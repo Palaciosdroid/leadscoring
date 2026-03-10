@@ -4,9 +4,9 @@ Routes scored leads into priority-ordered Dialer lists so the Closer
 always works the warmest leads first.
 
 Lists (create in Aircall Dashboard → Power Dialer):
-  🔴 sbc-priority  → Score ≥ 85   (call first)
-  🟠 sbc-hot       → Score 75-84  (call second)
-  🟡 sbc-warm      → Score 50-74  (follow-up)
+  🔴 priority  → Score ≥ 85   (call first — hottest & newest)
+  🟠 hot       → Score 75-84  (call second — work through today)
+  🟡 warm      → Score 50-74  (follow-up when priority + hot done)
 
 Docs: https://developer.aircall.io/api-references/
 """
