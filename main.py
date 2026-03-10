@@ -1,7 +1,7 @@
 """
 SBC Lead Scoring Engine — FastAPI
 Receives Customer.io webhooks, scores leads, writes back to HubSpot,
-triggers JustCall dialer + Slack alerts for Hot Leads.
+triggers Aircall Power Dialer + Slack alerts for Hot/Warm Leads.
 
 Deploy: Railway (~$5-10/Mo)
 """
@@ -134,7 +134,7 @@ WEBHOOK_SECRET = os.environ.get("CIO_WEBHOOK_SECRET", "")
 # Pydantic models
 # ---------------------------------------------------------------------------
 class LeadContext(BaseModel):
-    """Minimal lead info sent alongside scoring event for Slack/JustCall."""
+    """Minimal lead info sent alongside scoring event for Slack/Aircall."""
     contact_id: str = Field(..., description="HubSpot contact ID")
     email: str = ""
     firstname: str = ""
@@ -253,26 +253,32 @@ async def _score_and_update(
     except Exception as e:
         logger.error("HubSpot update failed: %s", e)
 
-    # 7. Hot Lead actions: JustCall + Slack
+    # 7. Aircall Power Dialer (Hot + Warm) + Slack alerts
     dialer_ok = False
-    if result.is_hot:
+    if result.combined_score >= 50 and lead.phone:
         try:
             notes = (
                 f"Score: {result.combined_score:.0f} | "
                 f"Tier: {result.tier_label} | "
                 f"Interesse: {result.interest_category or 'unknown'}"
             )
-            await add_to_power_dialer({
-                "phone":     lead.phone,
-                "firstname": lead.firstname,
-                "lastname":  lead.lastname,
-                "email":     lead.email,
-                "notes":     notes,
-            })
-            dialer_ok = True
+            dialer_result = await add_to_power_dialer(
+                {
+                    "phone":     lead.phone,
+                    "firstname": lead.firstname,
+                    "lastname":  lead.lastname,
+                    "email":     lead.email,
+                    "notes":     notes,
+                },
+                score=result.combined_score,
+                interest_category=result.interest_category,
+            )
+            dialer_ok = dialer_result is not None
         except Exception as e:
             logger.error("Aircall power dialer failed: %s", e)
 
+    # Slack alert only for Hot leads
+    if result.is_hot:
         try:
             await send_hot_lead_alert(
                 lead.model_dump(),
