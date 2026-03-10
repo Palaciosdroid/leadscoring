@@ -1,12 +1,12 @@
 """
 Aircall Power Dialer Integration
-Routes scored leads into priority-ordered Dialer lists so the Closer
-always works the warmest leads first.
+Routes leads into two lists so the Closer always works the right order.
 
 Lists (create in Aircall Dashboard → Power Dialer):
-  🔴 priority  → Score ≥ 85   (call first — hottest & newest)
-  🟠 hot       → Score 75-84  (call second — work through today)
-  🟡 warm      → Score 50-74  (follow-up when priority + hot done)
+  🔥 fresh  → brand-new opt-in (< 24h) — call immediately, regardless of score
+  🟡 warm   → Score ≥ 50, older leads worth following up
+
+Closer rule: empty 'fresh' first, then work 'warm'.
 
 Docs: https://developer.aircall.io/api-references/
 """
@@ -14,6 +14,7 @@ Docs: https://developer.aircall.io/api-references/
 import base64
 import os
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -24,26 +25,26 @@ AIRCALL_API_ID    = os.environ.get("AIRCALL_API_ID", "")
 AIRCALL_API_TOKEN = os.environ.get("AIRCALL_API_TOKEN", "")
 AIRCALL_BASE      = "https://api.aircall.io/v1"
 
-# 3 Dialer lists by priority — create in Aircall, paste IDs here
-DIALER_LIST_PRIORITY = os.environ.get("AIRCALL_LIST_PRIORITY", "")   # ≥ 85
-DIALER_LIST_HOT      = os.environ.get("AIRCALL_LIST_HOT", "")       # 75-84
-DIALER_LIST_WARM     = os.environ.get("AIRCALL_LIST_WARM", "")      # 50-74
+DIALER_LIST_FRESH = os.environ.get("AIRCALL_LIST_FRESH", "")  # opt-in < 24h
+DIALER_LIST_WARM  = os.environ.get("AIRCALL_LIST_WARM", "")   # score ≥ 50
 
-# Fallback: single list if 3-list setup not configured yet
-AIRCALL_DIALER_LIST_ID = os.environ.get("AIRCALL_DIALER_LIST_ID", "")
+FRESH_WINDOW_HOURS = 24
 
 
-def _select_list(score: float) -> str | None:
-    """Pick the right Dialer list based on lead score."""
-    if score >= 85 and DIALER_LIST_PRIORITY:
-        return DIALER_LIST_PRIORITY
-    if score >= 75 and DIALER_LIST_HOT:
-        return DIALER_LIST_HOT
+def _is_fresh(created_at: datetime | None) -> bool:
+    """True if lead opted in within the last 24 hours."""
+    if not created_at:
+        return False
+    age_hours = (datetime.now(timezone.utc) - created_at).total_seconds() / 3600
+    return age_hours < FRESH_WINDOW_HOURS
+
+
+def _select_list(score: float, created_at: datetime | None = None) -> str | None:
+    """Pick the right Dialer list: fresh wins over score."""
+    if _is_fresh(created_at) and DIALER_LIST_FRESH:
+        return DIALER_LIST_FRESH
     if score >= 50 and DIALER_LIST_WARM:
         return DIALER_LIST_WARM
-    # Fallback to single list for hot leads only
-    if score >= 75 and AIRCALL_DIALER_LIST_ID:
-        return AIRCALL_DIALER_LIST_ID
     return None
 
 
@@ -62,31 +63,30 @@ async def add_to_power_dialer(
     lead: dict[str, Any],
     *,
     score: float = 0,
+    created_at: datetime | None = None,
     interest_category: str | None = None,
     timeout: float = 10.0,
 ) -> dict[str, Any] | None:
     """
-    Push a lead into the correct Aircall Power Dialer list based on score.
+    Push a lead into the correct Aircall Power Dialer list.
 
     lead must contain: phone, firstname, lastname, email
-    Optional: notes (score context for the Closer)
+    created_at: when the lead opted in (UTC). Fresh leads bypass score threshold.
 
-    Returns None if score too low or no list configured.
+    Returns None if score too low and not fresh.
     """
     if not AIRCALL_API_ID or not AIRCALL_API_TOKEN:
         raise EnvironmentError("AIRCALL_API_ID and AIRCALL_API_TOKEN must be set")
 
-    list_id = _select_list(score)
+    list_id = _select_list(score, created_at)
     if not list_id:
-        logger.debug("Aircall: score %.0f too low for dialer — skipping %s", score, lead.get("email"))
+        logger.debug("Aircall: score %.0f too low, not fresh — skipping %s", score, lead.get("email"))
         return None
 
-    # Build tags: score tier + interest category
+    # Tags for the Closer
     tags = [f"score-{int(score)}"]
-    if score >= 85:
-        tags.append("priority")
-    elif score >= 75:
-        tags.append("hot")
+    if _is_fresh(created_at):
+        tags.append("fresh")
     else:
         tags.append("warm")
     if interest_category:
@@ -101,8 +101,8 @@ async def remove_from_all_lists(
     *,
     timeout: float = 10.0,
 ) -> None:
-    """Remove a contact from all known dialer lists (used before re-adding to correct list)."""
-    for list_id in (DIALER_LIST_PRIORITY, DIALER_LIST_HOT, DIALER_LIST_WARM, AIRCALL_DIALER_LIST_ID):
+    """Remove a contact from all dialer lists (used before re-adding to correct list)."""
+    for list_id in (DIALER_LIST_FRESH, DIALER_LIST_WARM):
         if not list_id:
             continue
         try:
@@ -177,8 +177,5 @@ async def _add_to_dialer_list(
         )
         response.raise_for_status()
 
-    logger.info(
-        "Aircall: added %s to Power Dialer list %s",
-        lead.get("email"), list_id,
-    )
+    logger.info("Aircall: added %s to Power Dialer list %s", lead.get("email"), list_id)
     return response.json()
