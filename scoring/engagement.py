@@ -11,18 +11,20 @@ from typing import Any
 # Base points per Customer.io event type
 # ---------------------------------------------------------------------------
 BASE_POINTS: dict[str, int] = {
-    "checkout_visited":       40,
-    "application_submitted":  35,
-    "video_watched_75":       25,
-    "webinar_attended":       25,
-    "sales_page_visited":     20,
-    "price_info_viewed":      20,
-    "webinar_registered":     15,
-    "video_watched_50":       15,
-    "email_link_clicked":     10,
+    "checkout_visited":         40,
+    "application_submitted":    35,
+    "video_watched_100":        30,   # watched complete — strong commitment signal
+    "video_watched_75":         25,
+    "webinar_attended":         25,
+    "sales_page_visited":       20,
+    "price_info_viewed":        20,
+    "webinar_registered":       15,
+    "video_watched_50":         15,
+    "cta_clicked":              12,   # CTA click on sales page
+    "email_link_clicked":       10,
     "free_resource_downloaded": 10,
-    "email_opened":           5,
-    "page_visited":           3,
+    "email_opened":              5,
+    "page_visited":              3,
 }
 
 # ---------------------------------------------------------------------------

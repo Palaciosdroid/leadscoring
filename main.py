@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 
 from batch.scorer import run_batch_scoring
 from integrations.hubspot import upsert_contact_score
-from integrations.justcall import add_to_dynamic_dialer
+from integrations.aircall import add_to_power_dialer
 from integrations.slack import send_hot_lead_alert
 from scoring.combined import combine_scores
 from scoring.engagement import calculate_engagement_score
@@ -29,19 +29,27 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Customer.io event → internal event_type mapping
 # ---------------------------------------------------------------------------
-CIO_EVENT_MAP: dict[str, str] = {
+CIO_EVENT_MAP: dict[str, str | None] = {
     # Page events (matched by URL pattern in webhook handler)
     "page":                   "page_visited",
-    # Email
+    # Email — CIO fires both names depending on version
     "email_opened":           "email_opened",
     "email_link_clicked":     "email_link_clicked",
+    "email_clicked":          "email_link_clicked",   # CIO alias
     "email_unsubscribed":     "email_unsubscribed",
-    # Custom events
+    "unsubscribed":           "email_unsubscribed",   # CIO alias
+    # Video — progress resolved via threshold, complete = 100%
     "video_progress":         None,          # resolved via threshold below
+    "video_complete":         "video_watched_100",
+    # Click events — URL-resolved below (CTA vs generic)
+    "click":                  None,          # resolved via URL below
+    # Webinar / resources / forms
     "webinar_attended":       "webinar_attended",
     "webinar_registered":     "webinar_registered",
     "resource_downloaded":    "free_resource_downloaded",
-    "application_submitted":  "application_submitted",
+    # CRITICAL: Customer.io fires "form_submit", NOT "application_submitted"
+    "form_submit":            "application_submitted",
+    "application_submitted":  "application_submitted",   # keep for manual/direct triggers
 }
 
 CHECKOUT_URL_PATTERNS  = ("checkout", "warenkorb", "order", "buy")
@@ -72,6 +80,16 @@ def _map_cio_event(raw_event: dict[str, Any]) -> str | None:
         elif pct >= 50:
             return "video_watched_50"
         return None  # below 50% — ignore
+
+    # Click events — resolve by URL (CTA-level detail)
+    if event_name == "click":
+        if any(p in url for p in CHECKOUT_URL_PATTERNS):
+            return "checkout_visited"     # clicking into checkout = strong signal
+        if any(p in url for p in PRICE_INFO_PATTERNS):
+            return "price_info_viewed"
+        if any(p in url for p in SALES_PAGE_PATTERNS):
+            return "cta_clicked"          # CTA on sales page
+        return None                       # generic click — not worth scoring
 
     return CIO_EVENT_MAP.get(event_name)
 
@@ -153,11 +171,15 @@ async def customerio_webhook(
     Expects JSON body: { "events": [...], "lead": { LeadContext } }
     or a single event payload with lead context embedded.
     """
-    body = await request.json()
+    # Read raw bytes first so signature verification has the original payload
+    raw_body = await request.body()
 
     # Optional: verify Customer.io webhook signature
     if WEBHOOK_SECRET and x_cio_signature:
-        _verify_signature(request, x_cio_signature)
+        _verify_signature(raw_body, x_cio_signature)
+
+    import json
+    body = json.loads(raw_body)
 
     raw_events: list[dict] = body.get("events", [body])  # support single or batch
     lead_data: dict = body.get("lead", {})
@@ -240,7 +262,7 @@ async def _score_and_update(
                 f"Tier: {result.tier_label} | "
                 f"Interesse: {result.interest_category or 'unknown'}"
             )
-            await add_to_dynamic_dialer({
+            await add_to_power_dialer({
                 "phone":     lead.phone,
                 "firstname": lead.firstname,
                 "lastname":  lead.lastname,
@@ -249,7 +271,7 @@ async def _score_and_update(
             })
             dialer_ok = True
         except Exception as e:
-            logger.error("JustCall dialer failed: %s", e)
+            logger.error("Aircall power dialer failed: %s", e)
 
         try:
             await send_hot_lead_alert(
@@ -293,14 +315,13 @@ def _build_ai_features(
     }
 
 
-def _verify_signature(request: Request, signature: str) -> None:
-    """Basic HMAC verification for Customer.io webhook secret."""
+def _verify_signature(raw_body: bytes, signature: str) -> None:
+    """HMAC-SHA256 verification for Customer.io webhook secret."""
     import hashlib
     import hmac
 
-    body_bytes = request.state.body if hasattr(request.state, "body") else b""
     expected = hmac.new(
-        WEBHOOK_SECRET.encode(), body_bytes, hashlib.sha256
+        WEBHOOK_SECRET.encode(), raw_body, hashlib.sha256
     ).hexdigest()
     if not hmac.compare_digest(expected, signature):
         raise HTTPException(status_code=401, detail="Invalid webhook signature")

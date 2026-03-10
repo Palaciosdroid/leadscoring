@@ -59,7 +59,7 @@ def _build_hot_lead_message(
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": "➡️ *Speed-to-Lead:* Lead wurde automatisch in JustCall Dynamic Dialer eingetragen.",
+                    "text": "➡️ *Speed-to-Lead:* Lead wurde automatisch in Aircall Power Dialer eingetragen.",
                 },
             },
             {"type": "divider"},

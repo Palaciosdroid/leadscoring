@@ -44,16 +44,18 @@ CATEGORY_SIGNALS: dict[str, list[str]] = {
 
 # Weight: how strongly each signal type counts toward category score
 SIGNAL_WEIGHTS = {
-    "page_visited": 1,
-    "sales_page_visited": 3,
-    "video_watched_50": 4,
-    "video_watched_75": 6,
-    "webinar_registered": 5,
-    "webinar_attended": 8,
-    "application_submitted": 15,   # strongest buying signal
-    "checkout_visited": 12,
+    "page_visited":             1,
+    "sales_page_visited":       3,
+    "cta_clicked":              3,
+    "email_link_clicked":       2,
     "free_resource_downloaded": 4,
-    "email_link_clicked": 2,
+    "video_watched_50":         4,
+    "video_watched_75":         6,
+    "video_watched_100":        8,   # full watch = strong product interest
+    "webinar_registered":       5,
+    "webinar_attended":         8,
+    "checkout_visited":         12,
+    "application_submitted":    15,  # strongest buying signal
 }
 
 
