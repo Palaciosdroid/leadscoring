@@ -21,19 +21,20 @@ ENGAGEMENT_WEIGHT = 0.70   # when AI score is present
 AI_WEIGHT = 0.30
 
 # ---------------------------------------------------------------------------
-# Tier thresholds
+# Tier thresholds — descending, first match wins
+# Using threshold-only (>= check) avoids float boundary gaps (e.g. 39.5)
 # ---------------------------------------------------------------------------
-TIERS = [
-    ("1_hot",          75,  float("inf")),
-    ("2_warm",         40,  74),
-    ("3_cold",          0,  39),
-    ("4_disqualified", float("-inf"), -1),
+TIERS: list[tuple[str, float]] = [
+    ("1_hot",          75.0),
+    ("2_warm",         40.0),
+    ("3_cold",          0.0),
+    ("4_disqualified", float("-inf")),
 ]
 
 
 def _determine_tier(score: float) -> str:
-    for tier_id, low, high in TIERS:
-        if low <= score <= high:
+    for tier_id, threshold in TIERS:
+        if score >= threshold:
             return tier_id
     return "4_disqualified"
 

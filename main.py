@@ -9,6 +9,7 @@ Deploy: Railway (~$5-10/Mo)
 import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -140,6 +141,10 @@ class LeadContext(BaseModel):
     firstname: str = ""
     lastname: str = ""
     phone: str = ""
+    created_at: datetime | None = Field(
+        default=None,
+        description="UTC datetime when lead opted in. Used for Aircall fresh-list routing.",
+    )
 
 
 class ScoreResponse(BaseModel):
@@ -174,8 +179,10 @@ async def customerio_webhook(
     # Read raw bytes first so signature verification has the original payload
     raw_body = await request.body()
 
-    # Optional: verify Customer.io webhook signature
-    if WEBHOOK_SECRET and x_cio_signature:
+    # Verify Customer.io webhook signature when secret is configured
+    if WEBHOOK_SECRET:
+        if not x_cio_signature:
+            raise HTTPException(status_code=401, detail="Missing webhook signature")
         _verify_signature(raw_body, x_cio_signature)
 
     import json
@@ -271,6 +278,7 @@ async def _score_and_update(
                     "notes":     notes,
                 },
                 score=result.combined_score,
+                created_at=lead.created_at,
                 interest_category=result.interest_category,
             )
             dialer_ok = dialer_result is not None
