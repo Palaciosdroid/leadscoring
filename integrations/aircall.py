@@ -1,12 +1,14 @@
 """
 Aircall Power Dialer Integration
-Routes leads into two lists so the Closer always works the right order.
+Pushes scored leads into Kevin's Power Dialer campaign so he always calls the right order.
 
-Lists (create in Aircall Dashboard → Power Dialer):
-  🔥 fresh  → brand-new opt-in (< 24h) — call immediately, regardless of score
+Flow:
+  1. Create/update Aircall contact with tags (fresh/warm, score-XX, Interest Category)
+  2. Push phone number into the Closer's Dialer Campaign
+
+Tags visible in Aircall UI during calls:
+  🔥 fresh  → brand-new opt-in (< 24h) — call immediately
   🟡 warm   → Score ≥ 50, older leads worth following up
-
-Closer rule: empty 'fresh' first, then work 'warm'.
 
 Docs: https://developer.aircall.io/api-references/
 """
@@ -21,12 +23,10 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-AIRCALL_API_ID    = os.environ.get("AIRCALL_API_ID", "")
-AIRCALL_API_TOKEN = os.environ.get("AIRCALL_API_TOKEN", "")
-AIRCALL_BASE      = "https://api.aircall.io/v1"
-
-DIALER_LIST_FRESH = os.environ.get("AIRCALL_LIST_FRESH", "")  # opt-in < 24h
-DIALER_LIST_WARM  = os.environ.get("AIRCALL_LIST_WARM", "")   # score ≥ 50
+AIRCALL_API_ID       = os.environ.get("AIRCALL_API_ID", "")
+AIRCALL_API_TOKEN    = os.environ.get("AIRCALL_API_TOKEN", "")
+AIRCALL_BASE         = "https://api.aircall.io/v1"
+AIRCALL_CLOSER_USER_ID = os.environ.get("AIRCALL_CLOSER_USER_ID", "")
 
 FRESH_WINDOW_HOURS = 24
 
@@ -39,13 +39,23 @@ def _is_fresh(created_at: datetime | None) -> bool:
     return age_hours < FRESH_WINDOW_HOURS
 
 
-def _select_list(score: float, created_at: datetime | None = None) -> str | None:
-    """Pick the right Dialer list: fresh wins over score."""
-    if _is_fresh(created_at) and DIALER_LIST_FRESH:
-        return DIALER_LIST_FRESH
-    if score >= 50 and DIALER_LIST_WARM:
-        return DIALER_LIST_WARM
-    return None
+def _should_dial(score: float, created_at: datetime | None = None) -> bool:
+    """Decide if lead qualifies for the Power Dialer: fresh OR score >= 50."""
+    if _is_fresh(created_at):
+        return True
+    return score >= 50
+
+
+def _build_tags(score: float, created_at: datetime | None, interest_category: str | None) -> list[str]:
+    """Build Aircall contact tags for the Closer to see during calls."""
+    tags = [f"score-{int(score)}"]
+    if _is_fresh(created_at):
+        tags.append("fresh")
+    else:
+        tags.append("warm")
+    if interest_category:
+        tags.append(interest_category)
+    return tags
 
 
 def _headers() -> dict[str, str]:
@@ -68,51 +78,30 @@ async def add_to_power_dialer(
     timeout: float = 10.0,
 ) -> dict[str, Any] | None:
     """
-    Push a lead into the correct Aircall Power Dialer list.
+    Push a lead into the Closer's Aircall Power Dialer campaign.
+
+    1. Upsert contact with tags (score, fresh/warm, interest)
+    2. Push phone number into Closer's dialer campaign
 
     lead must contain: phone, firstname, lastname, email
-    created_at: when the lead opted in (UTC). Fresh leads bypass score threshold.
-
     Returns None if score too low and not fresh.
     """
     if not AIRCALL_API_ID or not AIRCALL_API_TOKEN:
         raise EnvironmentError("AIRCALL_API_ID and AIRCALL_API_TOKEN must be set")
+    if not AIRCALL_CLOSER_USER_ID:
+        raise EnvironmentError("AIRCALL_CLOSER_USER_ID must be set")
 
-    list_id = _select_list(score, created_at)
-    if not list_id:
+    if not _should_dial(score, created_at):
         logger.debug("Aircall: score %.0f too low, not fresh — skipping %s", score, lead.get("email"))
         return None
 
-    # Tags for the Closer
-    tags = [f"score-{int(score)}"]
-    if _is_fresh(created_at):
-        tags.append("fresh")
-    else:
-        tags.append("warm")
-    if interest_category:
-        tags.append(interest_category)
+    tags = _build_tags(score, created_at, interest_category)
 
+    # Step 1: Create/update contact with tags
     contact_id = await _upsert_contact(lead, tags=tags, timeout=timeout)
-    return await _add_to_dialer_list(list_id, contact_id, lead, timeout=timeout)
 
-
-async def remove_from_all_lists(
-    contact_id: str,
-    *,
-    timeout: float = 10.0,
-) -> None:
-    """Remove a contact from all dialer lists (used before re-adding to correct list)."""
-    for list_id in (DIALER_LIST_FRESH, DIALER_LIST_WARM):
-        if not list_id:
-            continue
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                await client.delete(
-                    f"{AIRCALL_BASE}/power_dialer/lists/{list_id}/contacts/{contact_id}",
-                    headers=_headers(),
-                )
-        except Exception:
-            pass  # not in this list — fine
+    # Step 2: Push phone number into Closer's dialer campaign
+    return await _push_to_dialer_campaign(lead, timeout=timeout)
 
 
 async def _upsert_contact(
@@ -155,27 +144,32 @@ async def _upsert_contact(
     return contact_id
 
 
-async def _add_to_dialer_list(
-    list_id: str,
-    contact_id: str,
+async def _push_to_dialer_campaign(
     lead: dict[str, Any],
     *,
     timeout: float,
 ) -> dict[str, Any]:
-    """Add a contact to a specific Aircall Power Dialer list."""
+    """Push a phone number into the Closer's Dialer Campaign."""
+    phone = lead.get("phone", "")
+
     async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(
-            f"{AIRCALL_BASE}/power_dialer/lists/{list_id}/contacts",
+            f"{AIRCALL_BASE}/users/{AIRCALL_CLOSER_USER_ID}/dialer_campaign/phone_numbers",
             headers=_headers(),
-            json={"contact_id": contact_id},
+            json={"phone_numbers": [phone]},
         )
 
     if response.status_code not in (200, 201):
+        # 422 with "already imported" is OK — number already in campaign
+        if response.status_code == 422 and "already imported" in response.text:
+            logger.info("Aircall: %s already in dialer campaign — skipping", lead.get("email"))
+            return {"status": "already_imported", "phone": phone}
+
         logger.error(
-            "Aircall: power dialer add failed for %s (list %s): %s %s",
-            lead.get("email"), list_id, response.status_code, response.text,
+            "Aircall: dialer campaign push failed for %s: %s %s",
+            lead.get("email"), response.status_code, response.text,
         )
         response.raise_for_status()
 
-    logger.info("Aircall: added %s to Power Dialer list %s", lead.get("email"), list_id)
-    return response.json()
+    logger.info("Aircall: pushed %s to Closer's dialer campaign (user %s)", lead.get("email"), AIRCALL_CLOSER_USER_ID)
+    return {"status": "added", "phone": phone}
