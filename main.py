@@ -211,13 +211,17 @@ async def customerio_webhook(
     import json
     body = json.loads(raw_body)
 
-    # --- Detect format: CIO Reporting Webhook vs custom batch ---
+    # --- Detect format: CIO Reporting Webhook vs custom batch vs test/ping ---
     if "metric" in body and "object_type" in body:
         # CIO Reporting Webhook format
         return await _handle_cio_reporting_webhook(body)
-    else:
-        # Custom batch format (backward-compatible)
+    elif "lead" in body and body.get("lead", {}).get("contact_id"):
+        # Custom batch format (manual/direct triggers)
         return await _handle_custom_batch(body)
+    else:
+        # Test/ping payload or unrecognized format — acknowledge with 200
+        logger.info("Webhook received unrecognized payload (test/ping?): keys=%s", list(body.keys()))
+        return {"status": "ok", "message": "webhook received", "format": "unrecognized"}
 
 
 async def _handle_cio_reporting_webhook(body: dict[str, Any]) -> ScoreResponse:
