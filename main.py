@@ -9,7 +9,7 @@ Deploy: Railway (~$5-10/Mo)
 import logging
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -251,11 +251,20 @@ async def _handle_cio_reporting_webhook(body: dict[str, Any]) -> ScoreResponse:
         email=identifiers.get("email", "") or data.get("recipient", ""),
     )
 
-    # Build mapped event
+    # Build mapped event — convert CIO Unix epoch → ISO 8601
+    raw_ts = body.get("timestamp", "")
+    if raw_ts:
+        try:
+            ts_iso = datetime.fromtimestamp(int(raw_ts), tz=timezone.utc).isoformat()
+        except (ValueError, TypeError, OSError):
+            ts_iso = str(raw_ts)  # fallback: pass through as-is
+    else:
+        ts_iso = datetime.now(timezone.utc).isoformat()
+
     url = data.get("href", "") or data.get("link_url", "")
     mapped_events = [{
         "event_type": event_type,
-        "timestamp": body.get("timestamp", ""),
+        "timestamp": ts_iso,
         "url": url,
         "metadata": data,
     }]
@@ -342,17 +351,20 @@ async def _score_and_update(
         result.lead_tier, result.interest_category,
     )
 
-    # 6. Write back to HubSpot
+    # 6. Write back to HubSpot — only if lead has a phone number
     hubspot_ok = False
-    try:
-        await upsert_contact_score(lead.contact_id, result.to_hubspot_payload())
-        hubspot_ok = True
-    except Exception as e:
-        logger.error("HubSpot update failed: %s", e)
+    if not lead.phone:
+        logger.info("Skipping HubSpot + Aircall for %s — no phone number", lead.contact_id)
+    else:
+        try:
+            await upsert_contact_score(lead.contact_id, result.to_hubspot_payload())
+            hubspot_ok = True
+        except Exception as e:
+            logger.error("HubSpot update failed: %s", e)
 
-    # 7. Aircall Power Dialer (Hot + Warm) + Slack alerts
+    # 7. Aircall Power Dialer (Hot + Warm) + Slack alerts — only if phone present
     dialer_ok = False
-    if result.combined_score >= 50 and lead.phone:
+    if hubspot_ok and result.combined_score >= 50:
         try:
             notes = (
                 f"Score: {result.combined_score:.0f} | "
