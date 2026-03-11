@@ -53,6 +53,26 @@ CIO_EVENT_MAP: dict[str, str | None] = {
     "application_submitted":  "application_submitted",   # keep for manual/direct triggers
 }
 
+# ---------------------------------------------------------------------------
+# Customer.io Reporting Webhook metric → internal event_type mapping
+# These are the "metric" values CIO sends in reporting webhooks
+# ---------------------------------------------------------------------------
+CIO_METRIC_MAP: dict[str, str | None] = {
+    "opened":        "email_opened",
+    "clicked":       "email_link_clicked",
+    "converted":     "application_submitted",
+    "unsubscribed":  "email_unsubscribed",
+    # Delivery/technical events — not useful for scoring
+    "sent":          None,
+    "delivered":     None,
+    "bounced":       None,
+    "dropped":       None,
+    "spammed":       None,
+    "failed":        None,
+    "attempted":     None,
+    "drafted":       None,
+}
+
 CHECKOUT_URL_PATTERNS  = ("checkout", "warenkorb", "order", "buy")
 SALES_PAGE_PATTERNS    = ("ausbildung", "coaching", "kurs", "programm", "product")
 PRICE_INFO_PATTERNS    = ("preis", "price", "invest", "kosten", "cost")
@@ -166,20 +186,23 @@ async def health():
     return {"status": "ok", "version": "1.0.0"}
 
 
-@app.post("/webhook/customerio", response_model=ScoreResponse)
+@app.post("/webhook/customerio")
 async def customerio_webhook(
     request: Request,
     x_cio_signature: str | None = Header(default=None),
 ):
     """
-    Receive a Customer.io event batch webhook.
-    Expects JSON body: { "events": [...], "lead": { LeadContext } }
-    or a single event payload with lead context embedded.
+    Receive a Customer.io webhook — supports TWO formats:
+
+    1. CIO Reporting Webhook (actual CIO format):
+       { "event_id": "...", "metric": "clicked", "object_type": "email",
+         "timestamp": 1234, "data": { "customer_id": "...", "identifiers": {...} } }
+
+    2. Custom batch format (manual/direct triggers):
+       { "events": [...], "lead": { "contact_id": "...", ... } }
     """
-    # Read raw bytes first so signature verification has the original payload
     raw_body = await request.body()
 
-    # Verify Customer.io webhook signature when secret is configured
     if WEBHOOK_SECRET:
         if not x_cio_signature:
             raise HTTPException(status_code=401, detail="Missing webhook signature")
@@ -188,7 +211,70 @@ async def customerio_webhook(
     import json
     body = json.loads(raw_body)
 
-    raw_events: list[dict] = body.get("events", [body])  # support single or batch
+    # --- Detect format: CIO Reporting Webhook vs custom batch ---
+    if "metric" in body and "object_type" in body:
+        # CIO Reporting Webhook format
+        return await _handle_cio_reporting_webhook(body)
+    else:
+        # Custom batch format (backward-compatible)
+        return await _handle_custom_batch(body)
+
+
+async def _handle_cio_reporting_webhook(body: dict[str, Any]) -> ScoreResponse:
+    """Handle Customer.io's native Reporting Webhook format."""
+    metric = body.get("metric", "")
+    data = body.get("data", {}) or {}
+
+    # Map CIO metric → internal event type
+    event_type = CIO_METRIC_MAP.get(metric)
+    if not event_type:
+        logger.info("Ignoring CIO metric=%s (not scored)", metric)
+        return ScoreResponse(
+            contact_id=data.get("customer_id", "unknown"),
+            engagement_score=0, ai_score=None, combined_score=0.0,
+            lead_tier="ignored", interest_category=None,
+            hubspot_updated=False, dialer_added=False,
+        )
+
+    # Extract lead info from CIO's identifiers
+    identifiers = data.get("identifiers", {}) or {}
+    contact_id = data.get("customer_id") or identifiers.get("id") or identifiers.get("cio_id", "")
+    if not contact_id:
+        raise HTTPException(status_code=422, detail="No customer_id or identifiers.id in CIO payload")
+
+    lead = LeadContext(
+        contact_id=str(contact_id),
+        email=identifiers.get("email", "") or data.get("recipient", ""),
+    )
+
+    # Build mapped event
+    url = data.get("href", "") or data.get("link_url", "")
+    mapped_events = [{
+        "event_type": event_type,
+        "timestamp": body.get("timestamp", ""),
+        "url": url,
+        "metadata": data,
+    }]
+
+    # For click events, refine by URL pattern
+    if metric == "clicked" and url:
+        url_lower = url.lower()
+        if any(p in url_lower for p in CHECKOUT_URL_PATTERNS):
+            mapped_events[0]["event_type"] = "checkout_visited"
+        elif any(p in url_lower for p in PRICE_INFO_PATTERNS):
+            mapped_events[0]["event_type"] = "price_info_viewed"
+        elif any(p in url_lower for p in SALES_PAGE_PATTERNS):
+            mapped_events[0]["event_type"] = "cta_clicked"
+
+    logger.info("CIO webhook: metric=%s → event_type=%s for %s",
+                metric, mapped_events[0]["event_type"], contact_id)
+
+    return await _score_and_update(mapped_events, lead, pre_mapped=True)
+
+
+async def _handle_custom_batch(body: dict[str, Any]) -> ScoreResponse:
+    """Handle the custom batch format (manual triggers, /score endpoint)."""
+    raw_events: list[dict] = body.get("events", [body])
     lead_data: dict = body.get("lead", {})
 
     if not lead_data.get("contact_id"):
