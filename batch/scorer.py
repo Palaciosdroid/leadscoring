@@ -36,12 +36,12 @@ async def _fetch_active_hubspot_leads() -> list[dict[str, Any]]:
         "filterGroups": [
             {
                 "filters": [
-                    {"propertyName": "sbc_lead_tier", "operator": "HAS_PROPERTY"}
+                    {"propertyName": "lead_tier", "operator": "HAS_PROPERTY"}
                 ]
             }
         ],
         "properties": ["email", "firstname", "lastname", "phone",
-                        "sbc_engagement_score", "sbc_lead_tier"],
+                        "lead_engagement_score", "lead_tier"],
         "limit": 100,
     }
 
