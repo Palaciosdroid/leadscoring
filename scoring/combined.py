@@ -3,14 +3,13 @@ Combined Score + Lead Tier
 Merges Engagement Score with optional AI Predictive Score
 and returns the final tier (Hot / Warm / Cold / Disqualified).
 
-Tiers (calibrated for current CIO data — email opens/clicks only):
-  Hot          >= 25  -> immediate Aircall dial
-  Warm         15-24  -> follow-up within 24h
-  Cold          0-14  -> nurturing campaign (Customer.io)
+Tiers (calibrated for Supabase touchpoints — email + ads + forms):
+  Hot          >= 65  -> highest priority in Aircall
+  Warm         30-64  -> follow-up queue in Aircall
+  Cold          0-29  -> nurturing only (Customer.io)
   Disqualified  < 0   -> do not contact (unsubscribed)
 
-NOTE: Raise thresholds once video/page/checkout events are active in CIO.
-  Target thresholds: Hot >= 60, Warm >= 30, Cold >= 0.
+Updated 2026-03-12: Supabase-first architecture, thresholds raised.
 """
 
 from __future__ import annotations
@@ -28,8 +27,8 @@ AI_WEIGHT = 0.30
 # Using threshold-only (>= check) avoids float boundary gaps (e.g. 39.5)
 # ---------------------------------------------------------------------------
 TIERS: list[tuple[str, float]] = [
-    ("1_hot",          25.0),
-    ("2_warm",         15.0),
+    ("1_hot",          65.0),
+    ("2_warm",         30.0),
     ("3_cold",          0.0),
     ("4_disqualified", float("-inf")),
 ]

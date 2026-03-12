@@ -4,6 +4,7 @@ B2C Behaviour-based scoring via Customer.io events.
 Spec: Schneider Business Consulting, March 2026
 """
 
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
 
@@ -44,6 +45,10 @@ def recency_multiplier(days_ago: float) -> float:
 # ---------------------------------------------------------------------------
 # Inactivity + unsubscribe malus
 # ---------------------------------------------------------------------------
+# Maximum number of times the same event type is counted (prevents score inflation)
+MAX_EVENTS_PER_TYPE = 3
+
+
 def inactivity_malus(days_since_last_activity: float, unsubscribed: bool) -> int:
     malus = 0
     if unsubscribed:
@@ -77,12 +82,18 @@ def calculate_engagement_score(events: list[dict[str, Any]]) -> dict[str, Any]:
     raw_score = 0.0
     breakdown = []
     last_activity_ts: datetime | None = None
+    type_counts: Counter = Counter()
 
     for event in events:
         event_type = event.get("event_type", "")
         ts_str = event.get("timestamp", "")
 
         if event_type not in BASE_POINTS:
+            continue
+
+        # Cap: max N events of same type to prevent score inflation
+        type_counts[event_type] += 1
+        if type_counts[event_type] > MAX_EVENTS_PER_TYPE:
             continue
 
         try:

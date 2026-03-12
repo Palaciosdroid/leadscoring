@@ -29,7 +29,7 @@ from integrations.hubspot import (
     write_call_outcome,
 )
 from integrations.aircall import add_to_power_dialer
-from integrations.slack import send_hot_lead_alert
+# Slack hot lead alerts removed — Kevin handles via Aircall
 from scoring.combined import combine_scores
 from scoring.engagement import calculate_engagement_score
 from scoring.interest import detect_interest_category
@@ -201,6 +201,7 @@ app = FastAPI(
 )
 
 WEBHOOK_SECRET = os.environ.get("CIO_WEBHOOK_SECRET", "")
+DEBUG_API_KEY = os.environ.get("DEBUG_API_KEY", "")
 
 
 # ---------------------------------------------------------------------------
@@ -522,28 +523,48 @@ async def batch_run():
     return {"status": "started", "message": "Batch scoring started in background"}
 
 
-@app.post("/debug/poll")
-async def debug_poll(window_minutes: int = 10):
-    """
-    Manually trigger the call poller for E2E testing.
-    Uses a wider time window than the automatic 5-min job so you can pick up
-    a test call created in the last hour without waiting for the next cycle.
+@app.post("/debug/batch")
+async def debug_batch(x_api_key: str | None = Header(default=None)):
+    """Run batch scoring synchronously — returns result or error. Requires DEBUG_API_KEY."""
+    if DEBUG_API_KEY and x_api_key != DEBUG_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key header")
+    import io, logging as _log
+    buf = io.StringIO()
+    handler = _log.StreamHandler(buf)
+    handler.setLevel(_log.DEBUG)
+    handler.setFormatter(_log.Formatter("%(name)s %(levelname)s %(message)s"))
+    for name in ("batch.scorer", "integrations.supabase", "root", ""):
+        lg = _log.getLogger(name)
+        lg.addHandler(handler)
+        lg.setLevel(_log.DEBUG)
+    try:
+        await run_batch_scoring()
+        return {"status": "completed", "logs": buf.getvalue()[-5000:]}
+    except Exception as exc:
+        import traceback
+        return {"status": "error", "error": str(exc), "traceback": traceback.format_exc(), "logs": buf.getvalue()[-5000:]}
+    finally:
+        for name in ("batch.scorer", "integrations.supabase", "root", ""):
+            _log.getLogger(name).removeHandler(handler)
 
-    Example: POST /debug/poll?window_minutes=60
-    """
+
+@app.post("/debug/poll")
+async def debug_poll(window_minutes: int = 10, x_api_key: str | None = Header(default=None)):
+    """Manually trigger the call poller for E2E testing. Requires DEBUG_API_KEY."""
+    if DEBUG_API_KEY and x_api_key != DEBUG_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key header")
     logger.info("/debug/poll triggered manually (window=%dm)", window_minutes)
     await run_call_polling(since_minutes=window_minutes)
     return {"status": "ok", "message": f"Call polling completed (window={window_minutes}m)"}
 
 
 @app.post("/debug/daily-summary")
-async def debug_daily_summary():
-    """
-    Manually trigger the EOD daily summary card for testing.
-    Fetches live stats from HubSpot and posts to #sales-calls immediately.
-    """
+async def debug_daily_summary(x_api_key: str | None = Header(default=None)):
+    """Manually trigger the EOD daily summary card. Requires DEBUG_API_KEY."""
+    if DEBUG_API_KEY and x_api_key != DEBUG_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key header")
     logger.info("/debug/daily-summary triggered manually")
-    await run_daily_summary()
+    await run_scheduled_calls_summarizer()
     return {"status": "ok", "message": "Daily summary sent to Slack"}
 
 
@@ -630,17 +651,7 @@ async def _score_and_update(
         except Exception as e:
             logger.error("Aircall power dialer failed: %s", e)
 
-    # Slack alert only for Hot leads
-    if result.is_hot:
-        try:
-            await send_hot_lead_alert(
-                lead.model_dump(),
-                result.combined_score,
-                result.lead_tier,
-                result.interest_category,
-            )
-        except Exception as e:
-            logger.error("Slack alert failed: %s", e)
+    # No Slack alerts for hot leads — Kevin handles everything via Aircall
 
     return ScoreResponse(
         contact_id=lead.contact_id,
