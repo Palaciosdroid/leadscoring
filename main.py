@@ -29,7 +29,7 @@ from integrations.hubspot import (
     write_call_outcome,
 )
 from integrations.aircall import add_to_power_dialer
-from integrations.slack import send_hot_lead_alert, send_daily_summary
+from integrations.slack import send_hot_lead_alert
 from scoring.combined import combine_scores
 from scoring.engagement import calculate_engagement_score
 from scoring.interest import detect_interest_category
@@ -137,21 +137,6 @@ CALL_POLL_INTERVAL_MINUTES = int(os.environ.get("CALL_POLL_INTERVAL_MINUTES", "5
 CALL_POLL_WINDOW_MINUTES   = int(os.environ.get("CALL_POLL_WINDOW_MINUTES",    "10"))
 
 
-async def run_daily_summary() -> None:
-    """Fetch today's call stats from HubSpot and post the EOD summary card to Slack."""
-    try:
-        outbound_total, outbound_connected, inbound_connected, inbound_dur_sec = (
-            await get_daily_call_stats()
-        )
-        await send_daily_summary(outbound_total, outbound_connected, inbound_connected, inbound_dur_sec)
-        logger.info(
-            "EOD summary sent: outbound=%d connected=%d inbound=%d",
-            outbound_total, outbound_connected, inbound_connected,
-        )
-    except Exception as exc:
-        logger.error("run_daily_summary failed: %s", exc)
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     scheduler.add_job(
@@ -183,31 +168,22 @@ async def lifespan(app: FastAPI):
         id="daily_decay_check",
         replace_existing=True,
     )
-    # Scheduled calls summarizer — 17:55 CET, 5 min before EOD summary
-    # Fetches HubSpot tasks/meetings for next 7 days, groups by date + lead tier
+    # Scheduled calls summarizer — 18:00 CET daily
+    # Fetches past 7 days completed calls + next 7 days booked calls
+    # Posts combined summary to Slack with both sections
     scheduler.add_job(
         run_scheduled_calls_summarizer,
-        "cron",
-        hour=17,
-        minute=55,
-        timezone=ZoneInfo("Europe/Berlin"),
-        id="scheduled_calls_summary",
-        replace_existing=True,
-    )
-    # End-of-day summary card — fires daily at 18:00 CET/CEST
-    scheduler.add_job(
-        run_daily_summary,
         "cron",
         hour=18,
         minute=0,
         timezone=ZoneInfo("Europe/Berlin"),
-        id="daily_call_summary",
+        id="daily_summary",
         replace_existing=True,
     )
     scheduler.start()
     logger.info(
         "Schedulers started — batch scoring every %dm, call polling every %dm (window=%dm), "
-        "decay check at 17:00 CET, EOD summary at 18:00 CET",
+        "decay check at 17:00 CET, daily summary (with past+scheduled calls) at 18:00 CET",
         BATCH_INTERVAL_MINUTES, CALL_POLL_INTERVAL_MINUTES, CALL_POLL_WINDOW_MINUTES,
     )
     yield
