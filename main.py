@@ -11,6 +11,7 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -28,7 +29,7 @@ from integrations.hubspot import (
     write_call_outcome,
 )
 from integrations.aircall import add_to_power_dialer
-from integrations.slack import send_hot_lead_alert, send_call_report
+from integrations.slack import send_hot_lead_alert, send_call_report, send_daily_summary
 from scoring.combined import combine_scores
 from scoring.engagement import calculate_engagement_score
 from scoring.interest import detect_interest_category
@@ -136,6 +137,21 @@ CALL_POLL_INTERVAL_MINUTES = int(os.environ.get("CALL_POLL_INTERVAL_MINUTES", "5
 CALL_POLL_WINDOW_MINUTES   = int(os.environ.get("CALL_POLL_WINDOW_MINUTES",    "10"))
 
 
+async def run_daily_summary() -> None:
+    """Fetch today's call stats from HubSpot and post the EOD summary card to Slack."""
+    try:
+        outbound_total, outbound_connected, inbound_connected, inbound_dur_sec = (
+            await get_daily_call_stats()
+        )
+        await send_daily_summary(outbound_total, outbound_connected, inbound_connected, inbound_dur_sec)
+        logger.info(
+            "EOD summary sent: outbound=%d connected=%d inbound=%d",
+            outbound_total, outbound_connected, inbound_connected,
+        )
+    except Exception as exc:
+        logger.error("run_daily_summary failed: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     scheduler.add_job(
@@ -154,9 +170,33 @@ async def lifespan(app: FastAPI):
         id="call_polling",
         replace_existing=True,
     )
+    # Daily decay sweep — 17:00 CET, one hour before EOD summary.
+    # run_batch_scoring() already contains decay detection + Slack alerts.
+    # Running it at a fixed time means decay alerts land predictably instead of
+    # randomly during the 30-min interval job.
+    scheduler.add_job(
+        run_batch_scoring,
+        "cron",
+        hour=17,
+        minute=0,
+        timezone=ZoneInfo("Europe/Berlin"),
+        id="daily_decay_check",
+        replace_existing=True,
+    )
+    # End-of-day summary card — fires daily at 18:00 CET/CEST
+    scheduler.add_job(
+        run_daily_summary,
+        "cron",
+        hour=18,
+        minute=0,
+        timezone=ZoneInfo("Europe/Berlin"),
+        id="daily_call_summary",
+        replace_existing=True,
+    )
     scheduler.start()
     logger.info(
-        "Schedulers started — batch scoring every %dm, call polling every %dm (window=%dm)",
+        "Schedulers started — batch scoring every %dm, call polling every %dm (window=%dm), "
+        "decay check at 17:00 CET, EOD summary at 18:00 CET",
         BATCH_INTERVAL_MINUTES, CALL_POLL_INTERVAL_MINUTES, CALL_POLL_WINDOW_MINUTES,
     )
     yield
@@ -423,7 +463,9 @@ async def hubspot_call_webhook(payload: HubSpotCallPayload):
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
     (calls_7d, calls_30d, calls_365d) = results[0] if not isinstance(results[0], Exception) else (0, 0, 0)
-    (outbound_today, inbound_today, inbound_dur_today) = results[1] if not isinstance(results[1], Exception) else (0, 0, 0)
+    (outbound_total, outbound_connected, inbound_connected, inbound_dur_today) = (
+        results[1] if not isinstance(results[1], Exception) else (0, 0, 0, 0)
+    )
 
     await send_call_report(
         contact_name=contact_name,
@@ -434,9 +476,11 @@ async def hubspot_call_webhook(payload: HubSpotCallPayload):
         calls_7d=calls_7d,
         calls_30d=calls_30d,
         calls_365d=calls_365d,
-        outbound_today=outbound_today,
-        inbound_today=inbound_today,
+        outbound_total_today=outbound_total,
+        outbound_connected_today=outbound_connected,
+        inbound_connected_today=inbound_connected,
         inbound_duration_sec_today=inbound_dur_today,
+        contact_id=payload.contact_id,
     )
 
     logger.info(
@@ -500,6 +544,17 @@ async def debug_poll(window_minutes: int = 10):
     logger.info("/debug/poll triggered manually (window=%dm)", window_minutes)
     await run_call_polling(since_minutes=window_minutes)
     return {"status": "ok", "message": f"Call polling completed (window={window_minutes}m)"}
+
+
+@app.post("/debug/daily-summary")
+async def debug_daily_summary():
+    """
+    Manually trigger the EOD daily summary card for testing.
+    Fetches live stats from HubSpot and posts to #sales-calls immediately.
+    """
+    logger.info("/debug/daily-summary triggered manually")
+    await run_daily_summary()
+    return {"status": "ok", "message": "Daily summary sent to Slack"}
 
 
 # ---------------------------------------------------------------------------

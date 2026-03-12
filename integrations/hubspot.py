@@ -27,6 +27,13 @@ HS_DISPOSITION_MAP: dict[str, str] = {
     "17b47fee-58de-441e-a44c-c6300d46f273": "Falsche Nummer",
 }
 
+# Dispositions where a human actually picked up — these count as "Meetings".
+# Everything else (Keine Antwort, Voicemail, Besetzt, Falsche Nummer) = Anschlag.
+CONNECTED_DISPOSITIONS: frozenset[str] = frozenset({
+    "f240bbac-87c9-4f6e-bf70-924b57d47db7",  # Kontakt aufgenommen
+    "a4c4c377-d246-4b32-a13b-75a56a4cd0ff",  # Live-Nachricht hinterlassen
+})
+
 
 def _headers() -> dict[str, str]:
     return {
@@ -200,78 +207,75 @@ async def get_call_stats(*, timeout: float = 10.0) -> tuple[int, int, int]:
     return (_parse(responses[0]), _parse(responses[1]), _parse(responses[2]))
 
 
-async def get_daily_call_stats(*, timeout: float = 15.0) -> tuple[int, int, int]:
+async def get_daily_call_stats(*, timeout: float = 15.0) -> tuple[int, int, int, int]:
     """
-    Return today's call stats: (outbound_count, inbound_count, inbound_duration_sec).
+    Return today's call activity: (outbound_total, outbound_connected, inbound_connected, inbound_duration_sec).
 
-    "Today" = since midnight UTC, COMPLETED calls only (matches what the call poller
-    actually processes). Runs 2 parallel HubSpot search queries.
-    Inbound duration is summed from result properties (HubSpot has no aggregate API).
-    If there are >100 inbound calls today, duration will be under-counted — acceptable
-    for a sales team of this size.
+    - outbound_total:     ALL COMPLETED outbound calls today (= Anschläge, from server-side total)
+    - outbound_connected: subset where disposition in CONNECTED_DISPOSITIONS (= outbound Meetings)
+    - inbound_connected:  COMPLETED inbound calls with connected disposition (= inbound Meetings)
+    - inbound_duration_sec: total talk-time for inbound connected calls
+
+    "Today" = since midnight UTC. Post-processes disposition in Python — avoids extra API queries.
+    Accurate for up to 200 calls per direction per day (sufficient for this team size).
     """
     if not ACCESS_TOKEN:
-        return (0, 0, 0)
+        return (0, 0, 0, 0)
 
     import asyncio
 
     today = datetime.now(tz=timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     today_ms = int(today.timestamp() * 1000)
 
-    def _daily_filter(direction: str, include_duration: bool = False) -> dict:
-        props = ["hs_createdate"]
-        if include_duration:
-            props.append("hs_call_duration")
+    def _daily_filter(direction: str) -> dict:
         return {
             "filterGroups": [{"filters": [
                 {"propertyName": "hs_call_direction", "operator": "EQ",  "value": direction},
                 {"propertyName": "hs_call_status",    "operator": "EQ",  "value": "COMPLETED"},
                 {"propertyName": "hs_createdate",     "operator": "GTE", "value": str(today_ms)},
             ]}],
-            "properties": props,
-            "limit": 100,
+            # Fetch disposition + duration for all calls so we can post-process in Python
+            "properties": ["hs_call_disposition", "hs_call_duration"],
+            "limit": 200,
         }
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         outbound_r, inbound_r = await asyncio.gather(
-            client.post(
-                f"{HUBSPOT_BASE}/crm/v3/objects/calls/search",
-                headers=_headers(),
-                json=_daily_filter("OUTBOUND"),
-            ),
-            client.post(
-                f"{HUBSPOT_BASE}/crm/v3/objects/calls/search",
-                headers=_headers(),
-                json=_daily_filter("INBOUND", include_duration=True),
-            ),
+            client.post(f"{HUBSPOT_BASE}/crm/v3/objects/calls/search", headers=_headers(), json=_daily_filter("OUTBOUND")),
+            client.post(f"{HUBSPOT_BASE}/crm/v3/objects/calls/search", headers=_headers(), json=_daily_filter("INBOUND")),
             return_exceptions=True,
         )
 
-    outbound_today = inbound_today = inbound_duration_sec = 0
+    outbound_total = outbound_connected = inbound_connected = inbound_duration_sec = 0
 
     if not isinstance(outbound_r, Exception) and outbound_r.status_code == 200:
-        outbound_today = outbound_r.json().get("total", 0)
+        data = outbound_r.json()
+        outbound_total = data.get("total", 0)  # server-side count — accurate even if >200
+        for call in data.get("results", []):
+            if call.get("properties", {}).get("hs_call_disposition") in CONNECTED_DISPOSITIONS:
+                outbound_connected += 1
     elif isinstance(outbound_r, Exception):
         logger.warning("get_daily_call_stats outbound query failed: %s", outbound_r)
 
     if not isinstance(inbound_r, Exception) and inbound_r.status_code == 200:
-        data = inbound_r.json()
-        inbound_today = data.get("total", 0)
-        for call in data.get("results", []):
-            dur = call.get("properties", {}).get("hs_call_duration")
-            if dur:
-                try:
-                    inbound_duration_sec += int(dur) // 1000
-                except (ValueError, TypeError):
-                    pass
+        for call in inbound_r.json().get("results", []):
+            props = call.get("properties", {})
+            if props.get("hs_call_disposition") in CONNECTED_DISPOSITIONS:
+                inbound_connected += 1
+                dur = props.get("hs_call_duration")
+                if dur:
+                    try:
+                        inbound_duration_sec += int(dur) // 1000
+                    except (ValueError, TypeError):
+                        pass
     elif isinstance(inbound_r, Exception):
         logger.warning("get_daily_call_stats inbound query failed: %s", inbound_r)
 
     logger.debug(
-        "get_daily_call_stats: outbound=%d inbound=%d inbound_duration=%ds",
-        outbound_today, inbound_today, inbound_duration_sec,
+        "get_daily_call_stats: outbound_total=%d outbound_connected=%d inbound_connected=%d inbound_dur=%ds",
+        outbound_total, outbound_connected, inbound_connected, inbound_duration_sec,
     )
-    return (outbound_today, inbound_today, inbound_duration_sec)
+    return (outbound_total, outbound_connected, inbound_connected, inbound_duration_sec)
 
 
 async def get_latest_call_for_contact(
@@ -529,17 +533,18 @@ async def poll_completed_calls(
 
             contact_id = assoc.json()["results"][0]["id"]
 
-            # Get contact name
-            firstname, lastname = "", ""
+            # Get contact name + phone
+            firstname, lastname, phone = "", "", ""
             c_resp = await client.get(
                 f"{HUBSPOT_BASE}/crm/v3/objects/contacts/{contact_id}",
                 headers=_headers(),
-                params={"properties": "firstname,lastname"},
+                params={"properties": "firstname,lastname,phone"},
             )
             if c_resp.status_code == 200:
                 p = c_resp.json().get("properties", {})
                 firstname = p.get("firstname", "") or ""
                 lastname  = p.get("lastname",  "") or ""
+                phone     = p.get("phone",     "") or ""
 
             props = call.get("properties", {})
             return {
@@ -547,6 +552,7 @@ async def poll_completed_calls(
                 "contact_id":         contact_id,
                 "contact_firstname":  firstname,
                 "contact_lastname":   lastname,
+                "contact_phone":      phone,
                 "hs_call_direction":  props.get("hs_call_direction",  "OUTBOUND"),
                 "hs_call_disposition": props.get("hs_call_disposition", ""),
                 "hs_call_duration":   int(props.get("hs_call_duration") or 0),

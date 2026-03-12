@@ -173,3 +173,68 @@ async def _push_to_dialer_campaign(
 
     logger.info("Aircall: pushed %s to Closer's dialer campaign (user %s)", lead.get("email"), AIRCALL_CLOSER_USER_ID)
     return {"status": "added", "phone": phone}
+
+
+async def log_call_outcome(
+    phone: str,
+    outcome: str,
+    contact_name: str = "",
+    *,
+    timeout: float = 10.0,
+) -> None:
+    """
+    Append the call outcome to an Aircall contact's information field.
+
+    Looks up the contact by phone number (Aircall search API), then prepends
+    a timestamped outcome line so Kevin sees the latest result at the top.
+    Silently skips when the contact is not in Aircall (e.g. lead not yet in
+    the power dialer) or when credentials are missing.
+    """
+    if not AIRCALL_API_ID or not AIRCALL_API_TOKEN or not phone:
+        return
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        # Step 1: Find the Aircall contact by phone number
+        search_resp = await client.get(
+            f"{AIRCALL_BASE}/contacts",
+            headers=_headers(),
+            params={"phone_details": phone, "order": "created_at DESC", "per_page": 1},
+        )
+
+        if search_resp.status_code != 200:
+            logger.debug(
+                "Aircall: contact search failed for phone %s: %s",
+                phone, search_resp.status_code,
+            )
+            return
+
+        contacts = search_resp.json().get("contacts", [])
+        if not contacts:
+            logger.debug("Aircall: phone %s not in Aircall — skipping outcome log", phone)
+            return
+
+        aircall_id    = contacts[0].get("id")
+        existing_info = contacts[0].get("information", "") or ""
+
+        # Step 2: Prepend outcome entry so newest result is at the top
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        new_entry    = f"[{ts}] {outcome}"
+        updated_info = f"{new_entry}\n{existing_info}".strip()
+
+        # Step 3: PATCH contact with updated information field
+        update_resp = await client.put(
+            f"{AIRCALL_BASE}/contacts/{aircall_id}",
+            headers=_headers(),
+            json={"information": updated_info},
+        )
+
+    if update_resp.status_code not in (200, 201):
+        logger.warning(
+            "Aircall: outcome log failed for %s (id=%s): %s %s",
+            phone, aircall_id, update_resp.status_code, update_resp.text,
+        )
+    else:
+        logger.info(
+            "Aircall: outcome logged for %s (id=%s) → %s",
+            contact_name or phone, aircall_id, outcome,
+        )

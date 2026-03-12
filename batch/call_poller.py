@@ -13,7 +13,9 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
+from integrations.aircall import log_call_outcome as aircall_log_outcome
 from integrations.hubspot import (
+    CONNECTED_DISPOSITIONS,
     HS_DISPOSITION_MAP,
     get_call_stats,
     get_daily_call_stats,
@@ -45,10 +47,25 @@ async def run_call_polling(since_minutes: int = 10) -> None:
         logger.debug("call_poller: 0 new calls (all %d already processed)", len(calls))
         return
 
-    logger.info("call_poller: processing %d new call(s)", len(new_calls))
+    # Split: Anschläge (no Slack) vs Meetings (connected → send Slack)
+    connected_calls = [c for c in new_calls if c.get("hs_call_disposition") in CONNECTED_DISPOSITIONS]
+    anschlaege      = [c for c in new_calls if c.get("hs_call_disposition") not in CONNECTED_DISPOSITIONS]
+
+    # Silently dedup Anschläge — they count in the EOD report but get no individual Slack card
+    for c in anschlaege:
+        _processed_call_ids.add(c["call_id"])
+    if anschlaege:
+        logger.info("call_poller: %d Anschlag/-schläge (no Slack): %s", len(anschlaege),
+                    [HS_DISPOSITION_MAP.get(c.get("hs_call_disposition",""),"?") for c in anschlaege[:5]])
+
+    if not connected_calls:
+        logger.debug("call_poller: 0 connected calls to report this cycle")
+        return
+
+    logger.info("call_poller: processing %d connected call(s) (Meetings)", len(connected_calls))
 
     # Fetch both stat sets in parallel — reused across all calls in this batch
-    (calls_7d, calls_30d, calls_365d), (outbound_today, inbound_today, inbound_dur_today) = (
+    (calls_7d, calls_30d, calls_365d), (outbound_total, outbound_connected, inbound_connected, inbound_dur_today) = (
         await asyncio.gather(get_call_stats(), get_daily_call_stats())
     )
 
@@ -79,10 +96,19 @@ async def run_call_polling(since_minutes: int = 10) -> None:
         except (ValueError, TypeError, OSError):
             ts_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
+        phone = call.get("contact_phone", "")
+
         # 1. Write outcome back to HubSpot contact
         await write_call_outcome(contact_id, outcome)
 
-        # 2. Send Slack call report
+        # 2. Log outcome to Aircall contact (information field) — silently skips if not in Aircall
+        if phone:
+            try:
+                await aircall_log_outcome(phone, outcome, contact_name)
+            except Exception as ac_err:
+                logger.warning("call_poller: Aircall outcome log failed for %s: %s", contact_name, ac_err)
+
+        # 3. Send Slack call report (only for connected calls — Anschläge are already deduplicated above)
         await send_call_report(
             contact_name=contact_name,
             direction=direction,
@@ -92,9 +118,11 @@ async def run_call_polling(since_minutes: int = 10) -> None:
             calls_7d=calls_7d,
             calls_30d=calls_30d,
             calls_365d=calls_365d,
-            outbound_today=outbound_today,
-            inbound_today=inbound_today,
+            outbound_total_today=outbound_total,
+            outbound_connected_today=outbound_connected,
+            inbound_connected_today=inbound_connected,
             inbound_duration_sec_today=inbound_dur_today,
+            contact_id=contact_id,
         )
 
         # Mark as processed AFTER successful handling
@@ -105,8 +133,8 @@ async def run_call_polling(since_minutes: int = 10) -> None:
             call_id, contact_name, direction, outcome, duration_sec,
         )
 
-    # Process all new calls in parallel, log errors but don't crash the job
-    results = await asyncio.gather(*[_process(c) for c in new_calls], return_exceptions=True)
+    # Process all connected calls in parallel, log errors but don't crash the job
+    results = await asyncio.gather(*[_process(c) for c in connected_calls], return_exceptions=True)
     errors = [r for r in results if isinstance(r, Exception)]
     if errors:
         for err in errors:

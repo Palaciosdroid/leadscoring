@@ -11,10 +11,12 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
+SLACK_WEBHOOK_URL       = os.environ.get("SLACK_WEBHOOK_URL", "")
 SLACK_CALLS_WEBHOOK_URL = os.environ.get("SLACK_CALLS_WEBHOOK_URL", "")
 # Falls back to hot-lead webhook if no dedicated channel is configured
 SLACK_DECAY_WEBHOOK_URL = os.environ.get("SLACK_DECAY_WEBHOOK_URL", "") or SLACK_WEBHOOK_URL
+# HubSpot portal ID — required to build direct contact deep-links
+HUBSPOT_PORTAL_ID       = os.environ.get("HUBSPOT_PORTAL_ID", "")
 
 # Tier rank for comparing decay direction — higher number = worse tier
 TIER_ORDER: dict[str, int] = {
@@ -87,27 +89,29 @@ def _build_call_message(
     calls_7d: int,
     calls_30d: int,
     calls_365d: int,
-    outbound_today: int = 0,
-    inbound_today: int = 0,
+    outbound_total_today: int = 0,
+    outbound_connected_today: int = 0,
+    inbound_connected_today: int = 0,
     inbound_duration_sec_today: int = 0,
+    contact_id: str = "",
 ) -> dict[str, Any]:
     dir_emoji = "📞" if direction.lower() == "outbound" else "📲"
     mins, secs = divmod(duration_sec, 60)
     duration_str = f"{mins}m {secs}s" if mins else f"{secs}s"
 
-    # Format inbound duration: "3 Meetings (12m)" or "0 Meetings"
-    inbound_mins = inbound_duration_sec_today // 60
-    inbound_str = (
-        f"{inbound_today} Meetings ({inbound_mins}m)"
-        if inbound_today > 0
-        else f"{inbound_today} Meetings"
+    # "Meetings" = connected calls (both directions); "Anschläge" = all outbound attempts
+    meetings_total = outbound_connected_today + inbound_connected_today
+    inbound_dur_min = inbound_duration_sec_today // 60
+    meetings_str = (
+        f"{meetings_total} ({outbound_connected_today} out · {inbound_connected_today} in)"
+        if meetings_total > 0 else "0"
     )
 
     return {
         "blocks": [
             {
                 "type": "header",
-                "text": {"type": "plain_text", "text": f"{dir_emoji} Call Report — {contact_name}"},
+                "text": {"type": "plain_text", "text": f"{dir_emoji} Meeting — {contact_name}"},
             },
             {
                 "type": "section",
@@ -121,8 +125,8 @@ def _build_call_message(
             {
                 "type": "section",
                 "fields": [
-                    {"type": "mrkdwn", "text": f"*Outbound heute:*\n{outbound_today} Calls"},
-                    {"type": "mrkdwn", "text": f"*Inbound heute:*\n{inbound_str}"},
+                    {"type": "mrkdwn", "text": f"*Anschläge heute:*\n{outbound_total_today} Outbound"},
+                    {"type": "mrkdwn", "text": f"*Meetings heute:*\n{meetings_str}"},
                 ],
             },
             {
@@ -132,6 +136,53 @@ def _build_call_message(
                     {"type": "mrkdwn", "text": f"*Calls (30d):*\n{calls_30d}"},
                     {"type": "mrkdwn", "text": f"*Calls (365d):*\n{calls_365d}"},
                 ],
+            },
+            # HubSpot deep-link button — only shown when portal ID + contact ID are known
+            *([{
+                "type": "actions",
+                "elements": [{
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "📋 In HubSpot öffnen"},
+                    "url": f"https://app.hubspot.com/contacts/{HUBSPOT_PORTAL_ID}/contact/{contact_id}",
+                    "action_id": "open_hubspot_contact",
+                }],
+            }] if contact_id and HUBSPOT_PORTAL_ID else []),
+            {"type": "divider"},
+        ]
+    }
+
+
+def _build_daily_summary(
+    outbound_total: int,
+    outbound_connected: int,
+    inbound_connected: int,
+    inbound_duration_sec: int,
+    date_label: str,
+) -> dict[str, Any]:
+    """EOD summary card — sent once per day at 18:00 CET."""
+    meetings_total = outbound_connected + inbound_connected
+    conversion_pct = (outbound_connected / outbound_total * 100) if outbound_total else 0.0
+    total_talk_min = inbound_duration_sec // 60
+
+    lines = [
+        f"*Outbound Anschläge:* {outbound_total}",
+        f"*Outbound Meetings:* {outbound_connected}  _{conversion_pct:.1f}% conversion_",
+        f"*Inbound Meetings:* {inbound_connected}",
+        "─" * 30,
+        f"*Meetings gesamt:* {meetings_total}",
+    ]
+    if inbound_connected > 0 and total_talk_min > 0:
+        lines.append(f"*Inbound Gesprächszeit:* {total_talk_min}m")
+
+    return {
+        "blocks": [
+            {
+                "type": "header",
+                "text": {"type": "plain_text", "text": f"📊 Tages-Report — {date_label}"},
+            },
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": "\n".join(lines)},
             },
             {"type": "divider"},
         ]
@@ -147,13 +198,15 @@ async def send_call_report(
     calls_7d: int,
     calls_30d: int,
     calls_365d: int,
-    outbound_today: int = 0,
-    inbound_today: int = 0,
+    outbound_total_today: int = 0,
+    outbound_connected_today: int = 0,
+    inbound_connected_today: int = 0,
     inbound_duration_sec_today: int = 0,
+    contact_id: str = "",
     *,
     timeout: float = 5.0,
 ) -> None:
-    """Post a call summary to the #sales-calls Slack channel."""
+    """Post a connected-call (Meeting) card to the #sales-calls Slack channel."""
     if not SLACK_CALLS_WEBHOOK_URL:
         logger.warning("SLACK_CALLS_WEBHOOK_URL not set — skipping call report")
         return
@@ -161,7 +214,9 @@ async def send_call_report(
     message = _build_call_message(
         contact_name, direction, outcome, duration_sec,
         timestamp, calls_7d, calls_30d, calls_365d,
-        outbound_today, inbound_today, inbound_duration_sec_today,
+        outbound_total_today, outbound_connected_today,
+        inbound_connected_today, inbound_duration_sec_today,
+        contact_id,
     )
 
     async with httpx.AsyncClient(timeout=timeout) as client:
@@ -171,6 +226,38 @@ async def send_call_report(
         logger.error("Slack call report failed: %s %s", response.status_code, response.text)
     else:
         logger.info("Slack call report sent for %s (direction=%s outcome=%s)", contact_name, direction, outcome)
+
+
+async def send_daily_summary(
+    outbound_total: int,
+    outbound_connected: int,
+    inbound_connected: int,
+    inbound_duration_sec: int,
+    *,
+    timeout: float = 5.0,
+) -> None:
+    """Post the EOD summary card to #sales-calls at 18:00 CET."""
+    if not SLACK_CALLS_WEBHOOK_URL:
+        logger.warning("SLACK_CALLS_WEBHOOK_URL not set — skipping daily summary")
+        return
+
+    from datetime import datetime, timezone
+    date_label = datetime.now(tz=timezone.utc).strftime("%-d. %B %Y")  # "12. März 2026"
+
+    message = _build_daily_summary(
+        outbound_total, outbound_connected, inbound_connected, inbound_duration_sec, date_label,
+    )
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(SLACK_CALLS_WEBHOOK_URL, json=message)
+
+    if response.status_code != 200:
+        logger.error("Slack daily summary failed: %s %s", response.status_code, response.text)
+    else:
+        logger.info(
+            "Slack daily summary sent: outbound=%d connected=%d inbound=%d",
+            outbound_total, outbound_connected, inbound_connected,
+        )
 
 
 def _build_decay_message(
