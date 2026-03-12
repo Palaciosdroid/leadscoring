@@ -16,6 +16,7 @@ Flow:
 Docs: https://developer.aircall.io/api-references/
 """
 
+import asyncio
 import base64
 import os
 import logging
@@ -25,6 +26,10 @@ from typing import Any
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# Retry config for Aircall 429 rate limits (60 req/min)
+_MAX_RETRIES = 3
+_RETRY_BASE_DELAY = 2.0  # seconds, doubles each retry
 
 AIRCALL_API_ID       = os.environ.get("AIRCALL_API_ID", "")
 AIRCALL_API_TOKEN    = os.environ.get("AIRCALL_API_TOKEN", "")
@@ -81,6 +86,27 @@ def _headers() -> dict[str, str]:
     }
 
 
+async def _aircall_request(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    **kwargs: Any,
+) -> httpx.Response:
+    """Make an Aircall API request with retry on 429 (rate limit)."""
+    for attempt in range(_MAX_RETRIES + 1):
+        response = await getattr(client, method)(url, headers=_headers(), **kwargs)
+        if response.status_code != 429 or attempt == _MAX_RETRIES:
+            return response
+        # Exponential backoff: 2s, 4s, 8s
+        delay = _RETRY_BASE_DELAY * (2 ** attempt)
+        logger.warning(
+            "Aircall 429 rate limit — retry %d/%d in %.0fs",
+            attempt + 1, _MAX_RETRIES, delay,
+        )
+        await asyncio.sleep(delay)
+    return response  # unreachable but keeps type checker happy
+
+
 async def add_to_power_dialer(
     lead: dict[str, Any],
     *,
@@ -111,18 +137,20 @@ async def add_to_power_dialer(
 
     tags = _build_tags(score, created_at, interest_category)
 
-    # Step 1: Create/update contact with tags
-    contact_id = await _upsert_contact(lead, tags=tags, timeout=timeout)
+    # Use shared client for both calls (connection reuse + retry on 429)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        # Step 1: Create/update contact with tags
+        contact_id = await _upsert_contact(client, lead, tags=tags)
 
-    # Step 2: Push phone number into Closer's dialer campaign
-    return await _push_to_dialer_campaign(lead, timeout=timeout)
+        # Step 2: Push phone number into Closer's dialer campaign
+        return await _push_to_dialer_campaign(client, lead)
 
 
 async def _upsert_contact(
+    client: httpx.AsyncClient,
     lead: dict[str, Any],
     *,
     tags: list[str] | None = None,
-    timeout: float,
 ) -> str:
     """Create or update an Aircall contact. Returns the Aircall contact ID."""
     phone = lead.get("phone", "")
@@ -139,12 +167,9 @@ async def _upsert_contact(
     if tags:
         payload["tags"] = tags
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(
-            f"{AIRCALL_BASE}/contacts",
-            headers=_headers(),
-            json=payload,
-        )
+    response = await _aircall_request(
+        client, "post", f"{AIRCALL_BASE}/contacts", json=payload,
+    )
 
     if response.status_code not in (200, 201):
         logger.error(
@@ -159,19 +184,17 @@ async def _upsert_contact(
 
 
 async def _push_to_dialer_campaign(
+    client: httpx.AsyncClient,
     lead: dict[str, Any],
-    *,
-    timeout: float,
 ) -> dict[str, Any]:
     """Push a phone number into the Closer's Dialer Campaign."""
     phone = lead.get("phone", "")
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(
-            f"{AIRCALL_BASE}/users/{AIRCALL_CLOSER_USER_ID}/dialer_campaign/phone_numbers",
-            headers=_headers(),
-            json={"phone_numbers": [phone]},
-        )
+    response = await _aircall_request(
+        client, "post",
+        f"{AIRCALL_BASE}/users/{AIRCALL_CLOSER_USER_ID}/dialer_campaign/phone_numbers",
+        json={"phone_numbers": [phone]},
+    )
 
     if response.status_code not in (200, 201):
         # 422 with "already imported" is OK — number already in campaign
@@ -210,10 +233,9 @@ async def remove_from_power_dialer(
 
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            # Remove the phone number from the Closer's dialer campaign
-            response = await client.delete(
+            response = await _aircall_request(
+                client, "delete",
                 f"{AIRCALL_BASE}/users/{AIRCALL_CLOSER_USER_ID}/dialer_campaign/phone_numbers",
-                headers=_headers(),
                 json={"phone_numbers": [phone]},
             )
 
@@ -255,9 +277,8 @@ async def log_call_outcome(
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         # Step 1: Find the Aircall contact by phone number
-        search_resp = await client.get(
-            f"{AIRCALL_BASE}/contacts",
-            headers=_headers(),
+        search_resp = await _aircall_request(
+            client, "get", f"{AIRCALL_BASE}/contacts",
             params={"phone_number": phone, "order": "desc", "order_by": "created_at", "per_page": 1},
         )
 
@@ -282,9 +303,8 @@ async def log_call_outcome(
         updated_info = f"{new_entry}\n{existing_info}".strip()
 
         # Step 3: PATCH contact with updated information field
-        update_resp = await client.put(
-            f"{AIRCALL_BASE}/contacts/{aircall_id}",
-            headers=_headers(),
+        update_resp = await _aircall_request(
+            client, "put", f"{AIRCALL_BASE}/contacts/{aircall_id}",
             json={"information": updated_info},
         )
 
