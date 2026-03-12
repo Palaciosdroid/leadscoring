@@ -22,14 +22,12 @@ from batch.scorer import run_batch_scoring
 from integrations.hubspot import (
     HS_DISPOSITION_MAP,
     upsert_contact_score,
-    get_call_stats,
-    get_daily_call_stats,
     get_latest_call_for_contact,
     get_prioritized_contacts,
     write_call_outcome,
 )
 from integrations.aircall import add_to_power_dialer
-from integrations.slack import send_hot_lead_alert, send_call_report, send_daily_summary
+from integrations.slack import send_hot_lead_alert, send_daily_summary
 from scoring.combined import combine_scores
 from scoring.engagement import calculate_engagement_score
 from scoring.interest import detect_interest_category
@@ -418,8 +416,6 @@ async def hubspot_call_webhook(payload: HubSpotCallPayload):
     associations API (the workflow can only pass contact properties, not call properties).
     Also writes lead_last_call_date + lead_last_call_outcome back to the contact.
     """
-    import asyncio
-
     contact_name = f"{payload.contact_firstname} {payload.contact_lastname}".strip() or "Unknown"
 
     # Resolve call properties: prefer live HubSpot data over payload fields
@@ -456,32 +452,14 @@ async def hubspot_call_webhook(payload: HubSpotCallPayload):
     except (ValueError, TypeError, OSError):
         ts_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    # Write outcome + call date back to HubSpot AND fetch stats — all in parallel
-    tasks = [get_call_stats(), get_daily_call_stats()]
+    # Write outcome back to HubSpot contact
     if payload.contact_id:
-        tasks.append(write_call_outcome(payload.contact_id, outcome))
+        try:
+            await write_call_outcome(payload.contact_id, outcome)
+        except Exception as e:
+            logger.error("HubSpot write_call_outcome failed: %s", e)
 
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    (calls_7d, calls_30d, calls_365d) = results[0] if not isinstance(results[0], Exception) else (0, 0, 0)
-    (outbound_total, outbound_connected, inbound_connected, inbound_dur_today) = (
-        results[1] if not isinstance(results[1], Exception) else (0, 0, 0, 0)
-    )
-
-    await send_call_report(
-        contact_name=contact_name,
-        direction=direction,
-        outcome=outcome,
-        duration_sec=duration_sec,
-        timestamp=ts_str,
-        calls_7d=calls_7d,
-        calls_30d=calls_30d,
-        calls_365d=calls_365d,
-        outbound_total_today=outbound_total,
-        outbound_connected_today=outbound_connected,
-        inbound_connected_today=inbound_connected,
-        inbound_duration_sec_today=inbound_dur_today,
-        contact_id=payload.contact_id,
-    )
+    # No individual Slack card per call — meetings are summarised in the EOD report (18:00 CET)
 
     logger.info(
         "Call webhook processed: contact=%s direction=%s outcome=%s duration=%ds",
