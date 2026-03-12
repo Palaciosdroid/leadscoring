@@ -40,10 +40,10 @@ def _is_fresh(created_at: datetime | None) -> bool:
 
 
 def _should_dial(score: float, created_at: datetime | None = None) -> bool:
-    """Decide if lead qualifies for the Power Dialer: fresh OR score >= 50."""
+    """Decide if lead qualifies for the Power Dialer: fresh OR score >= 5."""
     if _is_fresh(created_at):
         return True
-    return score >= 50
+    return score >= 5
 
 
 def _build_tags(score: float, created_at: datetime | None, interest_category: str | None) -> list[str]:

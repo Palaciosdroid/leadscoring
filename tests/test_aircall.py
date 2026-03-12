@@ -42,15 +42,15 @@ class TestShouldDial:
 
     def test_low_score_old_lead_skipped(self):
         created = datetime.now(timezone.utc) - timedelta(days=3)
-        assert _should_dial(30, created) is False
+        assert _should_dial(4, created) is False
 
-    def test_exactly_50_dials(self):
+    def test_exactly_5_dials(self):
         created = datetime.now(timezone.utc) - timedelta(days=3)
-        assert _should_dial(50, created) is True
+        assert _should_dial(5, created) is True
 
-    def test_just_below_50_skipped(self):
+    def test_just_below_5_skipped(self):
         created = datetime.now(timezone.utc) - timedelta(days=3)
-        assert _should_dial(49, created) is False
+        assert _should_dial(4, created) is False
 
 
 class TestBuildTags:

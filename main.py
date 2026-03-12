@@ -594,7 +594,7 @@ async def _score_and_update(
 
     # 7. Aircall Power Dialer (Hot + Warm) + Slack alerts
     dialer_ok = False
-    if result.combined_score >= 50 and lead.phone:
+    if result.combined_score >= 5 and lead.phone:
         try:
             notes = (
                 f"Score: {result.combined_score:.0f} | "
