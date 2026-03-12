@@ -17,9 +17,15 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from batch.scorer import run_batch_scoring
-from integrations.hubspot import upsert_contact_score
+from integrations.hubspot import (
+    upsert_contact_score,
+    get_call_stats,
+    get_latest_call_for_contact,
+    get_prioritized_contacts,
+    write_call_outcome,
+)
 from integrations.aircall import add_to_power_dialer
-from integrations.slack import send_hot_lead_alert
+from integrations.slack import send_hot_lead_alert, send_call_report
 from scoring.combined import combine_scores
 from scoring.engagement import calculate_engagement_score
 from scoring.interest import detect_interest_category
@@ -71,6 +77,20 @@ CIO_METRIC_MAP: dict[str, str | None] = {
     "failed":        None,
     "attempted":     None,
     "drafted":       None,
+}
+
+# ---------------------------------------------------------------------------
+# HubSpot call disposition UUIDs → readable labels
+# (HubSpot stores call outcomes as internal UUIDs — map them here)
+# ---------------------------------------------------------------------------
+HS_DISPOSITION_MAP: dict[str, str] = {
+    # UUIDs verified against HubSpot /calling/v1/dispositions (German portal)
+    "f240bbac-87c9-4f6e-bf70-924b57d47db7": "Kontakt aufgenommen",   # Connected
+    "b2cf5968-551e-4856-9783-52b3da59a7d0": "Voicemail hinterlassen",  # Left voicemail
+    "a4c4c377-d246-4b32-a13b-75a56a4cd0ff": "Live-Nachricht hinterlassen",  # Left live msg
+    "73a0d17f-1163-4015-bdd5-ec830791da20": "Keine Antwort",          # No answer
+    "9d9162e7-6cf3-4944-bf63-4dff82258764": "Besetzt",                # Busy
+    "17b47fee-58de-441e-a44c-c6300d46f273": "Falsche Nummer",         # Wrong number
 }
 
 CHECKOUT_URL_PATTERNS  = ("checkout", "warenkorb", "order", "buy")
@@ -161,6 +181,10 @@ class LeadContext(BaseModel):
     firstname: str = ""
     lastname: str = ""
     phone: str = ""
+    funnel_source: str = Field(
+        default="",
+        description="Which CIO campaign/funnel brought this lead. Written to lead_funnel_source in HubSpot.",
+    )
     created_at: datetime | None = Field(
         default=None,
         description="UTC datetime when lead opted in. Used for Aircall fresh-list routing.",
@@ -176,6 +200,23 @@ class ScoreResponse(BaseModel):
     interest_category: str | None
     hubspot_updated: bool
     dialer_added: bool
+
+
+class HubSpotCallPayload(BaseModel):
+    """
+    Properties HubSpot sends via Workflow → Custom Webhook when a call is logged.
+
+    contact_id is the HubSpot contact object ID (hs_object_id).
+    When present, the endpoint fetches live call details directly from HubSpot
+    so the workflow only needs to send contact_id + name — no call properties needed.
+    """
+    contact_id:          str = ""              # HubSpot contact ID (hs_object_id)
+    contact_firstname:   str = ""
+    contact_lastname:    str = ""
+    hs_call_direction:   str = "OUTBOUND"      # OUTBOUND | INBOUND
+    hs_call_disposition: str = ""              # UUID — mapped via HS_DISPOSITION_MAP
+    hs_call_duration:    int = 0               # milliseconds
+    hs_timestamp:        int = 0               # Unix milliseconds
 
 
 # ---------------------------------------------------------------------------
@@ -242,13 +283,27 @@ async def _handle_cio_reporting_webhook(body: dict[str, Any]) -> ScoreResponse:
 
     # Extract lead info from CIO's identifiers
     identifiers = data.get("identifiers", {}) or {}
-    contact_id = data.get("customer_id") or identifiers.get("id") or identifiers.get("cio_id", "")
+    # Prefer email so hubspot.py resolves it → numeric HubSpot ID.
+    # CIO's customer_id is a hex string (not a HubSpot ID) — using it directly causes 404s.
+    contact_id = (
+        identifiers.get("email")
+        or data.get("recipient")
+        or data.get("customer_id")
+        or identifiers.get("id")
+        or identifiers.get("cio_id", "")
+    )
     if not contact_id:
         raise HTTPException(status_code=422, detail="No customer_id or identifiers.id in CIO payload")
+
+    # CIO sends campaign_name in reporting webhook — use it to derive funnel source
+    campaign_name = data.get("campaign_name", "") or ""
+    click_url     = data.get("href", "") or data.get("link_url", "")
+    funnel_source = _detect_funnel_source(campaign_name, click_url) if campaign_name else ""
 
     lead = LeadContext(
         contact_id=str(contact_id),
         email=identifiers.get("email", "") or data.get("recipient", ""),
+        funnel_source=funnel_source,
     )
 
     # Build mapped event — convert CIO Unix epoch → ISO 8601
@@ -308,6 +363,124 @@ async def score_lead(
     return await _score_and_update(events, lead, pre_mapped=True)
 
 
+@app.post("/webhook/hubspot/call")
+async def hubspot_call_webhook(payload: HubSpotCallPayload):
+    """
+    Receive a HubSpot Call activity webhook.
+    Setup: HubSpot Workflow → "notes_last_contacted changed" → Custom Webhook → this endpoint.
+
+    When contact_id is provided, fetches live call details from HubSpot via the
+    associations API (the workflow can only pass contact properties, not call properties).
+    Also writes lead_last_call_date + lead_last_call_outcome back to the contact.
+    """
+    import asyncio
+
+    contact_name = f"{payload.contact_firstname} {payload.contact_lastname}".strip() or "Unknown"
+
+    # Resolve call properties: prefer live HubSpot data over payload fields
+    direction    = payload.hs_call_direction
+    disposition  = payload.hs_call_disposition
+    duration_ms  = payload.hs_call_duration
+    ts_raw_ms    = payload.hs_timestamp
+
+    if payload.contact_id:
+        live_call = await get_latest_call_for_contact(payload.contact_id)
+        if live_call:
+            direction   = live_call.get("hs_call_direction",   direction)
+            disposition = live_call.get("hs_call_disposition", disposition)
+            try:
+                duration_ms = int(live_call.get("hs_call_duration", duration_ms) or duration_ms)
+            except (ValueError, TypeError):
+                pass
+            # Prefer hs_timestamp (call start) over hs_createdate (record created)
+            ts_raw_ms = live_call.get("hs_timestamp") or live_call.get("hs_createdate") or ts_raw_ms
+
+    outcome      = HS_DISPOSITION_MAP.get(disposition, disposition or "Unknown")
+    duration_sec = (duration_ms or 0) // 1000
+
+    # Parse timestamp
+    try:
+        if isinstance(ts_raw_ms, str):
+            # ISO string from live_call (hs_createdate)
+            ts = datetime.fromisoformat(ts_raw_ms.replace("Z", "+00:00"))
+        elif ts_raw_ms:
+            ts = datetime.fromtimestamp(int(ts_raw_ms) / 1000, tz=timezone.utc)
+        else:
+            ts = datetime.now(tz=timezone.utc)
+        ts_str = ts.strftime("%Y-%m-%d %H:%M UTC")
+    except (ValueError, TypeError, OSError):
+        ts_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    # Write outcome + call date back to HubSpot AND fetch stats — in parallel
+    stats_task   = asyncio.create_task(get_call_stats())
+    outcome_task = asyncio.create_task(
+        write_call_outcome(payload.contact_id, outcome)
+    ) if payload.contact_id else None
+
+    (calls_7d, calls_30d, calls_365d) = await stats_task
+    if outcome_task:
+        await outcome_task
+
+    await send_call_report(
+        contact_name=contact_name,
+        direction=direction,
+        outcome=outcome,
+        duration_sec=duration_sec,
+        timestamp=ts_str,
+        calls_7d=calls_7d,
+        calls_30d=calls_30d,
+        calls_365d=calls_365d,
+    )
+
+    logger.info(
+        "Call webhook processed: contact=%s direction=%s outcome=%s duration=%ds",
+        contact_name, direction, outcome, duration_sec,
+    )
+    return {"status": "ok", "contact": contact_name, "outcome": outcome, "duration_sec": duration_sec}
+
+
+@app.get("/batch/prioritize")
+async def batch_prioritize(limit: int = 200):
+    """
+    Return the outbound calling queue sorted by priority:
+      1. Hot  (lead_tier=1_hot)  — not called in last 24h
+      2. Warm (lead_tier=2_warm) — not called in last 48h
+      3. Cold (lead_tier=3_cold) — not called in last 7d
+    Only contacts with a phone number. Never-called contacts are always included.
+    """
+    contacts = await get_prioritized_contacts(limit=limit)
+
+    queue = []
+    for rank, c in enumerate(contacts, start=1):
+        props = c.get("properties", {}) or {}
+        queue.append({
+            "rank":          rank,
+            "contact_id":    c.get("id", ""),
+            "name":          f"{props.get('firstname', '')} {props.get('lastname', '')}".strip() or "Unknown",
+            "phone":         props.get("phone", ""),
+            "email":         props.get("email", ""),
+            "tier":          props.get("lead_tier", ""),
+            "score":         props.get("lead_combined_score"),
+            "interest":      props.get("lead_interest_category"),
+            "last_called":   props.get("lead_last_call_date"),
+            "last_outcome":  props.get("lead_last_call_outcome"),
+        })
+
+    return {"total": len(queue), "contacts": queue}
+
+
+@app.post("/batch/run")
+async def batch_run():
+    """
+    Manually trigger a batch re-score of all HubSpot contacts.
+    Fire-and-forget: returns immediately while scoring runs in the background.
+    """
+    import asyncio
+    asyncio.create_task(run_batch_scoring())
+    logger.info("/batch/run triggered manually")
+    return {"status": "started", "message": "Batch scoring started in background"}
+
+
 # ---------------------------------------------------------------------------
 # Core scoring pipeline
 # ---------------------------------------------------------------------------
@@ -351,20 +524,23 @@ async def _score_and_update(
         result.lead_tier, result.interest_category,
     )
 
-    # 6. Write back to HubSpot — only if lead has a phone number
+    # 6. Write back to HubSpot
+    # Include lead_funnel_source if the CIO event carried campaign info.
+    # HubSpot will overwrite an existing value — we only send it when non-empty
+    # so contacts without campaign context keep whatever they already have.
     hubspot_ok = False
-    if not lead.phone:
-        logger.info("Skipping HubSpot + Aircall for %s — no phone number", lead.contact_id)
-    else:
-        try:
-            await upsert_contact_score(lead.contact_id, result.to_hubspot_payload())
-            hubspot_ok = True
-        except Exception as e:
-            logger.error("HubSpot update failed: %s", e)
+    try:
+        hs_payload = result.to_hubspot_payload()
+        if lead.funnel_source:
+            hs_payload["lead_funnel_source"] = lead.funnel_source
+        await upsert_contact_score(lead.contact_id, hs_payload)
+        hubspot_ok = True
+    except Exception as e:
+        logger.error("HubSpot update failed: %s", e)
 
-    # 7. Aircall Power Dialer (Hot + Warm) + Slack alerts — only if phone present
+    # 7. Aircall Power Dialer (Hot + Warm) + Slack alerts
     dialer_ok = False
-    if hubspot_ok and result.combined_score >= 50:
+    if result.combined_score >= 50 and lead.phone:
         try:
             notes = (
                 f"Score: {result.combined_score:.0f} | "
@@ -409,6 +585,38 @@ async def _score_and_update(
         hubspot_updated=hubspot_ok,
         dialer_added=dialer_ok,
     )
+
+
+def _detect_funnel_source(campaign_name: str, url: str = "") -> str:
+    """
+    Derive a clean funnel source label from a CIO campaign name or URL.
+
+    Priority order:
+      1. Product keyword in campaign name → e.g. "hypnose_email_funnel"
+      2. Product keyword in URL           → e.g. "hypnose_landing"
+      3. Raw campaign name (trimmed)      → e.g. "Launch Sequence Woche 3"
+      4. Empty string if no signal
+
+    Used to write lead_funnel_source to HubSpot so sales + marketing
+    can segment by which campaign/landing page produced each lead.
+    """
+    PRODUCT_KEYWORDS = {
+        "hypnose":   ("hypnos",),
+        "lifecoach": ("lifecoach", "life coach", "life-coach"),
+        "meditation": ("meditati",),
+    }
+    name_lower = campaign_name.lower()
+    url_lower  = url.lower()
+
+    for product, keywords in PRODUCT_KEYWORDS.items():
+        if any(k in name_lower for k in keywords):
+            return f"{product}_email_funnel"
+
+    for product, keywords in PRODUCT_KEYWORDS.items():
+        if any(k in url_lower for k in keywords):
+            return f"{product}_landing"
+
+    return campaign_name.strip()
 
 
 def _build_ai_features(
