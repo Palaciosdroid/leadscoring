@@ -18,7 +18,19 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from batch.call_poller import run_call_polling
-from batch.scorer import run_batch_scoring
+from batch.scorer import (
+    run_batch_scoring,
+    _determine_freshness,
+    _determine_list_key,
+    _determine_tier_label,
+    _build_hubspot_card_properties,
+    _build_aircall_card,
+    _build_funnel_source,
+    _extract_purchased_funnels,
+    _extract_offer_signals,
+    SCORE_WARM,
+    VALID_FUNNELS,
+)
 from batch.scheduled_calls_summarizer import run_scheduled_calls_summarizer
 from batch.unsubscribe_handler import handle_unsubscribe
 from integrations.hubspot import (
@@ -29,10 +41,21 @@ from integrations.hubspot import (
     write_call_outcome,
 )
 from integrations.aircall import add_to_power_dialer
+from integrations.supabase import (
+    fetch_touchpoints_for_emails,
+    fetch_all_lead_data,
+)
 # Slack hot lead alerts removed — Kevin handles via Aircall
 from scoring.combined import combine_scores
 from scoring.engagement import calculate_engagement_score
+from scoring.hook_engine import generate_hook
 from scoring.interest import detect_interest_category
+from scoring.touchpoint_mapper import (
+    extract_first_last_touch,
+    map_touchpoints_batch,
+    map_browser_events_batch,
+    summarize_email_activity,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -235,6 +258,36 @@ class ScoreResponse(BaseModel):
     dialer_added: bool
 
 
+class RealtimeScoreRequest(BaseModel):
+    """
+    Payload for the realtime scoring endpoint.
+
+    Triggered by HubSpot Workflow when a new contact is created or phone number added.
+    The endpoint fetches all Supabase data, scores, and pushes to HubSpot + Aircall
+    in one shot — fresh leads get scored in <5 min instead of waiting for the 30-min batch.
+    """
+    email: str = Field(..., description="Contact email (used for Supabase lookup)")
+    contact_id: str = Field(default="", description="HubSpot contact ID — resolved from email if empty")
+    firstname: str = ""
+    lastname: str = ""
+    phone: str = ""
+
+
+class RealtimeScoreResponse(BaseModel):
+    contact_id: str
+    email: str
+    engagement_score: int
+    combined_score: float
+    lead_tier: str
+    tier_label: str
+    interest_category: str | None
+    hubspot_updated: bool
+    dialer_added: bool
+    is_fresh: bool
+    list_key: str | None
+    hook: str
+
+
 class HubSpotCallPayload(BaseModel):
     """
     Properties HubSpot sends via Workflow → Custom Webhook when a call is logged.
@@ -419,6 +472,181 @@ async def score_lead(
     return await _score_and_update(events, lead, pre_mapped=True)
 
 
+@app.post("/webhook/hubspot/new-contact", response_model=RealtimeScoreResponse)
+async def realtime_score_webhook(payload: RealtimeScoreRequest):
+    """
+    Realtime lead scoring — scores a single lead on-demand in <5 seconds.
+
+    Triggered by HubSpot Workflow when:
+      - New contact created (lifecycle stage = subscriber)
+      - Phone number added/updated on existing contact
+
+    Flow:
+      1. Fetch touchpoints + events + purchases + meetings from Supabase
+      2. Score using same pipeline as batch scorer
+      3. Push score + card properties to HubSpot
+      4. Push to Aircall Power Dialer if qualified (Fresh or Warm+)
+
+    This replaces the 30-min batch wait for fresh leads — they now get
+    scored and pushed to the closer's dialer within minutes of opt-in.
+    """
+    email = payload.email.strip().lower()
+    if not email:
+        raise HTTPException(status_code=422, detail="email is required")
+
+    contact_id = payload.contact_id
+    logger.info("Realtime score: starting for %s (contact_id=%s)", email, contact_id)
+
+    # Step 1: Fetch Supabase data (touchpoints + events + purchases + meetings)
+    try:
+        touchpoints_by_email = await fetch_touchpoints_for_emails([email], days=30)
+        all_lead_data = await fetch_all_lead_data([email], days=30)
+    except Exception as e:
+        logger.error("Realtime score: Supabase fetch failed for %s: %s", email, e)
+        raise HTTPException(status_code=502, detail=f"Supabase fetch failed: {e}")
+
+    touchpoints = touchpoints_by_email.get(email, [])
+    lead_data = all_lead_data.get(email, {
+        "events": [], "purchases": [], "meetings": [], "customerio_id": None,
+    })
+    browser_events = lead_data["events"]
+    purchases = lead_data["purchases"]
+    meetings = lead_data["meetings"]
+
+    # Step 2: Score — same pipeline as batch scorer
+    scored_events = map_touchpoints_batch(touchpoints)
+    browser_scored = map_browser_events_batch(browser_events)
+    scored_events.extend(browser_scored)
+
+    engagement_result = calculate_engagement_score(scored_events)
+    interest_result = detect_interest_category(scored_events)
+
+    # Build AI features
+    ai_features = _build_ai_features(scored_events, engagement_result)
+
+    scoring = combine_scores(engagement_result, interest_result, ai_features)
+    score = scoring.combined_score
+    funnel = scoring.interest_category
+
+    # Freshness + tier
+    is_fresh, fresh_hours = _determine_freshness(touchpoints)
+    tier_label = _determine_tier_label(score, is_fresh)
+
+    # Touchpoint analysis
+    first_touch, last_touch = extract_first_last_touch(touchpoints)
+    email_summary = summarize_email_activity(touchpoints, days=14)
+    funnel_source = _build_funnel_source(touchpoints)
+    purchased_funnels = _extract_purchased_funnels(purchases)
+
+    # Multi-funnel info
+    cat_scores = interest_result.get("category_scores", {})
+    multi_funnels = [f for f in VALID_FUNNELS if cat_scores.get(f, 0) > 0]
+    multi_funnel_info = ", ".join(multi_funnels) if len(multi_funnels) > 1 else ""
+
+    # Determine list assignment
+    has_phone = bool(payload.phone)
+    should_push = has_phone and (is_fresh or score >= SCORE_WARM)
+
+    # Simplified eignungscheck check (no DNC filter in realtime — new leads are clean)
+    qualifies_eignungscheck = (
+        has_phone
+        and funnel is not None
+        and funnel not in purchased_funnels
+    )
+
+    list_key = _determine_list_key(funnel, is_fresh, score, qualifies_eignungscheck)
+
+    # Generate hook for Aircall card
+    offer_signals = _extract_offer_signals(browser_events)
+    hook_context = {
+        "email_clicked": email_summary.get("clicks", 0) > 0,
+        "last_email_subject": email_summary.get("last_email_subject", ""),
+        "is_fresh": is_fresh,
+        "fresh_hours": fresh_hours,
+        "funnel": funnel,
+        "score": score,
+        "eignungscheck": qualifies_eignungscheck,
+        "call_booked": False,
+        "purchased_products": purchased_funnels,
+        "visited_offer_page": offer_signals.get("visited_offer"),
+        "visited_checkout": offer_signals.get("visited_checkout"),
+        "watched_video_on_offer": offer_signals.get("video_on_offer"),
+        "viewed_pricing": offer_signals.get("viewed_pricing"),
+    }
+    hook = generate_hook(hook_context)
+
+    logger.info(
+        "Realtime score: %s → score=%.0f tier=%s fresh=%s list=%s",
+        email, score, tier_label, is_fresh, list_key,
+    )
+
+    # Step 3: Push to HubSpot
+    hubspot_ok = False
+    try:
+        hs_properties = _build_hubspot_card_properties(
+            scoring=scoring,
+            funnel=funnel,
+            funnel_source=funnel_source,
+            first_touch=first_touch,
+            last_touch=last_touch,
+            purchased_funnels=purchased_funnels,
+            multi_funnel_info=multi_funnel_info,
+        )
+        # Use email as contact_id if none provided (hubspot.py resolves email → ID)
+        hs_contact_id = contact_id or email
+        await upsert_contact_score(hs_contact_id, hs_properties)
+        hubspot_ok = True
+    except Exception as e:
+        logger.error("Realtime score: HubSpot update failed for %s: %s", email, e)
+
+    # Step 4: Push to Aircall Power Dialer if qualified
+    dialer_ok = False
+    if should_push and list_key and payload.phone:
+        try:
+            aircall_card = _build_aircall_card(
+                tier_label=tier_label,
+                funnel=funnel,
+                score=score,
+                last_call_date=None,
+                email_summary=email_summary,
+                first_touch=first_touch,
+                last_touch=last_touch,
+                hook=hook,
+                purchased_funnels=purchased_funnels,
+            )
+            dialer_result = await add_to_power_dialer(
+                {
+                    "phone": payload.phone,
+                    "firstname": payload.firstname,
+                    "lastname": payload.lastname,
+                    "email": email,
+                    "notes": aircall_card,
+                },
+                score=score,
+                interest_category=funnel,
+                lead_tier=scoring.lead_tier,
+            )
+            dialer_ok = dialer_result is not None
+            logger.info("Realtime score: pushed %s to Aircall [%s]", email, list_key)
+        except Exception as e:
+            logger.error("Realtime score: Aircall push failed for %s: %s", email, e)
+
+    return RealtimeScoreResponse(
+        contact_id=contact_id or email,
+        email=email,
+        engagement_score=scoring.engagement_score,
+        combined_score=score,
+        lead_tier=scoring.lead_tier,
+        tier_label=tier_label,
+        interest_category=funnel,
+        hubspot_updated=hubspot_ok,
+        dialer_added=dialer_ok,
+        is_fresh=is_fresh,
+        list_key=list_key,
+        hook=hook,
+    )
+
+
 @app.post("/webhook/hubspot/call")
 async def hubspot_call_webhook(payload: HubSpotCallPayload):
     """
@@ -566,6 +794,26 @@ async def debug_daily_summary(x_api_key: str | None = Header(default=None)):
     logger.info("/debug/daily-summary triggered manually")
     await run_scheduled_calls_summarizer()
     return {"status": "ok", "message": "Daily summary sent to Slack"}
+
+
+@app.post("/debug/realtime-score")
+async def debug_realtime_score(
+    email: str,
+    phone: str = "",
+    firstname: str = "",
+    lastname: str = "",
+    x_api_key: str | None = Header(default=None),
+):
+    """
+    Test realtime scoring for a specific email without HubSpot Workflow trigger.
+    Requires DEBUG_API_KEY. Calls the same pipeline as /webhook/hubspot/new-contact.
+    """
+    if DEBUG_API_KEY and x_api_key != DEBUG_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key header")
+    logger.info("/debug/realtime-score triggered for %s", email)
+    return await realtime_score_webhook(RealtimeScoreRequest(
+        email=email, phone=phone, firstname=firstname, lastname=lastname,
+    ))
 
 
 # ---------------------------------------------------------------------------
