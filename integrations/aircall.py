@@ -1,14 +1,17 @@
 """
 Aircall Power Dialer Integration
-Pushes scored leads into Kevin's Power Dialer campaign so he always calls the right order.
+Pushes scored leads into Kevin's Power Dialer campaign as two virtual lists:
+
+  🔥 Fresh — brand-new opt-in (< 24h), ANY score → call immediately
+  🟡 Warm  — Hot + Warm tier (score ≥ 40) → follow-up queue
+
+Cold + Disqualified leads stay in CIO nurturing only — no Aircall push.
+Both lists feed the same Power Dialer queue.  Kevin sees the tag
+("fresh" vs "warm") during the call so he knows the context.
 
 Flow:
-  1. Create/update Aircall contact with tags (fresh/warm, score-XX, Interest Category)
+  1. Create/update Aircall contact with tags (list, score-XX, Interest Category)
   2. Push phone number into the Closer's Dialer Campaign
-
-Tags visible in Aircall UI during calls:
-  🔥 fresh  → brand-new opt-in (< 24h) — call immediately
-  🟡 warm   → Score ≥ 50, older leads worth following up
 
 Docs: https://developer.aircall.io/api-references/
 """
@@ -29,6 +32,8 @@ AIRCALL_BASE         = "https://api.aircall.io/v1"
 AIRCALL_CLOSER_USER_ID = os.environ.get("AIRCALL_CLOSER_USER_ID", "")
 
 FRESH_WINDOW_HOURS = 24
+# Tiers that qualify for the Aircall Power Dialer (Hot + Warm = "Warm" list)
+DIALABLE_TIERS: frozenset[str] = frozenset({"1_hot", "2_warm"})
 
 
 def _is_fresh(created_at: datetime | None) -> bool:
@@ -39,20 +44,27 @@ def _is_fresh(created_at: datetime | None) -> bool:
     return age_hours < FRESH_WINDOW_HOURS
 
 
-def _should_dial(score: float, created_at: datetime | None = None) -> bool:
-    """Decide if lead qualifies for the Power Dialer: fresh OR score >= 5."""
+def _should_dial(score: float, created_at: datetime | None = None, lead_tier: str = "") -> bool:
+    """Decide if lead qualifies for the Power Dialer.
+
+    Fresh list: any score, opted in < 24h → always dial.
+    Warm list:  tier is 1_hot or 2_warm   → dial.
+    Cold/Disqualified: CIO nurturing only → skip.
+    """
     if _is_fresh(created_at):
         return True
-    return score >= 5
+    return lead_tier in DIALABLE_TIERS
+
+
+def _classify_list(created_at: datetime | None) -> str:
+    """Return which virtual list this lead belongs to: 'fresh' or 'warm'."""
+    return "fresh" if _is_fresh(created_at) else "warm"
 
 
 def _build_tags(score: float, created_at: datetime | None, interest_category: str | None) -> list[str]:
     """Build Aircall contact tags for the Closer to see during calls."""
-    tags = [f"score-{int(score)}"]
-    if _is_fresh(created_at):
-        tags.append("fresh")
-    else:
-        tags.append("warm")
+    list_type = _classify_list(created_at)
+    tags = [list_type, f"score-{int(score)}"]
     if interest_category:
         tags.append(interest_category)
     return tags
@@ -75,23 +87,25 @@ async def add_to_power_dialer(
     score: float = 0,
     created_at: datetime | None = None,
     interest_category: str | None = None,
+    lead_tier: str = "",
     timeout: float = 10.0,
 ) -> dict[str, Any] | None:
     """
     Push a lead into the Closer's Aircall Power Dialer campaign.
 
-    1. Upsert contact with tags (score, fresh/warm, interest)
-    2. Push phone number into Closer's dialer campaign
+    Two virtual lists:
+      Fresh — opted in < 24h, any score → immediate call
+      Warm  — tier is 1_hot or 2_warm  → follow-up queue
 
     lead must contain: phone, firstname, lastname, email
-    Returns None if score too low and not fresh.
+    Returns None if not qualified (cold/disqualified and not fresh).
     """
     if not AIRCALL_API_ID or not AIRCALL_API_TOKEN:
         raise EnvironmentError("AIRCALL_API_ID and AIRCALL_API_TOKEN must be set")
     if not AIRCALL_CLOSER_USER_ID:
         raise EnvironmentError("AIRCALL_CLOSER_USER_ID must be set")
 
-    if not _should_dial(score, created_at):
+    if not _should_dial(score, created_at, lead_tier):
         logger.debug("Aircall: score %.0f too low, not fresh — skipping %s", score, lead.get("email"))
         return None
 

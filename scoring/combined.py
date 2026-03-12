@@ -3,11 +3,14 @@ Combined Score + Lead Tier
 Merges Engagement Score with optional AI Predictive Score
 and returns the final tier (Hot / Warm / Cold / Disqualified).
 
-Tiers per spec:
-  Hot          >= 75  -> immediate JustCall dial
-  Warm         40-74  -> follow-up within 24h
-  Cold          0-39  -> nurturing campaign (Customer.io)
+Tiers (calibrated for current CIO data — email opens/clicks only):
+  Hot          >= 25  -> immediate Aircall dial
+  Warm         15-24  -> follow-up within 24h
+  Cold          0-14  -> nurturing campaign (Customer.io)
   Disqualified  < 0   -> do not contact (unsubscribed)
+
+NOTE: Raise thresholds once video/page/checkout events are active in CIO.
+  Target thresholds: Hot >= 60, Warm >= 30, Cold >= 0.
 """
 
 from __future__ import annotations
@@ -25,8 +28,8 @@ AI_WEIGHT = 0.30
 # Using threshold-only (>= check) avoids float boundary gaps (e.g. 39.5)
 # ---------------------------------------------------------------------------
 TIERS: list[tuple[str, float]] = [
-    ("1_hot",          75.0),
-    ("2_warm",         40.0),
+    ("1_hot",          25.0),
+    ("2_warm",         15.0),
     ("3_cold",          0.0),
     ("4_disqualified", float("-inf")),
 ]
@@ -109,13 +112,13 @@ class ScoringResult:
     def to_hubspot_payload(self) -> dict[str, Any]:
         from datetime import datetime, timezone
         return {
-            "sbc_engagement_score":  self.engagement_score,
-            "sbc_ai_score":          self.ai_score,
-            "sbc_combined_score":    self.combined_score,
-            "sbc_lead_tier":         self.lead_tier,
-            "sbc_interest_category": self.interest_category,
-            "sbc_score_updated_at":  datetime.now(timezone.utc).isoformat(),
-            "sbc_score_version":     self.score_version,
+            "lead_engagement_score":  self.engagement_score,
+            "lead_ai_score":          self.ai_score,
+            "lead_combined_score":    self.combined_score,
+            "lead_tier":         self.lead_tier,
+            "lead_interest_category": self.interest_category,
+            "lead_score_updated_at":  datetime.now(timezone.utc).isoformat(),
+            "lead_score_version":     self.score_version,
         }
 
     @property

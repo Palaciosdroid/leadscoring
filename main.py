@@ -592,9 +592,9 @@ async def _score_and_update(
     except Exception as e:
         logger.error("HubSpot update failed: %s", e)
 
-    # 7. Aircall Power Dialer (Hot + Warm) + Slack alerts
+    # 7. Aircall Power Dialer — _should_dial decides: Fresh (< 24h) or Warm (Hot+Warm tier)
     dialer_ok = False
-    if result.combined_score >= 5 and lead.phone:
+    if lead.phone:
         try:
             notes = (
                 f"Score: {result.combined_score:.0f} | "
@@ -612,6 +612,7 @@ async def _score_and_update(
                 score=result.combined_score,
                 created_at=lead.created_at,
                 interest_category=result.interest_category,
+                lead_tier=result.lead_tier,
             )
             dialer_ok = dialer_result is not None
         except Exception as e:

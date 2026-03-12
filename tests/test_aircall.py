@@ -33,24 +33,34 @@ class TestIsFresh:
 
 class TestShouldDial:
     def test_fresh_lead_always_dials(self):
+        """Fresh leads (< 24h) dial regardless of score or tier."""
         created = datetime.now(timezone.utc) - timedelta(hours=1)
-        assert _should_dial(30, created) is True  # fresh trumps low score
+        assert _should_dial(0, created, lead_tier="3_cold") is True
 
-    def test_warm_score_dials(self):
-        created = datetime.now(timezone.utc) - timedelta(days=3)
-        assert _should_dial(60, created) is True
+    def test_hot_tier_dials(self):
+        """Hot tier (1_hot) qualifies for the Power Dialer."""
+        old = datetime.now(timezone.utc) - timedelta(days=3)
+        assert _should_dial(30, old, lead_tier="1_hot") is True
 
-    def test_low_score_old_lead_skipped(self):
-        created = datetime.now(timezone.utc) - timedelta(days=3)
-        assert _should_dial(4, created) is False
+    def test_warm_tier_dials(self):
+        """Warm tier (2_warm) qualifies for the Power Dialer."""
+        old = datetime.now(timezone.utc) - timedelta(days=3)
+        assert _should_dial(20, old, lead_tier="2_warm") is True
 
-    def test_exactly_5_dials(self):
-        created = datetime.now(timezone.utc) - timedelta(days=3)
-        assert _should_dial(5, created) is True
+    def test_cold_tier_skipped(self):
+        """Cold tier (3_cold) does NOT qualify — CIO nurturing only."""
+        old = datetime.now(timezone.utc) - timedelta(days=3)
+        assert _should_dial(10, old, lead_tier="3_cold") is False
 
-    def test_just_below_5_skipped(self):
-        created = datetime.now(timezone.utc) - timedelta(days=3)
-        assert _should_dial(4, created) is False
+    def test_disqualified_tier_skipped(self):
+        """Disqualified tier (4_disqualified) does NOT qualify."""
+        old = datetime.now(timezone.utc) - timedelta(days=3)
+        assert _should_dial(-10, old, lead_tier="4_disqualified") is False
+
+    def test_empty_tier_not_fresh_skipped(self):
+        """No tier + not fresh → skip."""
+        old = datetime.now(timezone.utc) - timedelta(days=3)
+        assert _should_dial(50, old, lead_tier="") is False
 
 
 class TestBuildTags:
@@ -90,9 +100,10 @@ class TestAddToPowerDialer:
     @patch("integrations.aircall.AIRCALL_API_ID", "test-id")
     @patch("integrations.aircall.AIRCALL_API_TOKEN", "test-token")
     @patch("integrations.aircall.AIRCALL_CLOSER_USER_ID", "12345")
-    async def test_low_score_returns_none(self):
+    async def test_cold_tier_returns_none(self):
+        """Cold tier lead is not pushed to the Power Dialer."""
         old = datetime.now(timezone.utc) - timedelta(days=3)
-        result = await add_to_power_dialer(self.LEAD, score=30, created_at=old)
+        result = await add_to_power_dialer(self.LEAD, score=10, created_at=old, lead_tier="3_cold")
         assert result is None
 
     @pytest.mark.asyncio
@@ -101,9 +112,10 @@ class TestAddToPowerDialer:
     @patch("integrations.aircall.AIRCALL_CLOSER_USER_ID", "12345")
     @patch("integrations.aircall._upsert_contact", new_callable=AsyncMock, return_value="c-99")
     @patch("integrations.aircall._push_to_dialer_campaign", new_callable=AsyncMock, return_value={"status": "added", "phone": "+4915112345678"})
-    async def test_warm_lead_pushes_to_dialer(self, mock_push, mock_upsert):
+    async def test_warm_tier_pushes_to_dialer(self, mock_push, mock_upsert):
+        """Warm tier lead gets pushed to the Power Dialer."""
         old = datetime.now(timezone.utc) - timedelta(days=3)
-        result = await add_to_power_dialer(self.LEAD, score=70, created_at=old, interest_category="Coaching")
+        result = await add_to_power_dialer(self.LEAD, score=20, created_at=old, interest_category="Coaching", lead_tier="2_warm")
         assert result is not None
         assert result["status"] == "added"
         mock_upsert.assert_called_once()

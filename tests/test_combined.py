@@ -95,8 +95,8 @@ class TestScoringResult:
             unsubscribed=False,
         )
         payload = r.to_hubspot_payload()
-        assert payload["sbc_engagement_score"] == 60
-        assert payload["sbc_lead_tier"] == "2_warm"
-        assert payload["sbc_interest_category"] == "lifecoach"
-        assert payload["sbc_score_version"] == "1.0.0"
-        assert "sbc_score_updated_at" in payload
+        assert payload["lead_engagement_score"] == 60
+        assert payload["lead_tier"] == "2_warm"
+        assert payload["lead_interest_category"] == "lifecoach"
+        assert payload["lead_score_version"] == "1.0.0"
+        assert "lead_score_updated_at" in payload

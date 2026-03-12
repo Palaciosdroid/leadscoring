@@ -36,8 +36,7 @@ async def _fetch_active_hubspot_leads() -> list[dict[str, Any]]:
         "filterGroups": [
             {
                 "filters": [
-                    {"propertyName": "lead_tier", "operator": "HAS_PROPERTY"},
-                    {"propertyName": "phone", "operator": "HAS_PROPERTY"},
+                    {"propertyName": "lead_tier", "operator": "HAS_PROPERTY"}
                 ]
             }
         ],
@@ -156,8 +155,10 @@ def _normalise_cio_activity(activity: dict[str, Any]) -> dict[str, Any]:
 async def run_batch_scoring() -> None:
     """
     Main batch job: fetch leads → re-score → update HubSpot.
+    Fires a Slack decay alert when a contact's tier drops due to inactivity.
     """
     from main import _score_and_update, LeadContext
+    from integrations.slack import send_decay_alert, TIER_ORDER
 
     logger.info("Batch scoring: starting run")
 
@@ -169,14 +170,19 @@ async def run_batch_scoring() -> None:
 
     logger.info("Batch: %d leads to re-score", len(leads))
     updated = 0
+    decayed = 0
 
     for contact in leads:
-        props = contact.get("properties", {})
+        props      = contact.get("properties", {})
         contact_id = contact.get("id", "")
-        email = props.get("email", "")
+        email      = props.get("email", "")
 
         if not contact_id or not email:
             continue
+
+        # Capture current tier/score BEFORE scoring — needed for decay detection
+        old_tier  = props.get("lead_tier", "")
+        old_score = float(props.get("lead_engagement_score") or 0)
 
         try:
             raw_activities = await _fetch_cio_events(email)
@@ -190,10 +196,40 @@ async def run_batch_scoring() -> None:
                 phone=props.get("phone", ""),
             )
 
-            await _score_and_update(raw_events, lead)
+            score_result = await _score_and_update(raw_events, lead)
             updated += 1
+
+            # Detect tier drop: higher TIER_ORDER rank = worse tier
+            new_tier  = score_result.lead_tier
+            new_score = float(score_result.combined_score)
+            if (
+                old_tier
+                and new_tier
+                and TIER_ORDER.get(new_tier, 99) > TIER_ORDER.get(old_tier, 99)
+            ):
+                decayed += 1
+                logger.info(
+                    "Batch decay: %s %s → %s (%.0f → %.0f)",
+                    email, old_tier, new_tier, old_score, new_score,
+                )
+                try:
+                    name = f"{props.get('firstname', '')} {props.get('lastname', '')}".strip() or email
+                    await send_decay_alert(
+                        name=name,
+                        email=email,
+                        old_tier=old_tier,
+                        new_tier=new_tier,
+                        old_score=old_score,
+                        new_score=new_score,
+                        interest_category=score_result.interest_category,
+                    )
+                except Exception as slack_err:
+                    logger.error("Batch: decay Slack alert failed for %s: %s", email, slack_err)
 
         except Exception as e:
             logger.error("Batch: failed to score %s: %s", email, e)
 
-    logger.info("Batch scoring: done — %d/%d contacts updated", updated, len(leads))
+    logger.info(
+        "Batch scoring: done — %d/%d contacts updated, %d tier decays detected",
+        updated, len(leads), decayed,
+    )
