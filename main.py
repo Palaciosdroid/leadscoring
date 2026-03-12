@@ -16,8 +16,10 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from batch.call_poller import run_call_polling
 from batch.scorer import run_batch_scoring
 from integrations.hubspot import (
+    HS_DISPOSITION_MAP,
     upsert_contact_score,
     get_call_stats,
     get_latest_call_for_contact,
@@ -79,20 +81,6 @@ CIO_METRIC_MAP: dict[str, str | None] = {
     "drafted":       None,
 }
 
-# ---------------------------------------------------------------------------
-# HubSpot call disposition UUIDs → readable labels
-# (HubSpot stores call outcomes as internal UUIDs — map them here)
-# ---------------------------------------------------------------------------
-HS_DISPOSITION_MAP: dict[str, str] = {
-    # UUIDs verified against HubSpot /calling/v1/dispositions (German portal)
-    "f240bbac-87c9-4f6e-bf70-924b57d47db7": "Kontakt aufgenommen",   # Connected
-    "b2cf5968-551e-4856-9783-52b3da59a7d0": "Voicemail hinterlassen",  # Left voicemail
-    "a4c4c377-d246-4b32-a13b-75a56a4cd0ff": "Live-Nachricht hinterlassen",  # Left live msg
-    "73a0d17f-1163-4015-bdd5-ec830791da20": "Keine Antwort",          # No answer
-    "9d9162e7-6cf3-4944-bf63-4dff82258764": "Besetzt",                # Busy
-    "17b47fee-58de-441e-a44c-c6300d46f273": "Falsche Nummer",         # Wrong number
-}
-
 CHECKOUT_URL_PATTERNS  = ("checkout", "warenkorb", "order", "buy")
 SALES_PAGE_PATTERNS    = ("ausbildung", "coaching", "kurs", "programm", "product")
 PRICE_INFO_PATTERNS    = ("preis", "price", "invest", "kosten", "cost")
@@ -143,6 +131,10 @@ scheduler = AsyncIOScheduler()
 BATCH_INTERVAL_MINUTES = int(os.environ.get("BATCH_INTERVAL_MINUTES", "30"))
 
 
+CALL_POLL_INTERVAL_MINUTES = int(os.environ.get("CALL_POLL_INTERVAL_MINUTES", "5"))
+CALL_POLL_WINDOW_MINUTES   = int(os.environ.get("CALL_POLL_WINDOW_MINUTES",    "10"))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     scheduler.add_job(
@@ -152,8 +144,20 @@ async def lifespan(app: FastAPI):
         id="batch_scoring",
         replace_existing=True,
     )
+    # Poll HubSpot for completed calls — replaces Workflow → Webhook (Operations Hub Pro)
+    scheduler.add_job(
+        run_call_polling,
+        "interval",
+        minutes=CALL_POLL_INTERVAL_MINUTES,
+        kwargs={"since_minutes": CALL_POLL_WINDOW_MINUTES},
+        id="call_polling",
+        replace_existing=True,
+    )
     scheduler.start()
-    logger.info("Batch scoring scheduler started (every %d min)", BATCH_INTERVAL_MINUTES)
+    logger.info(
+        "Schedulers started — batch scoring every %dm, call polling every %dm (window=%dm)",
+        BATCH_INTERVAL_MINUTES, CALL_POLL_INTERVAL_MINUTES, CALL_POLL_WINDOW_MINUTES,
+    )
     yield
     scheduler.shutdown()
 
