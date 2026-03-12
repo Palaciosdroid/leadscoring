@@ -158,21 +158,40 @@ def _build_daily_summary(
     inbound_connected: int,
     inbound_duration_sec: int,
     date_label: str,
+    scheduled_total: int = 0,
+    scheduled_hot: int = 0,
+    scheduled_warm: int = 0,
+    scheduled_cold: int = 0,
 ) -> dict[str, Any]:
-    """EOD summary card — sent once per day at 18:00 CET."""
+    """EOD summary card — sent once per day at 18:00 CET.
+
+    Combines:
+    - Past 7 days: completed calls (Anschläge) and conversion metrics
+    - Next 7 days: scheduled calls by lead tier
+    """
     meetings_total = outbound_connected + inbound_connected
     conversion_pct = (outbound_connected / outbound_total * 100) if outbound_total else 0.0
     total_talk_min = inbound_duration_sec // 60
 
+    # SECTION 1: Past 7 days — completed calls
     lines = [
-        f"*Outbound Anschläge:* {outbound_total}",
-        f"*Outbound Meetings:* {outbound_connected}  _{conversion_pct:.1f}% conversion_",
-        f"*Inbound Meetings:* {inbound_connected}",
-        "─" * 30,
-        f"*Meetings gesamt:* {meetings_total}",
+        "*LETZTE 7 TAGE — Abgeschlossene Anrufe:*",
+        f"  Outbound Anschläge: {outbound_total}",
+        f"  Outbound Meetings: {outbound_connected}  ({conversion_pct:.1f}% conversion)",
+        f"  Inbound Meetings: {inbound_connected}",
     ]
     if inbound_connected > 0 and total_talk_min > 0:
-        lines.append(f"*Inbound Gesprächszeit:* {total_talk_min}m")
+        lines.append(f"  Gesamte Gesprächszeit (Inbound): {total_talk_min}m")
+
+    lines.append("─" * 50)
+
+    # SECTION 2: Next 7 days — scheduled calls by tier
+    lines.append("*NÄCHSTE 7 TAGE — Eingeplante Anrufe:*")
+    lines.append(f"  🔥 Hot Tier: {scheduled_hot}")
+    lines.append(f"  🟡 Warm Tier: {scheduled_warm}")
+    lines.append(f"  🔵 Cold Tier: {scheduled_cold}")
+    lines.append(f"  ─────────────")
+    lines.append(f"  Gesamt eingeplant: {scheduled_total}")
 
     return {
         "blocks": [
@@ -233,10 +252,19 @@ async def send_daily_summary(
     outbound_connected: int,
     inbound_connected: int,
     inbound_duration_sec: int,
+    scheduled_total: int = 0,
+    scheduled_hot: int = 0,
+    scheduled_warm: int = 0,
+    scheduled_cold: int = 0,
     *,
     timeout: float = 5.0,
 ) -> None:
-    """Post the EOD summary card to #sales-calls at 18:00 CET."""
+    """Post the EOD summary card to #sales-calls at 18:00 CET.
+
+    Combines:
+    - Past 7 days: completed calls from call polling
+    - Next 7 days: scheduled calls from HubSpot meeting scheduler
+    """
     if not SLACK_CALLS_WEBHOOK_URL:
         logger.warning("SLACK_CALLS_WEBHOOK_URL not set — skipping daily summary")
         return
@@ -246,6 +274,7 @@ async def send_daily_summary(
 
     message = _build_daily_summary(
         outbound_total, outbound_connected, inbound_connected, inbound_duration_sec, date_label,
+        scheduled_total, scheduled_hot, scheduled_warm, scheduled_cold,
     )
 
     async with httpx.AsyncClient(timeout=timeout) as client:
@@ -255,8 +284,8 @@ async def send_daily_summary(
         logger.error("Slack daily summary failed: %s %s", response.status_code, response.text)
     else:
         logger.info(
-            "Slack daily summary sent: outbound=%d connected=%d inbound=%d",
-            outbound_total, outbound_connected, inbound_connected,
+            "Slack daily summary sent: outbound=%d connected=%d inbound=%d scheduled=%d",
+            outbound_total, outbound_connected, inbound_connected, scheduled_total,
         )
 
 

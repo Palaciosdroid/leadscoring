@@ -19,6 +19,7 @@ from integrations.hubspot import (
     poll_completed_calls,
     write_call_outcome,
 )
+from integrations.slack import send_call_report
 logger = logging.getLogger(__name__)
 
 # In-memory dedup set — prevents duplicate processing of the same call
@@ -75,6 +76,20 @@ async def run_call_polling(since_minutes: int = 10) -> None:
 
         phone = call.get("contact_phone", "")
 
+        # Format timestamp for Slack (HubSpot sends ISO 8601)
+        from datetime import datetime
+        ts_str = ""
+        try:
+            ts_raw = call.get("hs_timestamp", "")
+            if ts_raw:
+                if isinstance(ts_raw, str):
+                    ts_obj = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+                else:
+                    ts_obj = datetime.fromtimestamp(int(ts_raw) / 1000, tz=None)
+                ts_str = ts_obj.strftime("%Y-%m-%d %H:%M UTC")
+        except Exception:
+            ts_str = call.get("hs_timestamp", "")
+
         # 1. Write outcome back to HubSpot contact
         await write_call_outcome(contact_id, outcome)
 
@@ -85,7 +100,21 @@ async def run_call_polling(since_minutes: int = 10) -> None:
             except Exception as ac_err:
                 logger.warning("call_poller: Aircall outcome log failed for %s: %s", contact_name, ac_err)
 
-        # No individual Slack card per call — meetings are summarised in the EOD report (18:00 CET)
+        # 3. Post call report to Slack #sales-calls channel
+        try:
+            await send_call_report(
+                contact_name=contact_name,
+                direction=direction,
+                outcome=outcome,
+                duration_sec=duration_sec,
+                timestamp=ts_str,
+                calls_7d=0,
+                calls_30d=0,
+                calls_365d=0,
+                contact_id=contact_id,
+            )
+        except Exception as slack_err:
+            logger.warning("call_poller: Slack report failed for %s: %s", contact_name, slack_err)
 
         # Mark as processed AFTER successful handling
         _processed_call_ids.add(call_id)

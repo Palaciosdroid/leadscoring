@@ -19,6 +19,8 @@ from pydantic import BaseModel, Field
 
 from batch.call_poller import run_call_polling
 from batch.scorer import run_batch_scoring
+from batch.scheduled_calls_summarizer import run_scheduled_calls_summarizer
+from batch.unsubscribe_handler import handle_unsubscribe
 from integrations.hubspot import (
     HS_DISPOSITION_MAP,
     upsert_contact_score,
@@ -181,6 +183,17 @@ async def lifespan(app: FastAPI):
         id="daily_decay_check",
         replace_existing=True,
     )
+    # Scheduled calls summarizer — 17:55 CET, 5 min before EOD summary
+    # Fetches HubSpot tasks/meetings for next 7 days, groups by date + lead tier
+    scheduler.add_job(
+        run_scheduled_calls_summarizer,
+        "cron",
+        hour=17,
+        minute=55,
+        timezone=ZoneInfo("Europe/Berlin"),
+        id="scheduled_calls_summary",
+        replace_existing=True,
+    )
     # End-of-day summary card — fires daily at 18:00 CET/CEST
     scheduler.add_job(
         run_daily_summary,
@@ -313,18 +326,7 @@ async def _handle_cio_reporting_webhook(body: dict[str, Any]) -> ScoreResponse:
     metric = body.get("metric", "")
     data = body.get("data", {}) or {}
 
-    # Map CIO metric → internal event type
-    event_type = CIO_METRIC_MAP.get(metric)
-    if not event_type:
-        logger.info("Ignoring CIO metric=%s (not scored)", metric)
-        return ScoreResponse(
-            contact_id=data.get("customer_id", "unknown"),
-            engagement_score=0, ai_score=None, combined_score=0.0,
-            lead_tier="ignored", interest_category=None,
-            hubspot_updated=False, dialer_added=False,
-        )
-
-    # Extract lead info from CIO's identifiers
+    # Extract lead info from CIO's identifiers FIRST (needed for unsubscribe handling)
     identifiers = data.get("identifiers", {}) or {}
     # Prefer email so hubspot.py resolves it → numeric HubSpot ID.
     # CIO's customer_id is a hex string (not a HubSpot ID) — using it directly causes 404s.
@@ -337,6 +339,40 @@ async def _handle_cio_reporting_webhook(body: dict[str, Any]) -> ScoreResponse:
     )
     if not contact_id:
         raise HTTPException(status_code=422, detail="No customer_id or identifiers.id in CIO payload")
+
+    # Special handling for unsubscribe events
+    if metric == "unsubscribed":
+        email = identifiers.get("email", "") or data.get("recipient", "")
+        phone = identifiers.get("phone", "")
+
+        logger.info("CIO webhook: UNSUBSCRIBE detected for %s — removing from lists and Power Dialer", email)
+
+        # Trigger async unsubscribe handling (list removal, Power Dialer removal)
+        unsub_results = await handle_unsubscribe(
+            contact_id=str(contact_id),
+            email=email,
+            phone=phone,
+        )
+        logger.info("CIO webhook: unsubscribe handling complete: %s", unsub_results)
+
+        # Return response indicating the unsubscribe was processed
+        return ScoreResponse(
+            contact_id=str(contact_id),
+            engagement_score=0, ai_score=None, combined_score=0.0,
+            lead_tier="unsubscribed", interest_category=None,
+            hubspot_updated=False, dialer_added=False,
+        )
+
+    # Map CIO metric → internal event type for non-unsubscribe events
+    event_type = CIO_METRIC_MAP.get(metric)
+    if not event_type:
+        logger.info("Ignoring CIO metric=%s (not scored)", metric)
+        return ScoreResponse(
+            contact_id=data.get("customer_id", "unknown"),
+            engagement_score=0, ai_score=None, combined_score=0.0,
+            lead_tier="ignored", interest_category=None,
+            hubspot_updated=False, dialer_added=False,
+        )
 
     # CIO sends campaign_name in reporting webhook — use it to derive funnel source
     campaign_name = data.get("campaign_name", "") or ""

@@ -533,18 +533,26 @@ async def poll_completed_calls(
 
             contact_id = assoc.json()["results"][0]["id"]
 
-            # Get contact name + phone
-            firstname, lastname, phone = "", "", ""
+            # Get contact name + phone + lead tier + call stats for Slack reporting
+            firstname, lastname, phone, lead_tier = "", "", "", ""
+            calls_7d, calls_30d, calls_365d = 0, 0, 0
             c_resp = await client.get(
                 f"{HUBSPOT_BASE}/crm/v3/objects/contacts/{contact_id}",
                 headers=_headers(),
-                params={"properties": "firstname,lastname,phone"},
+                params={"properties": "firstname,lastname,phone,lead_tier,hs_call_count_7d,hs_call_count_30d,hs_call_count_365d"},
             )
             if c_resp.status_code == 200:
                 p = c_resp.json().get("properties", {})
                 firstname = p.get("firstname", "") or ""
                 lastname  = p.get("lastname",  "") or ""
                 phone     = p.get("phone",     "") or ""
+                lead_tier = p.get("lead_tier", "") or ""
+                try:
+                    calls_7d = int(p.get("hs_call_count_7d", "0") or 0)
+                    calls_30d = int(p.get("hs_call_count_30d", "0") or 0)
+                    calls_365d = int(p.get("hs_call_count_365d", "0") or 0)
+                except (ValueError, TypeError):
+                    pass
 
             props = call.get("properties", {})
             return {
@@ -553,6 +561,10 @@ async def poll_completed_calls(
                 "contact_firstname":  firstname,
                 "contact_lastname":   lastname,
                 "contact_phone":      phone,
+                "lead_tier":          lead_tier,
+                "calls_7d":           calls_7d,
+                "calls_30d":          calls_30d,
+                "calls_365d":         calls_365d,
                 "hs_call_direction":  props.get("hs_call_direction",  "OUTBOUND"),
                 "hs_call_disposition": props.get("hs_call_disposition", ""),
                 "hs_call_duration":   int(props.get("hs_call_duration") or 0),
@@ -587,3 +599,73 @@ async def get_contact_events(contact_id: str) -> list[dict[str, Any]]:
         )
     response.raise_for_status()
     return response.json().get("properties", {})
+
+
+async def remove_from_lists(
+    contact_id: str,
+    *,
+    timeout: float = 10.0,
+) -> bool:
+    """
+    Remove a contact from all active HubSpot lists (triggered on unsubscribe).
+
+    Queries list memberships, then removes the contact from each list.
+    Returns True if successful, False otherwise.
+
+    Used in unsubscribe automation workflow.
+    """
+    if not ACCESS_TOKEN or not contact_id:
+        logger.warning("remove_from_lists: missing token or contact_id")
+        return False
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            # Step 1: Get all list memberships for this contact
+            list_response = await client.get(
+                f"{HUBSPOT_BASE}/crm/v3/objects/contacts/{contact_id}/associations/lists",
+                headers=_headers(),
+            )
+
+            if list_response.status_code != 200:
+                logger.warning(
+                    "remove_from_lists: failed to fetch list memberships for %s: %s",
+                    contact_id, list_response.status_code,
+                )
+                return False
+
+            associations = list_response.json().get("results", [])
+            list_ids = [a.get("id") for a in associations if a.get("id")]
+
+            if not list_ids:
+                logger.info("remove_from_lists: %s not in any lists", contact_id)
+                return True  # Not in any lists, so mission accomplished
+
+            # Step 2: Remove contact from each list
+            removed_count = 0
+            for list_id in list_ids:
+                remove_response = await client.delete(
+                    f"{HUBSPOT_BASE}/crm/v3/objects/lists/{list_id}/memberships",
+                    headers=_headers(),
+                    json={"inputs": [{"id": contact_id}]},
+                )
+
+                if remove_response.status_code in (200, 204):
+                    removed_count += 1
+                    logger.debug("remove_from_lists: removed %s from list %s", contact_id, list_id)
+                else:
+                    logger.warning(
+                        "remove_from_lists: failed to remove %s from list %s: %s",
+                        contact_id, list_id, remove_response.status_code,
+                    )
+
+            success = removed_count == len(list_ids)
+            if success:
+                logger.info("remove_from_lists: successfully removed %s from %d list(s)", contact_id, removed_count)
+            else:
+                logger.warning("remove_from_lists: removed from %d/%d lists for %s", removed_count, len(list_ids), contact_id)
+
+            return success
+
+    except Exception as e:
+        logger.error("remove_from_lists: exception for %s: %s", contact_id, e)
+        return False

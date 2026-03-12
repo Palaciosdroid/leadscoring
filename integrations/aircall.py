@@ -189,6 +189,52 @@ async def _push_to_dialer_campaign(
     return {"status": "added", "phone": phone}
 
 
+async def remove_from_power_dialer(
+    phone: str,
+    *,
+    timeout: float = 10.0,
+) -> bool:
+    """
+    Remove a phone number from the Closer's Aircall Power Dialer campaign.
+    Called when a lead unsubscribes or is marked as "do not contact".
+
+    Returns True if successfully removed, False if not found or error.
+    """
+    if not AIRCALL_API_ID or not AIRCALL_API_TOKEN or not AIRCALL_CLOSER_USER_ID:
+        logger.warning("Aircall: credentials missing — cannot remove from Power Dialer")
+        return False
+
+    if not phone:
+        logger.warning("Aircall: no phone number provided for removal")
+        return False
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            # Remove the phone number from the Closer's dialer campaign
+            response = await client.delete(
+                f"{AIRCALL_BASE}/users/{AIRCALL_CLOSER_USER_ID}/dialer_campaign/phone_numbers",
+                headers=_headers(),
+                json={"phone_numbers": [phone]},
+            )
+
+        if response.status_code in (200, 204):
+            logger.info("Aircall: removed %s from Power Dialer (user %s)", phone, AIRCALL_CLOSER_USER_ID)
+            return True
+        elif response.status_code == 404:
+            logger.info("Aircall: phone %s not in Power Dialer — already removed or never added", phone)
+            return True  # Already removed, so mission accomplished
+        else:
+            logger.error(
+                "Aircall: failed to remove %s from Power Dialer: %s %s",
+                phone, response.status_code, response.text,
+            )
+            return False
+
+    except Exception as e:
+        logger.error("Aircall: exception while removing %s from Power Dialer: %s", phone, e)
+        return False
+
+
 async def log_call_outcome(
     phone: str,
     outcome: str,
