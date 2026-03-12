@@ -533,26 +533,18 @@ async def poll_completed_calls(
 
             contact_id = assoc.json()["results"][0]["id"]
 
-            # Get contact name + phone + lead tier + call stats for Slack reporting
-            firstname, lastname, phone, lead_tier = "", "", "", ""
-            calls_7d, calls_30d, calls_365d = 0, 0, 0
+            # Get contact name + phone
+            firstname, lastname, phone = "", "", ""
             c_resp = await client.get(
                 f"{HUBSPOT_BASE}/crm/v3/objects/contacts/{contact_id}",
                 headers=_headers(),
-                params={"properties": "firstname,lastname,phone,lead_tier,hs_call_count_7d,hs_call_count_30d,hs_call_count_365d"},
+                params={"properties": "firstname,lastname,phone"},
             )
             if c_resp.status_code == 200:
                 p = c_resp.json().get("properties", {})
                 firstname = p.get("firstname", "") or ""
                 lastname  = p.get("lastname",  "") or ""
                 phone     = p.get("phone",     "") or ""
-                lead_tier = p.get("lead_tier", "") or ""
-                try:
-                    calls_7d = int(p.get("hs_call_count_7d", "0") or 0)
-                    calls_30d = int(p.get("hs_call_count_30d", "0") or 0)
-                    calls_365d = int(p.get("hs_call_count_365d", "0") or 0)
-                except (ValueError, TypeError):
-                    pass
 
             props = call.get("properties", {})
             return {
@@ -561,10 +553,6 @@ async def poll_completed_calls(
                 "contact_firstname":  firstname,
                 "contact_lastname":   lastname,
                 "contact_phone":      phone,
-                "lead_tier":          lead_tier,
-                "calls_7d":           calls_7d,
-                "calls_30d":          calls_30d,
-                "calls_365d":         calls_365d,
                 "hs_call_direction":  props.get("hs_call_direction",  "OUTBOUND"),
                 "hs_call_disposition": props.get("hs_call_disposition", ""),
                 "hs_call_duration":   int(props.get("hs_call_duration") or 0),
