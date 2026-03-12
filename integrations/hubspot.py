@@ -200,6 +200,80 @@ async def get_call_stats(*, timeout: float = 10.0) -> tuple[int, int, int]:
     return (_parse(responses[0]), _parse(responses[1]), _parse(responses[2]))
 
 
+async def get_daily_call_stats(*, timeout: float = 15.0) -> tuple[int, int, int]:
+    """
+    Return today's call stats: (outbound_count, inbound_count, inbound_duration_sec).
+
+    "Today" = since midnight UTC, COMPLETED calls only (matches what the call poller
+    actually processes). Runs 2 parallel HubSpot search queries.
+    Inbound duration is summed from result properties (HubSpot has no aggregate API).
+    If there are >100 inbound calls today, duration will be under-counted — acceptable
+    for a sales team of this size.
+    """
+    if not ACCESS_TOKEN:
+        return (0, 0, 0)
+
+    import asyncio
+
+    today = datetime.now(tz=timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    today_ms = int(today.timestamp() * 1000)
+
+    def _daily_filter(direction: str, include_duration: bool = False) -> dict:
+        props = ["hs_createdate"]
+        if include_duration:
+            props.append("hs_call_duration")
+        return {
+            "filterGroups": [{"filters": [
+                {"propertyName": "hs_call_direction", "operator": "EQ",  "value": direction},
+                {"propertyName": "hs_call_status",    "operator": "EQ",  "value": "COMPLETED"},
+                {"propertyName": "hs_createdate",     "operator": "GTE", "value": str(today_ms)},
+            ]}],
+            "properties": props,
+            "limit": 100,
+        }
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        outbound_r, inbound_r = await asyncio.gather(
+            client.post(
+                f"{HUBSPOT_BASE}/crm/v3/objects/calls/search",
+                headers=_headers(),
+                json=_daily_filter("OUTBOUND"),
+            ),
+            client.post(
+                f"{HUBSPOT_BASE}/crm/v3/objects/calls/search",
+                headers=_headers(),
+                json=_daily_filter("INBOUND", include_duration=True),
+            ),
+            return_exceptions=True,
+        )
+
+    outbound_today = inbound_today = inbound_duration_sec = 0
+
+    if not isinstance(outbound_r, Exception) and outbound_r.status_code == 200:
+        outbound_today = outbound_r.json().get("total", 0)
+    elif isinstance(outbound_r, Exception):
+        logger.warning("get_daily_call_stats outbound query failed: %s", outbound_r)
+
+    if not isinstance(inbound_r, Exception) and inbound_r.status_code == 200:
+        data = inbound_r.json()
+        inbound_today = data.get("total", 0)
+        for call in data.get("results", []):
+            dur = call.get("properties", {}).get("hs_call_duration")
+            if dur:
+                try:
+                    inbound_duration_sec += int(dur) // 1000
+                except (ValueError, TypeError):
+                    pass
+    elif isinstance(inbound_r, Exception):
+        logger.warning("get_daily_call_stats inbound query failed: %s", inbound_r)
+
+    logger.debug(
+        "get_daily_call_stats: outbound=%d inbound=%d inbound_duration=%ds",
+        outbound_today, inbound_today, inbound_duration_sec,
+    )
+    return (outbound_today, inbound_today, inbound_duration_sec)
+
+
 async def get_latest_call_for_contact(
     contact_id: str,
     *,

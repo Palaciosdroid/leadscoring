@@ -22,6 +22,7 @@ from integrations.hubspot import (
     HS_DISPOSITION_MAP,
     upsert_contact_score,
     get_call_stats,
+    get_daily_call_stats,
     get_latest_call_for_contact,
     get_prioritized_contacts,
     write_call_outcome,
@@ -415,15 +416,14 @@ async def hubspot_call_webhook(payload: HubSpotCallPayload):
     except (ValueError, TypeError, OSError):
         ts_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    # Write outcome + call date back to HubSpot AND fetch stats — in parallel
-    stats_task   = asyncio.create_task(get_call_stats())
-    outcome_task = asyncio.create_task(
-        write_call_outcome(payload.contact_id, outcome)
-    ) if payload.contact_id else None
+    # Write outcome + call date back to HubSpot AND fetch stats — all in parallel
+    tasks = [get_call_stats(), get_daily_call_stats()]
+    if payload.contact_id:
+        tasks.append(write_call_outcome(payload.contact_id, outcome))
 
-    (calls_7d, calls_30d, calls_365d) = await stats_task
-    if outcome_task:
-        await outcome_task
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    (calls_7d, calls_30d, calls_365d) = results[0] if not isinstance(results[0], Exception) else (0, 0, 0)
+    (outbound_today, inbound_today, inbound_dur_today) = results[1] if not isinstance(results[1], Exception) else (0, 0, 0)
 
     await send_call_report(
         contact_name=contact_name,
@@ -434,6 +434,9 @@ async def hubspot_call_webhook(payload: HubSpotCallPayload):
         calls_7d=calls_7d,
         calls_30d=calls_30d,
         calls_365d=calls_365d,
+        outbound_today=outbound_today,
+        inbound_today=inbound_today,
+        inbound_duration_sec_today=inbound_dur_today,
     )
 
     logger.info(
@@ -483,6 +486,20 @@ async def batch_run():
     asyncio.create_task(run_batch_scoring())
     logger.info("/batch/run triggered manually")
     return {"status": "started", "message": "Batch scoring started in background"}
+
+
+@app.post("/debug/poll")
+async def debug_poll(window_minutes: int = 10):
+    """
+    Manually trigger the call poller for E2E testing.
+    Uses a wider time window than the automatic 5-min job so you can pick up
+    a test call created in the last hour without waiting for the next cycle.
+
+    Example: POST /debug/poll?window_minutes=60
+    """
+    logger.info("/debug/poll triggered manually (window=%dm)", window_minutes)
+    await run_call_polling(since_minutes=window_minutes)
+    return {"status": "ok", "message": f"Call polling completed (window={window_minutes}m)"}
 
 
 # ---------------------------------------------------------------------------

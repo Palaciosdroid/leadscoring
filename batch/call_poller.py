@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from integrations.hubspot import (
     HS_DISPOSITION_MAP,
     get_call_stats,
+    get_daily_call_stats,
     poll_completed_calls,
     write_call_outcome,
 )
@@ -46,8 +47,10 @@ async def run_call_polling(since_minutes: int = 10) -> None:
 
     logger.info("call_poller: processing %d new call(s)", len(new_calls))
 
-    # Fetch stats once, reused across all calls in this batch
-    (calls_7d, calls_30d, calls_365d) = await get_call_stats()
+    # Fetch both stat sets in parallel — reused across all calls in this batch
+    (calls_7d, calls_30d, calls_365d), (outbound_today, inbound_today, inbound_dur_today) = (
+        await asyncio.gather(get_call_stats(), get_daily_call_stats())
+    )
 
     async def _process(call: dict) -> None:
         call_id     = call["call_id"]
@@ -89,6 +92,9 @@ async def run_call_polling(since_minutes: int = 10) -> None:
             calls_7d=calls_7d,
             calls_30d=calls_30d,
             calls_365d=calls_365d,
+            outbound_today=outbound_today,
+            inbound_today=inbound_today,
+            inbound_duration_sec_today=inbound_dur_today,
         )
 
         # Mark as processed AFTER successful handling
