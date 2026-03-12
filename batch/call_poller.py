@@ -73,14 +73,14 @@ async def run_call_polling(since_minutes: int = 10) -> None:
         call_id     = call["call_id"]
         contact_id  = call["contact_id"]
         disposition = call.get("hs_call_disposition", "")
-        direction   = call.get("hs_call_direction", "OUTBOUND")
+        direction   = call.get("hs_call_direction") or "OUTBOUND"
         duration_ms = call.get("hs_call_duration", 0) or 0
         ts_raw      = call.get("hs_timestamp", "")
 
         outcome      = HS_DISPOSITION_MAP.get(disposition, disposition or "Unknown")
         duration_sec = duration_ms // 1000
         contact_name = (
-            f"{call.get('contact_firstname', '')} {call.get('contact_lastname', '')}".strip()
+            f"{call.get('contact_firstname') or ''} {call.get('contact_lastname') or ''}".strip()
             or "Unknown"
         )
 

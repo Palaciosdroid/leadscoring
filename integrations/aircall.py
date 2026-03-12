@@ -198,13 +198,13 @@ async def log_call_outcome(
         search_resp = await client.get(
             f"{AIRCALL_BASE}/contacts",
             headers=_headers(),
-            params={"phone_details": phone, "order": "created_at DESC", "per_page": 1},
+            params={"phone_number": phone, "order": "desc", "order_by": "created_at", "per_page": 1},
         )
 
         if search_resp.status_code != 200:
-            logger.debug(
-                "Aircall: contact search failed for phone %s: %s",
-                phone, search_resp.status_code,
+            logger.warning(
+                "Aircall: contact search failed for phone %s: %s — %s",
+                phone, search_resp.status_code, search_resp.text[:200],
             )
             return
 
