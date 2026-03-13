@@ -84,27 +84,29 @@ async def get_recording_files(meeting_uuid: str) -> list[dict]:
     return files
 
 
-async def get_audio_recording_url(meeting_uuid: str) -> tuple[str | None, str | None]:
+async def get_vtt_url(meeting_uuid: str) -> str | None:
     """
-    Get the best audio recording URL for transcription.
-    Prefers M4A (audio only) over MP4 (video) for smaller file size.
+    Get the VTT (WebVTT transcript) download URL for a completed meeting.
+    Zoom generates VTT automatically when cloud recording + transcription is enabled.
 
-    Returns (download_url, file_extension) or (None, None) if not found.
+    Returns download_url string or None if not available.
     """
     files = await get_recording_files(meeting_uuid)
 
-    # Prefer audio-only file
-    for preferred_type in ("M4A", "MP3", "AUDIO_ONLY"):
-        for f in files:
-            if f.get("file_type", "").upper() == preferred_type and f.get("download_url"):
-                return f["download_url"], f.get("file_extension", "m4a").lower()
-
-    # Fall back to MP4 if no audio-only
     for f in files:
-        if f.get("file_type", "").upper() == "MP4" and f.get("download_url"):
-            return f["download_url"], "mp4"
+        if f.get("file_type", "").upper() == "TRANSCRIPT" or \
+           f.get("file_extension", "").lower() == "vtt":
+            url = f.get("download_url")
+            if url:
+                logger.info("Zoom: found VTT transcript file for meeting %s", meeting_uuid)
+                return url
 
-    return None, None
+    logger.warning(
+        "Zoom: no VTT file found for meeting %s — "
+        "check that cloud recording + transcription is enabled in Zoom settings",
+        meeting_uuid,
+    )
+    return None
 
 
 async def download_recording(download_url: str) -> bytes:

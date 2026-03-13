@@ -1,30 +1,26 @@
 """
-Call Summarizer — Zoom Recording → Whisper Transcription → Claude Haiku Summary
+Call Summarizer — Zoom VTT → Claude Haiku Summary → HubSpot Note
 
 Flow:
-  1. Receive recording bytes (audio file from Zoom)
-  2. Transcribe via OpenAI Whisper API
-  3. Summarize via Claude Haiku — structured output for HubSpot Note
+  1. Download VTT file (Zoom's auto-generated transcript — free, instant)
+  2. Parse VTT → clean plain text with speaker lines
+  3. Summarize via Claude Haiku — structured DE output for HubSpot Note
+
+No Whisper needed — Zoom transcribes automatically at no extra cost.
 
 Env vars required:
-    OPENAI_API_KEY     — for Whisper transcription
     ANTHROPIC_API_KEY  — for Claude Haiku summary
 """
 
 import logging
 import os
-import tempfile
-from datetime import datetime, timezone
+import re
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
-OPENAI_API_KEY    = os.environ.get("OPENAI_API_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-
-# Max recording size to process (50 MB — Whisper limit is 25 MB, we check here first)
-MAX_RECORDING_BYTES = 50 * 1024 * 1024
 
 _SUMMARY_SYSTEM_PROMPT = """Du bist ein Assistent der Verkaufsgespräche für Gabriel Palacios (Hypnose, Meditation, Lifecoaching) analysiert.
 Erstelle eine strukturierte Gesprächs-Zusammenfassung für den Closer Kevin.
@@ -51,52 +47,65 @@ Erstelle eine Zusammenfassung in genau diesem Format:
 ➡️ Empfohlener nächster Schritt: [Was sollte Kevin jetzt tun?]
 ──────────────────────────
 ⏱️ Gesprächsdauer: {duration}
-🤖 Automatisch erstellt via Zoom AI"""
+🤖 Automatisch erstellt via Zoom Transkript"""
 
 
-async def transcribe_audio(audio_bytes: bytes, file_extension: str = "m4a") -> str:
+def parse_vtt(vtt_content: str) -> str:
     """
-    Transcribe audio bytes using OpenAI Whisper API.
-    Returns the transcribed text.
+    Parse a WebVTT file and return clean plain text.
+
+    VTT format:
+        WEBVTT
+
+        00:00:01.000 --> 00:00:04.000
+        Kevin: Hallo, schön dass Sie Zeit haben.
+
+        00:00:04.500 --> 00:00:08.000
+        Lead: Ja, danke für die Einladung.
+
+    Returns plain text with one line per cue, duplicate lines collapsed.
     """
-    if not OPENAI_API_KEY:
-        raise EnvironmentError("OPENAI_API_KEY not set — cannot transcribe audio")
+    lines = vtt_content.splitlines()
+    text_lines: list[str] = []
+    last_line = ""
 
-    if len(audio_bytes) > MAX_RECORDING_BYTES:
-        raise ValueError(
-            f"Recording too large: {len(audio_bytes) / 1024 / 1024:.1f} MB "
-            f"(max {MAX_RECORDING_BYTES / 1024 / 1024:.0f} MB)"
-        )
+    # Skip header and timestamp lines, collect text cues
+    timestamp_pattern = re.compile(r"^\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}")
 
-    logger.info("Whisper: transcribing %.1f MB audio file", len(audio_bytes) / 1024 / 1024)
+    skip_next = False
+    for line in lines:
+        line = line.strip()
 
-    # Write to temp file — Whisper API requires a file upload
-    with tempfile.NamedTemporaryFile(suffix=f".{file_extension}", delete=False) as tmp:
-        tmp.write(audio_bytes)
-        tmp_path = tmp.name
+        # Skip VTT header
+        if line == "WEBVTT" or line.startswith("NOTE") or line.startswith("STYLE"):
+            continue
 
-    try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            with open(tmp_path, "rb") as f:
-                r = await client.post(
-                    "https://api.openai.com/v1/audio/transcriptions",
-                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-                    files={"file": (f"recording.{file_extension}", f, "audio/mpeg")},
-                    data={
-                        "model": "whisper-1",
-                        "language": "de",   # German — change if multilingual needed
-                        "response_format": "text",
-                    },
-                )
-                r.raise_for_status()
-                transcript = r.text.strip()
+        # Skip timestamp lines — the text line follows
+        if timestamp_pattern.match(line):
+            skip_next = False
+            continue
 
-        logger.info("Whisper: transcription complete (%d chars)", len(transcript))
-        return transcript
+        # Skip empty lines and cue identifiers (pure numbers)
+        if not line or line.isdigit():
+            continue
 
-    finally:
-        import os as _os
-        _os.unlink(tmp_path)
+        # Strip HTML tags Zoom sometimes adds (e.g. <v Kevin>text</v>)
+        line = re.sub(r"</?v[^>]*>", "", line)
+        line = re.sub(r"<[^>]+>", "", line).strip()
+
+        if not line:
+            continue
+
+        # Collapse consecutive duplicate lines (Zoom sometimes repeats cues)
+        if line == last_line:
+            continue
+
+        text_lines.append(line)
+        last_line = line
+
+    transcript = "\n".join(text_lines)
+    logger.info("VTT parsed: %d lines → %d chars", len(text_lines), len(transcript))
+    return transcript
 
 
 async def summarize_transcript(transcript: str, duration_minutes: int = 0) -> str:
@@ -142,30 +151,28 @@ async def summarize_transcript(transcript: str, duration_minutes: int = 0) -> st
     return summary
 
 
-async def process_zoom_recording(
-    audio_bytes: bytes,
-    file_extension: str = "m4a",
+async def process_zoom_vtt(
+    vtt_content: str,
     duration_minutes: int = 0,
 ) -> str:
     """
-    Full pipeline: audio bytes → transcription → summary.
+    Full pipeline: VTT string → parse → summarize.
     Returns formatted HubSpot Note text.
     """
-    try:
-        transcript = await transcribe_audio(audio_bytes, file_extension)
-    except Exception as e:
-        logger.error("call_summarizer: transcription failed: %s", e)
-        return f"⚠️ Transkription fehlgeschlagen: {e}\n\nBitte manuell zusammenfassen."
+    transcript = parse_vtt(vtt_content)
 
-    try:
-        summary = await summarize_transcript(transcript, duration_minutes)
-    except Exception as e:
-        logger.error("call_summarizer: summarization failed: %s", e)
-        # Return raw transcript as fallback
-        short_transcript = transcript[:1000] + "..." if len(transcript) > 1000 else transcript
+    if not transcript.strip():
         return (
-            f"⚠️ AI-Zusammenfassung fehlgeschlagen: {e}\n\n"
-            f"Transkript (gekürzt):\n{short_transcript}"
+            "⚠️ VTT-Transkript konnte nicht geparst werden.\n"
+            "Bitte Gesprächsnotizen manuell hinzufügen."
         )
 
-    return summary
+    try:
+        return await summarize_transcript(transcript, duration_minutes)
+    except Exception as e:
+        logger.error("call_summarizer: summarization failed: %s", e)
+        short = transcript[:1000] + "..." if len(transcript) > 1000 else transcript
+        return (
+            f"⚠️ AI-Zusammenfassung fehlgeschlagen: {e}\n\n"
+            f"Transkript (gekürzt):\n{short}"
+        )

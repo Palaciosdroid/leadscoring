@@ -43,12 +43,12 @@ from integrations.hubspot import (
     add_note,
 )
 from integrations.zoom import (
-    get_audio_recording_url,
+    get_vtt_url,
     download_recording,
     get_lead_email_from_meeting,
     verify_webhook_signature as verify_zoom_signature,
 )
-from batch.call_summarizer import process_zoom_recording
+from batch.call_summarizer import process_zoom_vtt
 from integrations.aircall import add_to_power_dialer
 from integrations.supabase import (
     fetch_touchpoints_for_emails,
@@ -1075,22 +1075,26 @@ async def zoom_recording_webhook(request: Request):
             "message": f"No HubSpot contact found for meeting {meeting_id}. Manual assignment needed.",
         }
 
-    # Step 2: Download audio recording
-    download_url, file_ext = await get_audio_recording_url(meeting_uuid)
-    if not download_url:
-        logger.error("Zoom recording: no audio file found for meeting %s", meeting_uuid)
-        return {"status": "no_audio", "meeting_id": meeting_id}
+    # Step 2: Download VTT transcript (Zoom auto-generates, free, instant)
+    vtt_url = await get_vtt_url(meeting_uuid)
+    if not vtt_url:
+        logger.error("Zoom recording: no VTT transcript found for meeting %s", meeting_uuid)
+        return {
+            "status": "no_vtt",
+            "meeting_id": meeting_id,
+            "hint": "Enable cloud recording + audio transcript in Zoom settings",
+        }
 
     try:
-        audio_bytes = await download_recording(download_url)
+        vtt_bytes = await download_recording(vtt_url)
+        vtt_content = vtt_bytes.decode("utf-8", errors="replace")
     except Exception as e:
-        logger.error("Zoom recording: download failed for meeting %s: %s", meeting_id, e)
+        logger.error("Zoom recording: VTT download failed for meeting %s: %s", meeting_id, e)
         return {"status": "download_failed", "error": str(e)}
 
-    # Step 3: Transcribe + Summarize (Whisper → Claude Haiku)
-    summary = await process_zoom_recording(
-        audio_bytes=audio_bytes,
-        file_extension=file_ext or "m4a",
+    # Step 3: Parse VTT + Summarize via Claude Haiku
+    summary = await process_zoom_vtt(
+        vtt_content=vtt_content,
         duration_minutes=duration_min,
     )
 
