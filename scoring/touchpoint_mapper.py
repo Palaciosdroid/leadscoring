@@ -150,7 +150,13 @@ def map_browser_event(event: dict) -> dict | None:
         scored_type = "video_watched_100"
 
     elif event_type == "video_progress":
-        depth = props.get("depth") or props.get("progress") or 0
+        # Support multiple field names: percent_complete (CIO), depth, progress (older versions)
+        depth = (
+            props.get("percent_complete")
+            or props.get("depth")
+            or props.get("progress")
+            or 0
+        )
         if isinstance(depth, str):
             try:
                 depth = int(depth.replace("%", ""))

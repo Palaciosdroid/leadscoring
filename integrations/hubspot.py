@@ -657,3 +657,149 @@ async def remove_from_lists(
     except Exception as e:
         logger.error("remove_from_lists: exception for %s: %s", contact_id, e)
         return False
+
+
+async def find_contact_by_zoom_meeting(zoom_meeting_id: str) -> str | None:
+    """
+    Find a HubSpot contact associated with a Zoom meeting.
+
+    HubSpot Meetings store the Zoom join URL in hs_meeting_external_url.
+    We search for a meeting containing the Zoom meeting ID, then return
+    the associated contact ID.
+
+    Returns contact_id string or None if not found.
+    """
+    if not ACCESS_TOKEN or not zoom_meeting_id:
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            # Search HubSpot meetings where external URL contains the Zoom meeting ID
+            r = await client.post(
+                f"{HUBSPOT_BASE}/crm/v3/objects/meetings/search",
+                headers=_headers(),
+                json={
+                    "filterGroups": [{
+                        "filters": [{
+                            "propertyName": "hs_meeting_external_url",
+                            "operator": "CONTAINS_TOKEN",
+                            "value": zoom_meeting_id,
+                        }]
+                    }],
+                    "properties": ["hs_meeting_external_url", "hs_timestamp"],
+                    "limit": 1,
+                },
+            )
+
+            if r.status_code != 200:
+                logger.warning(
+                    "find_contact_by_zoom_meeting: search failed %s: %s",
+                    r.status_code, r.text[:200],
+                )
+                return None
+
+            results = r.json().get("results", [])
+            if not results:
+                logger.info(
+                    "find_contact_by_zoom_meeting: no meeting found for zoom_id=%s",
+                    zoom_meeting_id,
+                )
+                return None
+
+            meeting_id = results[0]["id"]
+
+            # Get contact association for this meeting
+            assoc = await client.get(
+                f"{HUBSPOT_BASE}/crm/v3/objects/meetings/{meeting_id}/associations/contacts",
+                headers=_headers(),
+            )
+
+            if assoc.status_code != 200:
+                logger.warning(
+                    "find_contact_by_zoom_meeting: association fetch failed for meeting %s",
+                    meeting_id,
+                )
+                return None
+
+            contacts = assoc.json().get("results", [])
+            if not contacts:
+                logger.info(
+                    "find_contact_by_zoom_meeting: meeting %s has no associated contacts",
+                    meeting_id,
+                )
+                return None
+
+            contact_id = contacts[0]["id"]
+            logger.info(
+                "find_contact_by_zoom_meeting: zoom_id=%s → meeting=%s → contact=%s",
+                zoom_meeting_id, meeting_id, contact_id,
+            )
+            return contact_id
+
+    except Exception as e:
+        logger.error("find_contact_by_zoom_meeting: exception: %s", e)
+        return None
+
+
+async def add_note(
+    contact_id: str,
+    body: str,
+    *,
+    timestamp: datetime | None = None,
+    timeout: float = 15.0,
+) -> str | None:
+    """
+    Add a Note engagement to a HubSpot contact.
+
+    Returns the created note ID or None on failure.
+    Used for Call AI summaries from Zoom recordings.
+    """
+    if not ACCESS_TOKEN or not contact_id or not body:
+        logger.warning("add_note: missing token, contact_id, or body")
+        return None
+
+    ts = timestamp or datetime.now(timezone.utc)
+    ts_ms = int(ts.timestamp() * 1000)
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            # Create the note
+            r = await client.post(
+                f"{HUBSPOT_BASE}/crm/v3/objects/notes",
+                headers=_headers(),
+                json={
+                    "properties": {
+                        "hs_note_body": body,
+                        "hs_timestamp": str(ts_ms),
+                    }
+                },
+            )
+
+            if r.status_code not in (200, 201):
+                logger.error(
+                    "add_note: create failed %s: %s",
+                    r.status_code, r.text[:300],
+                )
+                return None
+
+            note_id = r.json()["id"]
+
+            # Associate note with contact
+            assoc = await client.put(
+                f"{HUBSPOT_BASE}/crm/v3/objects/notes/{note_id}"
+                f"/associations/contacts/{contact_id}/202",
+                headers=_headers(),
+            )
+
+            if assoc.status_code not in (200, 201):
+                logger.warning(
+                    "add_note: association failed for note %s → contact %s: %s",
+                    note_id, contact_id, assoc.status_code,
+                )
+
+            logger.info("add_note: created note %s for contact %s", note_id, contact_id)
+            return note_id
+
+    except Exception as e:
+        logger.error("add_note: exception for contact %s: %s", contact_id, e)
+        return None

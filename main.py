@@ -39,7 +39,16 @@ from integrations.hubspot import (
     get_latest_call_for_contact,
     get_prioritized_contacts,
     write_call_outcome,
+    find_contact_by_zoom_meeting,
+    add_note,
 )
+from integrations.zoom import (
+    get_audio_recording_url,
+    download_recording,
+    get_lead_email_from_meeting,
+    verify_webhook_signature as verify_zoom_signature,
+)
+from batch.call_summarizer import process_zoom_recording
 from integrations.aircall import add_to_power_dialer
 from integrations.supabase import (
     fetch_touchpoints_for_emails,
@@ -975,3 +984,132 @@ def _verify_signature(raw_body: bytes, signature: str) -> None:
     ).hexdigest()
     if not hmac.compare_digest(expected, signature):
         raise HTTPException(status_code=401, detail="Invalid webhook signature")
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: Zoom Call AI — Recording → Transcription → Summary → HubSpot Note
+# ---------------------------------------------------------------------------
+
+@app.post("/webhook/zoom/recording")
+async def zoom_recording_webhook(request: Request):
+    """
+    Zoom recording.completed webhook — triggered when a Zoom meeting recording
+    is ready for download.
+
+    Flow:
+      1. Verify Zoom webhook signature (optional if ZOOM_WEBHOOK_SECRET set)
+      2. Handle Zoom URL validation challenge (one-time setup)
+      3. Find HubSpot contact via HubSpot Meetings (hs_meeting_external_url)
+         Falls back to Zoom Participants API (lead joined with their email)
+      4. Download audio recording from Zoom
+      5. Transcribe with Whisper, summarize with Claude Haiku
+      6. Write formatted summary as Note on HubSpot contact
+
+    Env vars: ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET,
+              ZOOM_WEBHOOK_SECRET (optional), ZOOM_HOST_EMAIL (Kevin's email)
+    """
+    raw_body = await request.body()
+
+    # Zoom webhook signature verification
+    timestamp = request.headers.get("x-zm-request-timestamp", "")
+    signature = request.headers.get("x-zm-signature", "")
+    if timestamp and signature:
+        if not verify_zoom_signature(raw_body, timestamp, signature):
+            raise HTTPException(status_code=401, detail="Invalid Zoom webhook signature")
+
+    import json as _json
+    body = _json.loads(raw_body)
+    event = body.get("event", "")
+
+    # Zoom URL validation challenge — sent once during webhook setup
+    if event == "endpoint.url_validation":
+        plain_token = body.get("payload", {}).get("plainToken", "")
+        import hashlib, hmac as _hmac, os as _os
+        secret = _os.environ.get("ZOOM_WEBHOOK_SECRET", "")
+        encrypted = _hmac.new(
+            secret.encode(), plain_token.encode(), hashlib.sha256
+        ).hexdigest()
+        return {"plainToken": plain_token, "encryptedToken": encrypted}
+
+    if event != "recording.completed":
+        logger.debug("Zoom webhook: ignoring event=%s", event)
+        return {"status": "ignored", "event": event}
+
+    payload = body.get("payload", {}).get("object", {})
+    meeting_id  = str(payload.get("id", ""))        # numeric meeting ID
+    meeting_uuid = payload.get("uuid", "")           # unique UUID for this instance
+    host_email   = payload.get("host_email", "")
+    duration_min = payload.get("duration", 0)        # meeting duration in minutes
+    topic        = payload.get("topic", "")
+
+    logger.info(
+        "Zoom recording.completed: meeting_id=%s uuid=%s host=%s duration=%dm topic=%s",
+        meeting_id, meeting_uuid, host_email, duration_min, topic,
+    )
+
+    # Step 1: Find HubSpot contact
+    # Primary: HubSpot Meetings (booked via HubSpot calendar)
+    contact_id = await find_contact_by_zoom_meeting(meeting_id)
+
+    # Fallback: Zoom Participants API (lead joined with their email)
+    if not contact_id:
+        logger.info("Zoom: HubSpot meeting lookup failed, trying participants API")
+        zoom_host = host_email or os.environ.get("ZOOM_HOST_EMAIL", "")
+        lead_email = await get_lead_email_from_meeting(meeting_id, host_email=zoom_host)
+        if lead_email:
+            # Resolve email → HubSpot contact ID
+            import httpx as _httpx
+            async with _httpx.AsyncClient(timeout=10.0) as _c:
+                from integrations.hubspot import _resolve_hubspot_id
+                contact_id = await _resolve_hubspot_id(lead_email, _c)
+
+    if not contact_id:
+        logger.warning(
+            "Zoom recording: no HubSpot contact found for meeting %s — "
+            "writing Slack alert for manual assignment",
+            meeting_id,
+        )
+        # Fire-and-forget: return 200 so Zoom doesn't retry
+        return {
+            "status": "no_contact",
+            "message": f"No HubSpot contact found for meeting {meeting_id}. Manual assignment needed.",
+        }
+
+    # Step 2: Download audio recording
+    download_url, file_ext = await get_audio_recording_url(meeting_uuid)
+    if not download_url:
+        logger.error("Zoom recording: no audio file found for meeting %s", meeting_uuid)
+        return {"status": "no_audio", "meeting_id": meeting_id}
+
+    try:
+        audio_bytes = await download_recording(download_url)
+    except Exception as e:
+        logger.error("Zoom recording: download failed for meeting %s: %s", meeting_id, e)
+        return {"status": "download_failed", "error": str(e)}
+
+    # Step 3: Transcribe + Summarize (Whisper → Claude Haiku)
+    summary = await process_zoom_recording(
+        audio_bytes=audio_bytes,
+        file_extension=file_ext or "m4a",
+        duration_minutes=duration_min,
+    )
+
+    # Step 4: Write Note to HubSpot contact
+    note_id = await add_note(
+        contact_id=contact_id,
+        body=summary,
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    logger.info(
+        "Zoom recording: summary written to HubSpot contact=%s note=%s",
+        contact_id, note_id,
+    )
+
+    return {
+        "status": "ok",
+        "contact_id": contact_id,
+        "note_id": note_id,
+        "meeting_id": meeting_id,
+        "duration_minutes": duration_min,
+    }
