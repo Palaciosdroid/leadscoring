@@ -8,6 +8,7 @@ qualified leads to HubSpot + Aircall with rich card content.
 Called by APScheduler in main.py.
 """
 
+import asyncio
 import logging
 import os
 from datetime import datetime, timedelta, timezone
@@ -118,6 +119,8 @@ async def _fetch_active_hubspot_leads() -> list[dict[str, Any]]:
             after = paging.get("after")
             if not after:
                 break
+            # Small delay between pages to avoid HubSpot 429
+            await asyncio.sleep(0.5)
 
     return results
 
@@ -158,6 +161,9 @@ async def _batch_update_hubspot_contacts(
                 )
                 resp.raise_for_status()
                 updated += len(chunk)
+                # Delay between batch chunks to avoid HubSpot 429
+                if i + _HUBSPOT_BATCH_SIZE < len(updates):
+                    await asyncio.sleep(0.5)
             except httpx.HTTPStatusError as e:
                 logger.error(
                     "HubSpot batch update failed (chunk %d-%d): %s %s",
