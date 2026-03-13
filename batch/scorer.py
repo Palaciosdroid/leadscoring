@@ -48,16 +48,23 @@ FRESH_WINDOW = timedelta(hours=24)
 # Funnel list definitions: hubspot_list_id will be populated from env/config
 LISTS: dict[str, dict[str, Any]] = {
     "eignungscheck":     {"hubspot_list_id": None, "aircall_tag": "eignungscheck"},
-    "hypnose_fresh":     {"hubspot_list_id": None, "aircall_tag": "hypnose-fresh"},
-    "hypnose_warm":      {"hubspot_list_id": None, "aircall_tag": "hypnose-warm"},
-    "meditation_fresh":  {"hubspot_list_id": None, "aircall_tag": "meditation-fresh"},
-    "meditation_warm":   {"hubspot_list_id": None, "aircall_tag": "meditation-warm"},
-    "lifecoach_fresh":   {"hubspot_list_id": None, "aircall_tag": "lifecoach-fresh"},
-    "lifecoach_warm":    {"hubspot_list_id": None, "aircall_tag": "lifecoach-warm"},
+    "hypnose_fresh":     {"hubspot_list_id": None, "aircall_tag": "hc-fresh"},
+    "hypnose_warm":      {"hubspot_list_id": None, "aircall_tag": "hc-warm"},
+    "meditation_fresh":  {"hubspot_list_id": None, "aircall_tag": "mc-fresh"},
+    "meditation_warm":   {"hubspot_list_id": None, "aircall_tag": "mc-warm"},
+    "lifecoach_fresh":   {"hubspot_list_id": None, "aircall_tag": "gc-fresh"},
+    "lifecoach_warm":    {"hubspot_list_id": None, "aircall_tag": "gc-warm"},
 }
 
 # Valid funnels for category mapping
 VALID_FUNNELS = {"hypnose", "meditation", "lifecoach"}
+
+# Short display names for Aircall tags (Kevin's naming convention)
+FUNNEL_SHORT: dict[str, str] = {
+    "hypnose": "HC",       # Hypnose Coach
+    "meditation": "MC",     # Meditationscoach
+    "lifecoach": "GC",      # Gesprächscoach / Lifecoach
+}
 
 
 # ---------------------------------------------------------------------------
@@ -655,6 +662,7 @@ async def run_batch_scoring() -> None:
                     score=item["score"],
                     interest_category=item["funnel"],
                     lead_tier=item["lead_tier"],
+                    list_key=item["list_key"],
                 )
                 pushed += 1
                 logger.info(

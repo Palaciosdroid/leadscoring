@@ -66,12 +66,26 @@ def _classify_list(created_at: datetime | None) -> str:
     return "fresh" if _is_fresh(created_at) else "warm"
 
 
-def _build_tags(score: float, created_at: datetime | None, interest_category: str | None) -> list[str]:
-    """Build Aircall contact tags for the Closer to see during calls."""
-    list_type = _classify_list(created_at)
-    tags = [list_type, f"score-{int(score)}"]
-    if interest_category:
-        tags.append(interest_category)
+def _build_tags(score: float, created_at: datetime | None, interest_category: str | None, list_key: str = "") -> list[str]:
+    """Build Aircall contact tags for the Closer to see during calls.
+
+    Uses short funnel names: HC (Hypnose), MC (Meditation), GC (Gesprächscoach).
+    Combined tag format: 'hc-fresh', 'mc-warm', 'eignungscheck'.
+    """
+    # Short funnel mapping
+    _SHORT = {"hypnose": "HC", "meditation": "MC", "lifecoach": "GC"}
+    funnel_short = _SHORT.get(interest_category or "", interest_category or "")
+
+    tags = [f"score-{int(score)}"]
+
+    # Primary list tag (e.g. 'hc-fresh', 'eignungscheck')
+    if list_key:
+        tags.insert(0, list_key)
+
+    # Funnel short name as separate tag
+    if funnel_short:
+        tags.append(funnel_short)
+
     return tags
 
 
@@ -114,14 +128,15 @@ async def add_to_power_dialer(
     created_at: datetime | None = None,
     interest_category: str | None = None,
     lead_tier: str = "",
+    list_key: str = "",
     timeout: float = 10.0,
 ) -> dict[str, Any] | None:
     """
     Push a lead into the Closer's Aircall Power Dialer campaign.
 
-    Two virtual lists:
-      Fresh — opted in < 24h, any score → immediate call
-      Warm  — tier is 1_hot or 2_warm  → follow-up queue
+    list_key: key from LISTS dict (e.g. 'hc-fresh', 'eignungscheck').
+              Used as primary tag on the Aircall contact so Kevin can
+              filter by list in the Power Dialer.
 
     lead must contain: phone, firstname, lastname, email
     Returns None if not qualified (cold/disqualified and not fresh).
@@ -135,7 +150,10 @@ async def add_to_power_dialer(
         logger.debug("Aircall: score %.0f too low, not fresh — skipping %s", score, lead.get("email"))
         return None
 
-    tags = _build_tags(score, created_at, interest_category)
+    # Resolve aircall_tag from list_key (e.g. 'hypnose_fresh' -> 'hc-fresh')
+    from batch.scorer import LISTS
+    aircall_tag = LISTS.get(list_key, {}).get("aircall_tag", list_key)
+    tags = _build_tags(score, created_at, interest_category, list_key=aircall_tag)
 
     # Use shared client for both calls (connection reuse + retry on 429)
     async with httpx.AsyncClient(timeout=timeout) as client:

@@ -634,6 +634,7 @@ async def realtime_score_webhook(payload: RealtimeScoreRequest):
                 score=score,
                 interest_category=funnel,
                 lead_tier=scoring.lead_tier,
+                list_key=list_key or "",
             )
             dialer_ok = dialer_result is not None
             logger.info("Realtime score: pushed %s to Aircall [%s]", email, list_key)
