@@ -35,6 +35,8 @@ async def check_do_not_call(
     not_interested: bool = False,
     unsubscribed: bool = False,
     purchased_funnels: list[str] | None = None,
+    call_outcome: str | None = None,
+    **kwargs: Any,
 ) -> DoNotCallResult:
     """
     Master Do Not Call check.  Returns whether to skip and why.
@@ -82,6 +84,17 @@ async def check_do_not_call(
     if not_interested:
         logger.info("DNC skip [not_interested]: %s", email)
         return DoNotCallResult(should_skip=True, reason="not_interested")
+
+    # 6. Disqualified / not qualified / cancelled — permanent removal outcomes
+    call_outcome = kwargs.get("call_outcome", "")
+    if call_outcome:
+        _PERMANENT_OUTCOMES = {
+            "falsche nummer", "nicht_qualifiziert", "nicht qualifiziert",
+            "disqualified", "abgesagt", "beratungsgespräch abgesagt",
+        }
+        if call_outcome.lower().strip() in _PERMANENT_OUTCOMES:
+            logger.info("DNC skip [permanent_outcome]: %s — %s", email, call_outcome)
+            return DoNotCallResult(should_skip=True, reason=f"permanent:{call_outcome}")
 
     return DoNotCallResult(should_skip=False, reason="")
 

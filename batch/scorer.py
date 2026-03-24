@@ -16,7 +16,7 @@ from typing import Any
 
 import httpx
 
-from batch.do_not_call import DoNotCallResult, check_do_not_call
+from batch.do_not_call import check_do_not_call
 from integrations.customerio import is_unsubscribed
 from integrations.supabase import (
     fetch_touchpoints_for_emails,
@@ -32,6 +32,7 @@ from scoring.touchpoint_mapper import (
     map_browser_events_batch,
     summarize_email_activity,
 )
+from integrations.slack import send_decay_alert
 
 logger = logging.getLogger(__name__)
 
@@ -44,21 +45,67 @@ RESCORE_WINDOW_DAYS = int(os.environ.get("RESCORE_WINDOW_DAYS", "30"))
 # Score thresholds
 SCORE_WARM = 30      # >= 30 -> push to HubSpot/Aircall
 SCORE_HOT = 65       # >= 65 -> same list as warm, tagged hot
-FRESH_WINDOW = timedelta(hours=24)
+FRESH_WINDOW = timedelta(hours=72)
 
-# Funnel list definitions: hubspot_list_id will be populated from env/config
+# Cooldown after call — prevent Kevin from calling the same person repeatedly
+COOLDOWN_ANSWERED_HOURS = 7 * 24      # 7 days after answered call
+COOLDOWN_NO_ANSWER_HOURS = 3 * 24     # 3 days after no-answer
+COOLDOWN_VOICEMAIL_HOURS = 3 * 24     # 3 days after voicemail
+
+# Call outcomes that permanently remove a lead from calling lists
+# These map to HubSpot lead_last_call_outcome values (written by call_poller.py)
+PERMANENT_REMOVE_OUTCOMES: frozenset[str] = frozenset({
+    "Falsche Nummer",           # wrong number — never call again
+    "nicht_qualifiziert",       # Kevin marked as not qualified
+    "nicht qualifiziert",       # alternate spelling
+    "disqualified",             # English variant
+    "abgesagt",                 # cancelled consultation
+    "Beratungsgespräch abgesagt",
+})
+
+# Max call attempts before giving up on a lead
+MAX_CALL_ATTEMPTS = 5  # after 5 unanswered attempts → remove from queue
+
+# Aircall priority order — lower number = called first
+AIRCALL_PRIORITY = {
+    "eignungscheck": 1,
+    "hypnose_fresh": 2, "meditation_fresh": 2, "lifecoach_fresh": 2,
+    "hypnose_warm": 3, "meditation_warm": 3, "lifecoach_warm": 3,
+}
+
+# Funnel list definitions — HubSpot list IDs confirmed 2026-03-13
+# Warm lists: lead_interest_category=X AND lead_tier IN [1_hot,2_warm]; Fresh: lead_is_fresh=true AND lead_interest_category=X
 LISTS: dict[str, dict[str, Any]] = {
-    "eignungscheck":     {"hubspot_list_id": None, "aircall_tag": "eignungscheck"},
-    "hypnose_fresh":     {"hubspot_list_id": None, "aircall_tag": "hc-fresh"},
-    "hypnose_warm":      {"hubspot_list_id": None, "aircall_tag": "hc-warm"},
-    "meditation_fresh":  {"hubspot_list_id": None, "aircall_tag": "mc-fresh"},
-    "meditation_warm":   {"hubspot_list_id": None, "aircall_tag": "mc-warm"},
-    "lifecoach_fresh":   {"hubspot_list_id": None, "aircall_tag": "gc-fresh"},
-    "lifecoach_warm":    {"hubspot_list_id": None, "aircall_tag": "gc-warm"},
+    # --- Calling lists (Kevin's pipeline) ---
+    "eignungscheck":     {"hubspot_list_id": 352, "aircall_tag": "eignungscheck"},
+    "hypnose_fresh":     {"hubspot_list_id": 368, "aircall_tag": "hc-fresh"},
+    "hypnose_warm":      {"hubspot_list_id": 365, "aircall_tag": "hc-warm"},
+    "meditation_fresh":  {"hubspot_list_id": 369, "aircall_tag": "mc-fresh"},
+    "meditation_warm":   {"hubspot_list_id": 366, "aircall_tag": "mc-warm"},
+    "lifecoach_fresh":   {"hubspot_list_id": 370, "aircall_tag": "gc-fresh"},
+    "lifecoach_warm":    {"hubspot_list_id": 367, "aircall_tag": "gc-warm"},
+    # --- Käufer-Listen (observation only, NOT routed to Kevin) ---
+    # Entry-level / event product buyers. No aircall_tag — these do not go to the dialer.
+    "bf_kaeufer":        {"hubspot_list_id": 362, "aircall_tag": ""},
+    "tfmw_kaeufer":      {"hubspot_list_id": 363, "aircall_tag": ""},
+    "med_kaeufer":       {"hubspot_list_id": 364, "aircall_tag": ""},
 }
 
 # Valid funnels for category mapping
 VALID_FUNNELS = {"hypnose", "meditation", "lifecoach"}
+
+# Only the main Ausbildung products count as "already a customer" and trigger
+# exclusion from calling lists. Entry-level products (afk, tfmw, bf) are
+# high-intent signals but NOT customer exclusions — those leads can still be
+# called for the full Ausbildung upgrade.
+_AUSBILDUNG_KEYS: frozenset[str] = frozenset({"hc", "mc", "gc"})
+
+# Product name patterns that indicate entry-level bundle purchases.
+# These do NOT count as "customer" exclusions — the lead can still be called.
+_BUNDLE_PRODUCT_PATTERNS: frozenset[str] = frozenset({
+    "inner journey",
+    "meditationspaket",
+})
 
 # Short display names for Aircall tags (Kevin's naming convention)
 FUNNEL_SHORT: dict[str, str] = {
@@ -92,8 +139,8 @@ async def _fetch_active_hubspot_leads() -> list[dict[str, Any]]:
         "properties": [
             "email", "firstname", "lastname", "phone",
             "lead_engagement_score", "lead_tier",
-            "lead_last_call_date", "lead_not_interested",
-            "lead_call_booked",
+            "lead_last_call_date", "lead_last_call_outcome",
+            "lead_call_attempts", "lead_not_interested", "lead_call_booked",
         ],
         "limit": 100,
     }
@@ -176,6 +223,84 @@ async def _batch_update_hubspot_contacts(
     return updated
 
 
+_HUBSPOT_NOTE_MARKER = "── Lead Score Card ──"
+
+
+async def _write_hubspot_note(contact_id: str, body: str) -> None:
+    """
+    Write a note on a HubSpot contact visible in the activity timeline.
+
+    Uses the Engagements v3 API (POST /crm/v3/objects/notes).
+    Deduplicates: searches for existing scorer notes and deletes them first.
+    """
+    headers = {
+        "Authorization": f"Bearer {HUBSPOT_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    timestamped_body = f"{_HUBSPOT_NOTE_MARKER}\n{body}"
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        # Search for existing scorer notes on this contact to dedup
+        try:
+            assoc_resp = await client.get(
+                f"{HUBSPOT_BASE}/crm/v3/objects/contacts/{contact_id}/associations/notes",
+                headers=headers,
+            )
+            if assoc_resp.status_code == 200:
+                for assoc in assoc_resp.json().get("results", []):
+                    note_id = assoc.get("id")
+                    if not note_id:
+                        continue
+                    # Fetch note body to check marker
+                    note_resp = await client.get(
+                        f"{HUBSPOT_BASE}/crm/v3/objects/notes/{note_id}",
+                        headers=headers,
+                        params={"properties": "hs_note_body"},
+                    )
+                    if note_resp.status_code == 200:
+                        existing_body = (
+                            note_resp.json()
+                            .get("properties", {})
+                            .get("hs_note_body", "")
+                        )
+                        if _HUBSPOT_NOTE_MARKER in existing_body:
+                            # Delete old scorer note
+                            await client.delete(
+                                f"{HUBSPOT_BASE}/crm/v3/objects/notes/{note_id}",
+                                headers=headers,
+                            )
+        except Exception:
+            pass  # Dedup is best-effort
+
+        # Create new note
+        resp = await client.post(
+            f"{HUBSPOT_BASE}/crm/v3/objects/notes",
+            headers=headers,
+            json={
+                "properties": {
+                    "hs_note_body": timestamped_body,
+                    "hs_timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+                "associations": [
+                    {
+                        "to": {"id": contact_id},
+                        "types": [
+                            {
+                                "associationCategory": "HUBSPOT_DEFINED",
+                                "associationTypeId": 202,  # note_to_contact
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+        if resp.status_code not in (200, 201):
+            logger.warning(
+                "HubSpot note create failed for contact %s: %s %s",
+                contact_id, resp.status_code, resp.text[:300],
+            )
+
+
 # ---------------------------------------------------------------------------
 # Scoring pipeline for a single lead
 # ---------------------------------------------------------------------------
@@ -211,6 +336,67 @@ def _determine_freshness(
     return hours < FRESH_WINDOW.total_seconds() / 3600, hours
 
 
+def _should_exclude_from_queue(
+    last_call_date: str | None,
+    call_outcome: str | None = None,
+    call_attempts: int = 0,
+) -> tuple[bool, str]:
+    """
+    Check if a lead should be excluded from the Aircall queue.
+
+    Returns (should_exclude, reason).
+
+    Exclusion rules:
+      1. Permanent remove outcomes (falsche Nummer, nicht qualifiziert, abgesagt)
+      2. Max call attempts exceeded (5+ unanswered)
+      3. Cooldown: answered=7d, voicemail=3d, no-answer=3d
+    """
+    # 1. Permanent remove — these leads should never be called again
+    if call_outcome and call_outcome.lower().strip() in {o.lower() for o in PERMANENT_REMOVE_OUTCOMES}:
+        return True, f"permanent_remove:{call_outcome}"
+
+    # 2. Max attempts — after 5 tries, stop calling
+    if call_attempts >= MAX_CALL_ATTEMPTS:
+        return True, f"max_attempts:{call_attempts}"
+
+    # 3. Cooldown — temporary exclusion based on last call
+    if not last_call_date:
+        return False, ""
+    try:
+        dt = datetime.fromisoformat(last_call_date.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return False, ""
+
+    hours_since = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+
+    if call_outcome and "kontakt aufgenommen" in call_outcome.lower():
+        if hours_since < COOLDOWN_ANSWERED_HOURS:
+            return True, "cooldown:answered"
+    elif call_outcome and "voicemail" in call_outcome.lower():
+        if hours_since < COOLDOWN_VOICEMAIL_HOURS:
+            return True, "cooldown:voicemail"
+    else:
+        # No answer, busy, unknown — 3 day cooldown
+        if hours_since < COOLDOWN_NO_ANSWER_HOURS:
+            return True, "cooldown:no_answer"
+
+    return False, ""
+
+
+def _aircall_priority_key(item: dict) -> tuple:
+    """
+    Sort key for Aircall queue. Lower = higher priority.
+
+    Order: EC first → Fresh (by recency) → Hot (by score desc) → Warm (by score desc).
+    """
+    priority = AIRCALL_PRIORITY.get(item.get("list_key", ""), 99)
+    # Within same priority: higher score first (negate for ascending sort)
+    # For fresh leads: more recent first (lower fresh_hours first)
+    fresh_hours = item.get("fresh_hours", float("inf"))
+    score = item.get("score", 0)
+    return (priority, fresh_hours, -score)
+
+
 def _determine_tier_label(score: float, is_fresh: bool) -> str:
     """Human-readable tier label for Aircall card."""
     if is_fresh:
@@ -227,16 +413,26 @@ def _determine_list_key(
     is_fresh: bool,
     score: float,
     qualifies_eignungscheck: bool,
+    purchased_funnels: list[str] | None = None,
 ) -> str | None:
     """
     Determine which list a lead belongs to.
 
-    Returns a key from LISTS dict or None if the lead should not be listed.
+    Priority: Eignungscheck > Funnel fresh/warm > None.
+    Leads who filled the Eignungscheck form always go there first (top prio).
+    Others route to their funnel's fresh or warm list.
+
+    Leads who already purchased the Ausbildung in this funnel (hc/mc/gc) are
+    excluded from all calling lists — they are customers, not prospects.
     """
     if qualifies_eignungscheck:
         return "eignungscheck"
 
     if funnel not in VALID_FUNNELS:
+        return None
+
+    # Already bought this Ausbildung → they are a customer, not a prospect
+    if purchased_funnels and funnel in purchased_funnels:
         return None
 
     if is_fresh:
@@ -317,6 +513,8 @@ def _build_hubspot_card_properties(
     last_touch: dict | None,
     purchased_funnels: list[str],
     multi_funnel_info: str,
+    is_fresh: bool = False,
+    purchases: list[dict] | None = None,
 ) -> dict[str, Any]:
     """Build the HubSpot properties dict for the lead card."""
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -328,10 +526,14 @@ def _build_hubspot_card_properties(
         "lead_funnel_source": funnel_source,
         "lead_first_touch": _format_touch_summary(first_touch),
         "lead_last_touch": _format_touch_summary(last_touch),
-        "lead_purchased_products": ", ".join(purchased_funnels) if purchased_funnels else "",
+        "lead_purchased_products": _format_purchases_display(purchases or []) or (
+            ", ".join(purchased_funnels) if purchased_funnels else ""
+        ),
         "lead_multi_funnel": multi_funnel_info,
         "lead_score_updated_at": now_iso,
         "lead_engagement_score": scoring.engagement_score,
+        # Drives the "HC/MC/GC — Frisch" HubSpot dynamic lists (resets to False after 24h)
+        "lead_is_fresh": "true" if is_fresh else "false",
     }
 
 
@@ -345,6 +547,7 @@ def _build_aircall_card(
     last_touch: dict | None,
     hook: str,
     purchased_funnels: list[str] | None = None,
+    purchases: list[dict] | None = None,
 ) -> str:
     """
     Build the Aircall card info string for the closer.
@@ -386,8 +589,15 @@ def _build_aircall_card(
     lines.append(f"First: {first_label} | Last: {last_label}")
 
     # Existing customer info — critical for the closer to know
-    if purchased_funnels:
-        lines.append(f"Kunde: {', '.join(f.title() for f in purchased_funnels)}")
+    purchase_display = _format_purchases_display(purchases or [])
+    if purchase_display:
+        lines.append(f"Kauf: {purchase_display}")
+    elif purchased_funnels:
+        lines.append(f"Kauf: {', '.join(f.title() for f in purchased_funnels)}")
+
+    next_product = _next_product_recommendation(purchased_funnels or [], funnel, purchases)
+    if next_product:
+        lines.append(f"Naechstes Produkt: {next_product}")
 
     # Hook
     lines.append(f"Hook: {hook}")
@@ -459,7 +669,11 @@ async def run_batch_scoring() -> None:
 
     # Step 3: Score each contact — collect HubSpot updates for batch push
     hubspot_updates: list[dict[str, Any]] = []  # {"id": ..., "properties": {...}}
+    hubspot_notes_queue: list[dict[str, Any]] = []  # {"contact_id": ..., "email": ..., "card": ...}
     aircall_queue: list[dict[str, Any]] = []     # leads to push to Aircall
+    decay_alerts: list[dict[str, Any]] = []      # tier downgrades for Slack
+    # Map list_key -> [contact_ids] for bulk HubSpot list membership updates
+    list_memberships: dict[str, list[str]] = {k: [] for k in LISTS}
     skipped_dnc = 0
     skipped_cold = 0
 
@@ -504,6 +718,24 @@ async def run_batch_scoring() -> None:
             is_fresh, fresh_hours = _determine_freshness(touchpoints)
             tier_label = _determine_tier_label(score, is_fresh)
 
+            # Detect tier decay — compare old tier from HubSpot with new
+            old_tier = props.get("lead_tier") or ""
+            new_tier = scoring.lead_tier
+            old_score_val = float(props.get("lead_engagement_score") or 0)
+            _TIER_RANK = {"1_hot": 1, "2_warm": 2, "3_cold": 3, "4_disqualified": 4}
+            if (
+                old_tier in _TIER_RANK
+                and new_tier in _TIER_RANK
+                and _TIER_RANK[new_tier] > _TIER_RANK[old_tier]
+            ):
+                name = f"{props.get('firstname', '')} {props.get('lastname', '')}".strip() or email
+                decay_alerts.append({
+                    "name": name, "email": email,
+                    "old_tier": old_tier, "new_tier": new_tier,
+                    "old_score": old_score_val, "new_score": score,
+                    "interest_category": funnel,
+                })
+
             # Extract first/last touch
             first_touch, last_touch = extract_first_last_touch(touchpoints)
 
@@ -544,6 +776,9 @@ async def run_batch_scoring() -> None:
             not_interested = _truthy(props.get("lead_not_interested"))
             has_phone = bool(props.get("phone"))
 
+            # Read call outcome early — needed for both DNC and cooldown
+            call_outcome = props.get("lead_last_call_outcome")
+
             dnc_result = await check_do_not_call(
                 email=email,
                 funnel=funnel or "",
@@ -554,11 +789,19 @@ async def run_batch_scoring() -> None:
                 not_interested=not_interested,
                 unsubscribed=unsubscribed,
                 purchased_funnels=purchased_funnels,
+                call_outcome=call_outcome,
             )
 
-            # Eignungscheck qualification
+            # Eignungscheck qualification — ONLY for leads who submitted the form.
+            # Warm/fresh leads without a form submission go to their funnel list instead.
+            # This prevents all phone-owning leads from being funnelled to Eignungscheck.
+            has_submitted_form = any(
+                e.get("event_type") == "application_submitted"
+                for e in scored_events
+            )
             qualifies_eignungscheck = (
                 has_phone
+                and has_submitted_form
                 and not call_booked
                 and not unsubscribed
                 and not not_interested
@@ -566,9 +809,46 @@ async def run_batch_scoring() -> None:
                 and funnel not in purchased_funnels
             )
 
-            # Determine list assignment — ONLY leads with phone go to HubSpot/Aircall
-            should_push = has_phone and (is_fresh or score >= SCORE_WARM)
-            list_key = _determine_list_key(funnel, is_fresh, score, qualifies_eignungscheck)
+            # Determine list assignment first — needed to decide should_push logic
+            list_key = _determine_list_key(
+                funnel, is_fresh, score, qualifies_eignungscheck, purchased_funnels
+            )
+
+            # Eignungscheck leads always get called — form submission is the qualifier,
+            # no score threshold applies. Score is shown on the Aircall card for context only.
+            # Fresh/warm funnel lists require score >= 30 or freshness as a quality gate.
+            should_push = has_phone and (
+                list_key == "eignungscheck"
+                or is_fresh
+                or score >= SCORE_WARM
+            )
+
+            # Exclusion check: cooldown, permanent remove, max attempts
+            # (call_outcome already read above for DNC check)
+            try:
+                call_attempts = int(props.get("lead_call_attempts") or 0)
+            except (ValueError, TypeError):
+                call_attempts = 0
+
+            if should_push:
+                excluded, exclude_reason = _should_exclude_from_queue(
+                    last_call_date, call_outcome, call_attempts,
+                )
+                if excluded:
+                    logger.debug(
+                        "Batch: queue exclude %s — %s (last call %s, attempts=%d)",
+                        email, exclude_reason, last_call_date, call_attempts,
+                    )
+                    should_push = False
+
+            # Käufer-Listen: buyers with phone go into observation lists.
+            # Only contacts WITH phone are added — phone-less buyers are tracked in HubSpot only.
+            _KAEUFER_LIST_MAP = {"bf": "bf_kaeufer", "tfmw": "tfmw_kaeufer", "med": "med_kaeufer"}
+            for p in purchases:
+                pk = (p.get("product_key") or "").lower()
+                kaeufer_key = _KAEUFER_LIST_MAP.get(pk)
+                if kaeufer_key and has_phone and contact_id not in list_memberships[kaeufer_key]:
+                    list_memberships[kaeufer_key].append(contact_id)
 
             if not has_phone:
                 logger.debug("Batch: skip %s — no phone number", email)
@@ -592,16 +872,23 @@ async def run_batch_scoring() -> None:
                 last_touch=last_touch,
                 purchased_funnels=purchased_funnels,
                 multi_funnel_info=multi_funnel_info,
+                is_fresh=is_fresh,
+                purchases=purchases,
             )
 
             # Collect for batch HubSpot update (instead of per-lead PATCH)
             hubspot_updates.append({"id": contact_id, "properties": hs_properties})
 
-            # Queue Aircall push if qualified and not DNC
-            if should_push and list_key:
-                # Derive offer/video signals from browser events for hook
-                offer_signals = _extract_offer_signals(browser_events)
+            # Track HubSpot list membership — ONLY contacts with phone number.
+            # Lists are calling lists — contacts without phone are useless for Kevin.
+            if list_key and has_phone:
+                list_memberships[list_key].append(contact_id)
 
+            # Build the call card for ALL scored leads with phone + score >= WARM
+            # This card is used for both Aircall notes AND HubSpot notes
+            aircall_card = ""
+            if has_phone and score >= SCORE_WARM:
+                offer_signals = _extract_offer_signals(browser_events)
                 hook_context = {
                     "email_clicked": email_summary.get("clicks", 0) > 0,
                     "last_email_subject": email_summary.get("last_email_subject", ""),
@@ -618,7 +905,6 @@ async def run_batch_scoring() -> None:
                     "viewed_pricing": offer_signals.get("viewed_pricing"),
                 }
                 hook = generate_hook(hook_context)
-
                 aircall_card = _build_aircall_card(
                     tier_label=tier_label,
                     funnel=funnel,
@@ -629,7 +915,27 @@ async def run_batch_scoring() -> None:
                     last_touch=last_touch,
                     hook=hook,
                     purchased_funnels=purchased_funnels,
+                    purchases=purchases,
                 )
+
+            # Store card in HubSpot as lead_call_card property (visible in contact record)
+            if aircall_card:
+                hs_properties["lead_call_card"] = aircall_card
+
+            # Queue for HubSpot NOTE creation (separate from properties)
+            if aircall_card:
+                hubspot_notes_queue.append({
+                    "contact_id": contact_id,
+                    "email": email,
+                    "card": aircall_card,
+                })
+
+            # Queue Aircall push if qualified and not DNC
+            if should_push and list_key and aircall_card:
+                priority_num = AIRCALL_PRIORITY.get(list_key, 4)
+                priority_tag = f"P{priority_num}-{tier_label}"
+                if funnel:
+                    priority_tag += f"-{funnel[:3]}"
 
                 aircall_queue.append({
                     "email": email,
@@ -642,15 +948,57 @@ async def run_batch_scoring() -> None:
                     "firstname": props.get("firstname", ""),
                     "lastname": props.get("lastname", ""),
                     "aircall_card": aircall_card,
+                    "fresh_hours": fresh_hours,
+                    "priority_tag": priority_tag,
                 })
 
         except Exception as e:
             logger.error("Batch: failed to score %s: %s", email, e)
 
-    # Step 4: Batch-update HubSpot (100 per API call instead of 1-by-1)
+    # Step 4: Batch-update HubSpot contact properties (100 per API call)
     updated = await _batch_update_hubspot_contacts(hubspot_updates)
 
-    # Step 5: Push qualified leads to Aircall
+    # Step 4b: Sync HubSpot list memberships — add contacts to the right static lists
+    from integrations.hubspot import batch_add_to_list
+    total_listed = 0
+    for list_key, contact_ids in list_memberships.items():
+        if not contact_ids:
+            continue
+        list_id = LISTS[list_key]["hubspot_list_id"]
+        if not list_id:
+            continue
+        n = await batch_add_to_list(list_id, contact_ids)
+        total_listed += n
+        logger.info(
+            "Batch: HubSpot list '%s' (id=%d) — added %d/%d contacts",
+            list_key, list_id, n, len(contact_ids),
+        )
+
+    # Step 4c: Write HubSpot notes — Kevin sees these in the contact timeline
+    hs_notes_written = 0
+    if hubspot_notes_queue:
+        logger.info("Batch: writing %d HubSpot notes", len(hubspot_notes_queue))
+        for note_item in hubspot_notes_queue:
+            try:
+                await _write_hubspot_note(
+                    contact_id=note_item["contact_id"],
+                    body=note_item["card"],
+                )
+                hs_notes_written += 1
+            except Exception as e:
+                logger.warning(
+                    "Batch: HubSpot note failed for %s: %s",
+                    note_item["email"], e,
+                )
+        logger.info("Batch: wrote %d/%d HubSpot notes", hs_notes_written, len(hubspot_notes_queue))
+
+    # Step 5: Push qualified leads to Aircall — sorted by priority
+    # EC first → Fresh (most recent first) → Hot (highest score) → Warm (highest score)
+    aircall_queue.sort(key=_aircall_priority_key)
+    logger.info(
+        "Batch: Aircall queue has %d leads (sorted: EC→Fresh→Hot→Warm)",
+        len(aircall_queue),
+    )
     pushed = 0
     for item in aircall_queue:
         try:
@@ -678,9 +1026,23 @@ async def run_batch_scoring() -> None:
         except Exception as e:
             logger.error("Batch: Aircall push failed for %s: %s", item["email"], e)
 
+    # Step 6: Send decay alerts to Slack (tier downgrades)
+    if decay_alerts:
+        logger.info("Batch: %d tier decay(s) detected — sending Slack alerts", len(decay_alerts))
+        for da in decay_alerts[:10]:  # cap at 10 per batch to avoid Slack spam
+            try:
+                await send_decay_alert(
+                    name=da["name"], email=da["email"],
+                    old_tier=da["old_tier"], new_tier=da["new_tier"],
+                    old_score=da["old_score"], new_score=da["new_score"],
+                    interest_category=da["interest_category"],
+                )
+            except Exception as e:
+                logger.warning("Batch: decay alert failed for %s: %s", da["email"], e)
+
     logger.info(
-        "Batch scoring: done — %d/%d updated, %d pushed, %d DNC-skipped, %d cold-skipped",
-        updated, len(email_lead_map), pushed, skipped_dnc, skipped_cold,
+        "Batch scoring: done — %d/%d updated, %d listed, %d pushed, %d DNC-skipped, %d cold-skipped, %d decayed",
+        updated, len(email_lead_map), total_listed, pushed, skipped_dnc, skipped_cold, len(decay_alerts),
     )
 
 
@@ -688,28 +1050,117 @@ async def run_batch_scoring() -> None:
 # Helpers
 # ---------------------------------------------------------------------------
 
-# Supabase product_key -> funnel mapping
+# Supabase product_key -> funnel mapping (used for interest scoring & display)
 _PRODUCT_KEY_TO_FUNNEL: dict[str, str] = {
-    "gc": "lifecoach",
-    "mc": "meditation",
-    "hc": "hypnose",
-    "afk": "hypnose",  # Angstfrei event is under hypnose umbrella
+    "gc":   "lifecoach",
+    "mc":   "meditation",
+    "hc":   "hypnose",
+    "afk":  "hypnose",   # Angstfrei event — high-intent signal, NOT customer exclusion
+    "tfmw": "hypnose",   # Tag für Mentales Wachstum — event signal
 }
+
+
+# Human-readable product display names for Kevin's Aircall card
+_PRODUCT_KEY_DISPLAY: dict[str, str] = {
+    "hc":   "Hypnosecoach Ausbildung",
+    "mc":   "Meditationscoach Ausbildung",
+    "gc":   "Life Coach Ausbildung",
+    "afk":  "Angstfrei Kongress",
+    "tfmw": "Tag f. Mentales Wachstum",
+    "bf":   "Bewusstseinsformel",
+    "ik":   "Inneres Kind",
+    "med":  "Medizinische Grundlagen",
+}
+
+
+def _format_purchases_display(purchases: list[dict]) -> str:
+    """
+    Build a human-readable purchase history string for Kevin's card.
+    Separates full Ausbildung purchases from bundle/entry purchases.
+    Example: "Hypnosecoach Ausbildung | Bundle: Inner Journey"
+    """
+    full_purchases: list[str] = []
+    bundle_purchases: list[str] = []
+
+    for p in purchases:
+        pk = (p.get("product_key") or "").lower()
+        pname = (p.get("product_name") or "").lower()
+        display = _PRODUCT_KEY_DISPLAY.get(pk, pk.upper())
+
+        if any(pat in pname for pat in _BUNDLE_PRODUCT_PATTERNS):
+            bundle_purchases.append("Inner Journey (Bundle)")
+        elif pk in {"hc", "mc", "gc"}:
+            full_purchases.append(display)
+        elif pk in _PRODUCT_KEY_DISPLAY:
+            full_purchases.append(display)
+
+    parts = []
+    if full_purchases:
+        parts.append(" | ".join(full_purchases))
+    if bundle_purchases:
+        parts.append("Bundle: " + ", ".join(bundle_purchases))
+    return " | ".join(parts) if parts else ""
+
+
+def _next_product_recommendation(
+    purchased_funnels: list[str],
+    funnel: str | None,
+    purchases: list[dict] | None = None,
+) -> str:
+    """
+    Derive the next product recommendation for Kevin.
+    Cross-sell flow: HC -> GC -> MC
+    Bundle buyers -> Vollprogramm of same track.
+    """
+    has_hc = "hypnose" in purchased_funnels
+    has_mc = "meditation" in purchased_funnels
+    has_gc = "lifecoach" in purchased_funnels
+
+    has_bundle = any(
+        any(pat in (p.get("product_name") or "").lower() for pat in _BUNDLE_PRODUCT_PATTERNS)
+        for p in (purchases or [])
+    )
+
+    if has_hc and has_gc and has_mc:
+        return "Fachspezialisierung HC"
+    if has_hc and has_gc:
+        return "Meditationscoach Ausbildung (MC)"
+    if has_hc:
+        return "Life Coach Ausbildung (GC)"
+    if has_gc:
+        return "Meditationscoach Ausbildung (MC)"
+    if has_mc:
+        return "Life Coach oder Hypnosecoach Ausbildung"
+    if has_bundle:
+        return "Meditationscoach Vollprogramm"
+    if funnel == "hypnose":
+        return "Hypnosecoach Ausbildung"
+    if funnel == "meditation":
+        return "Meditationscoach Ausbildung"
+    if funnel == "lifecoach":
+        return "Life Coach Ausbildung"
+    return ""
 
 
 def _extract_purchased_funnels(purchases: list[dict]) -> list[str]:
     """
-    Derive purchased funnel names from Supabase purchases.
+    Return funnels where the lead has purchased the full Ausbildung.
 
-    Maps product_key (gc/mc/hc/afk) to funnel names.
-    Returns deduplicated list of funnel names.
+    Only hc/mc/gc count — these make someone a customer who should NOT be
+    called again for the same funnel. Entry-level products (afk, tfmw, bf)
+    and bundles (Inner Journey) are interest signals, not customer exclusions.
     """
     funnels: set[str] = set()
     for p in purchases:
         pk = (p.get("product_key") or "").lower()
-        funnel = _PRODUCT_KEY_TO_FUNNEL.get(pk)
-        if funnel:
-            funnels.add(funnel)
+        pname = (p.get("product_name") or "").lower()
+        # Skip bundle/entry products — not a full Ausbildung purchase
+        if any(pat in pname for pat in _BUNDLE_PRODUCT_PATTERNS):
+            continue
+        if pk in _AUSBILDUNG_KEYS:
+            funnel = _PRODUCT_KEY_TO_FUNNEL.get(pk)
+            if funnel:
+                funnels.add(funnel)
     return list(funnels)
 
 

@@ -20,6 +20,7 @@ import asyncio
 import base64
 import os
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -39,6 +40,24 @@ AIRCALL_CLOSER_USER_ID = os.environ.get("AIRCALL_CLOSER_USER_ID", "")
 FRESH_WINDOW_HOURS = 24
 # Tiers that qualify for the Aircall Power Dialer (Hot + Warm = "Warm" list)
 DIALABLE_TIERS: frozenset[str] = frozenset({"1_hot", "2_warm"})
+
+# Minimum digits after the country code prefix "+" to be a valid number
+_PHONE_MIN_DIGITS = 7
+
+
+def _validate_phone(phone: str) -> bool:
+    """Return True if phone is a plausible international number.
+
+    Accepts:  +41791234567, +4915112345678, +1 (800) 555-1234
+    Rejects:  "+", "", "abc", "123456" (no + prefix), "+123" (too short)
+
+    We intentionally avoid heavy validation — country-specific rules differ.
+    The rule: must start with "+" and contain at least 7 digits after it.
+    """
+    if not phone or not phone.startswith("+"):
+        return False
+    digits = re.sub(r"\D", "", phone[1:])
+    return len(digits) >= _PHONE_MIN_DIGITS
 
 
 def _is_fresh(created_at: datetime | None) -> bool:
@@ -121,6 +140,38 @@ async def _aircall_request(
     return response  # unreachable but keeps type checker happy
 
 
+def _build_call_info(
+    score: float,
+    lead_tier: str,
+    interest_category: str | None,
+    created_at: datetime | None,
+    existing_notes: str = "",
+) -> str:
+    """Build the Aircall contact 'information' field shown during calls.
+
+    Prepends a one-line summary so Kevin immediately sees context:
+      🔥 HOT | Score: 75 | Hypnose | Fresh (<24h)
+      ─────────────────────────────
+      [existing HubSpot notes]
+    """
+    _TIER_EMOJI = {"1_hot": "🔥 HOT", "2_warm": "🟡 WARM", "3_cold": "❄️ COLD", "4_disqualified": "🚫 DQ"}
+    _INTEREST_LABEL = {"hypnose": "Hypnose", "meditation": "Meditation", "lifecoach": "Life Coaching"}
+
+    tier_label = _TIER_EMOJI.get(lead_tier, lead_tier.upper())
+    interest_label = _INTEREST_LABEL.get(interest_category or "", interest_category or "")
+    fresh_label = " | 🆕 Fresh (<24h)" if _is_fresh(created_at) else ""
+
+    parts = [f"{tier_label} | Score: {int(score)}"]
+    if interest_label:
+        parts.append(interest_label)
+    header = " | ".join(parts) + fresh_label
+
+    separator = "\n─────────────────────────\n"
+    if existing_notes:
+        return f"{header}{separator}{existing_notes}"
+    return header
+
+
 async def add_to_power_dialer(
     lead: dict[str, Any],
     *,
@@ -150,17 +201,49 @@ async def add_to_power_dialer(
         logger.debug("Aircall: score %.0f too low, not fresh — skipping %s", score, lead.get("email"))
         return None
 
+    phone = lead.get("phone", "")
+    if not _validate_phone(phone):
+        logger.warning(
+            "Aircall: invalid phone '%s' for %s — skipping push to avoid 400",
+            phone, lead.get("email"),
+        )
+        return None
+
     # Resolve aircall_tag from list_key (e.g. 'hypnose_fresh' -> 'hc-fresh')
     from batch.scorer import LISTS
     aircall_tag = LISTS.get(list_key, {}).get("aircall_tag", list_key)
     tags = _build_tags(score, created_at, interest_category, list_key=aircall_tag)
 
+    # Use pre-built card from scorer if provided (V1: includes Kauf, Naechstes Produkt, Hook).
+    # Fall back to _build_call_info header if no card was passed.
+    existing_notes = lead.get("notes", "")
+    if existing_notes and any(
+        kw in existing_notes for kw in ("Score:", "Hook:", "Ziel:")
+    ):
+        # Card already built by _build_aircall_card() in scorer.py — use as-is
+        call_info = existing_notes
+    else:
+        call_info = _build_call_info(
+            score=score,
+            lead_tier=lead_tier,
+            interest_category=interest_category,
+            created_at=created_at,
+            existing_notes=existing_notes,
+        )
+    lead_with_info = {**lead, "notes": call_info}
+
     # Use shared client for both calls (connection reuse + retry on 429)
     async with httpx.AsyncClient(timeout=timeout) as client:
-        # Step 1: Create/update contact with tags
-        contact_id = await _upsert_contact(client, lead, tags=tags)
+        # Step 1: Create/update contact with tags + call info in information field
+        contact_id = await _upsert_contact(client, lead_with_info, tags=tags)
 
-        # Step 2: Push phone number into Closer's dialer campaign
+        # Step 2: Write scorer card as a NOTE on the contact
+        # Notes appear directly in the Aircall UI panel (visible during calls)
+        # The information field is hidden in Power Dialer view
+        if contact_id and call_info:
+            await _write_contact_note(client, contact_id, call_info, lead.get("email", ""))
+
+        # Step 3: Push phone number into Closer's dialer campaign
         return await _push_to_dialer_campaign(client, lead)
 
 
@@ -199,6 +282,62 @@ async def _upsert_contact(
     contact_id = str(response.json().get("contact", {}).get("id", ""))
     logger.info("Aircall: upserted contact %s → id=%s tags=%s", lead.get("email"), contact_id, tags)
     return contact_id
+
+
+async def _write_contact_note(
+    client: httpx.AsyncClient,
+    contact_id: str,
+    content: str,
+    email: str = "",
+) -> None:
+    """
+    Write a note on an Aircall contact. Notes appear directly in Kevin's
+    call panel — unlike the 'information' field which is hidden in Power Dialer.
+
+    Aircall API: POST /v1/contacts/{id}/notes
+    Docs: https://developer.aircall.io/api-references/#create-a-note
+
+    The note is prefixed with a timestamp marker so the batch scorer can
+    detect and replace stale notes on subsequent runs.
+    """
+    # Marker to identify scorer-generated notes (for dedup on re-runs)
+    marker = "── Lead Score Card ──"
+    timestamped = f"{marker}\n{content}"
+
+    try:
+        # First: check existing notes and remove old scorer note if present
+        notes_resp = await _aircall_request(
+            client, "get", f"{AIRCALL_BASE}/contacts/{contact_id}/notes",
+        )
+        if notes_resp.status_code == 200:
+            existing_notes = notes_resp.json().get("notes", [])
+            for note in existing_notes:
+                if marker in (note.get("content") or ""):
+                    note_id = note.get("id")
+                    if note_id:
+                        await _aircall_request(
+                            client, "delete",
+                            f"{AIRCALL_BASE}/contacts/{contact_id}/notes/{note_id}",
+                        )
+                        logger.debug("Aircall: deleted old scorer note %s for %s", note_id, email)
+
+        # Create fresh note with current card
+        resp = await _aircall_request(
+            client, "post",
+            f"{AIRCALL_BASE}/contacts/{contact_id}/notes",
+            json={"content": timestamped},
+        )
+
+        if resp.status_code in (200, 201):
+            logger.info("Aircall: wrote scorer note for %s (contact %s)", email, contact_id)
+        else:
+            logger.warning(
+                "Aircall: note write failed for %s: %s %s",
+                email, resp.status_code, resp.text,
+            )
+    except Exception as e:
+        # Note write is best-effort — don't fail the entire push
+        logger.warning("Aircall: note write error for %s: %s", email, e)
 
 
 async def _push_to_dialer_campaign(
