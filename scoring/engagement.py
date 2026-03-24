@@ -50,15 +50,15 @@ MAX_EVENTS_PER_TYPE = 3
 
 
 def inactivity_malus(days_since_last_activity: float, unsubscribed: bool) -> int:
-    """Flat point deduction for inactivity or unsubscribe."""
-    malus = 0
+    """Flat point deduction for unsubscribe only.
+
+    Inactivity is now handled by inactivity_decay_factor() (multiplicative).
+    The flat -30/-15 malus was removed to avoid double-penalizing inactive leads.
+    Unsubscribe malus (-50) remains as a hard signal.
+    """
     if unsubscribed:
-        malus -= 50
-    elif days_since_last_activity > 30:
-        malus -= 30
-    elif days_since_last_activity > 14:
-        malus -= 15
-    return malus
+        return -50
+    return 0
 
 
 def inactivity_decay_factor(days_since_last_activity: float) -> float:
