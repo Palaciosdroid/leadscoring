@@ -54,9 +54,9 @@ class TestCalculateEngagementScore:
 
     def test_empty_events(self):
         result = calculate_engagement_score([])
-        # No events → days_since_last = 999 → inactivity malus -30
-        assert result["score"] == -30
-        assert result["raw_score"] == -30
+        # No events → days_since_last = 999 → malus -30 × decay 0.25 = -7.5
+        assert result["score"] == -8  # round(-7.5) = -8
+        assert result["raw_score"] == -7.5
         assert result["event_breakdown"] == []
         assert result["days_since_last_activity"] == 999.0
 
@@ -80,8 +80,8 @@ class TestCalculateEngagementScore:
     def test_unknown_event_ignored(self):
         events = [{"event_type": "unknown_event", "timestamp": datetime.now(timezone.utc).isoformat()}]
         result = calculate_engagement_score(events)
-        # Unknown events skipped → no last_activity → 999 days → -30 malus
-        assert result["score"] == -30
+        # Unknown events skipped → no last_activity → 999 days → malus -30 × decay 0.25
+        assert result["score"] == -8
         assert result["event_breakdown"] == []
 
     def test_recency_decay(self):
@@ -107,8 +107,8 @@ class TestCalculateEngagementScore:
     def test_invalid_timestamp_skipped(self):
         events = [{"event_type": "email_opened", "timestamp": "not-a-date"}]
         result = calculate_engagement_score(events)
-        # Invalid timestamp skipped → no last_activity → -30 malus
-        assert result["score"] == -30
+        # Invalid timestamp skipped → no last_activity → malus -30 × decay 0.25
+        assert result["score"] == -8
 
     def test_multiple_events_accumulate(self):
         events = [

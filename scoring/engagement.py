@@ -50,6 +50,7 @@ MAX_EVENTS_PER_TYPE = 3
 
 
 def inactivity_malus(days_since_last_activity: float, unsubscribed: bool) -> int:
+    """Flat point deduction for inactivity or unsubscribe."""
     malus = 0
     if unsubscribed:
         malus -= 50
@@ -58,6 +59,30 @@ def inactivity_malus(days_since_last_activity: float, unsubscribed: bool) -> int
     elif days_since_last_activity > 14:
         malus -= 15
     return malus
+
+
+def inactivity_decay_factor(days_since_last_activity: float) -> float:
+    """
+    Multiplicative decay factor based on inactivity.
+
+    Applied to the total score AFTER event scoring + malus.
+    This ensures that leads who haven't engaged in months
+    don't stay at score 100 forever.
+
+    Decay schedule:
+      - 0-30 days:  no decay (1.0)
+      - 31-60 days: mild decay (0.7)
+      - 61-90 days: strong decay (0.5)
+      - 91+ days:   heavy decay (0.25)
+    """
+    if days_since_last_activity <= 30:
+        return 1.0
+    elif days_since_last_activity <= 60:
+        return 0.7
+    elif days_since_last_activity <= 90:
+        return 0.5
+    else:
+        return 0.25
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +150,11 @@ def calculate_engagement_score(events: list[dict[str, Any]]) -> dict[str, Any]:
     unsubscribed = any(e.get("event_type") == "email_unsubscribed" for e in events)
     malus = inactivity_malus(days_since_last, unsubscribed)
     raw_score += malus
+
+    # Apply inactivity decay — multiplicative reduction for stale leads
+    decay = inactivity_decay_factor(days_since_last)
+    if decay < 1.0:
+        raw_score = raw_score * decay
 
     score = max(min(round(raw_score), 100), -100)  # allow negative for Disqualified tier
 
