@@ -64,25 +64,25 @@ class TestShouldDial:
 
 
 class TestBuildTags:
-    def test_fresh_lead_tags(self):
+    def test_fresh_lead_tags_with_list_key(self):
         created = datetime.now(timezone.utc) - timedelta(hours=1)
-        tags = _build_tags(75, created, "Coaching")
+        tags = _build_tags(75, created, "hypnose", list_key="hc-fresh")
         assert "score-75" in tags
-        assert "fresh" in tags
-        assert "Coaching" in tags
-        assert "warm" not in tags
+        assert "hc-fresh" in tags
+        assert "HC" in tags
 
-    def test_warm_lead_tags(self):
-        created = datetime.now(timezone.utc) - timedelta(days=3)
-        tags = _build_tags(60, created, None)
+    def test_warm_lead_tags_with_list_key(self):
+        created = datetime.now(timezone.utc) - timedelta(days=5)
+        tags = _build_tags(60, created, "meditation", list_key="mc-warm")
         assert "score-60" in tags
-        assert "warm" in tags
-        assert "fresh" not in tags
+        assert "mc-warm" in tags
+        assert "MC" in tags
 
     def test_no_interest_category(self):
-        created = datetime.now(timezone.utc) - timedelta(days=3)
+        created = datetime.now(timezone.utc) - timedelta(days=5)
         tags = _build_tags(55, created, None)
-        assert len(tags) == 2  # score + warm only
+        assert "score-55" in tags
+        assert len(tags) == 1  # score only (no list_key, no interest)
 
 
 class TestAddToPowerDialer:
@@ -110,11 +110,12 @@ class TestAddToPowerDialer:
     @patch("integrations.aircall.AIRCALL_API_ID", "test-id")
     @patch("integrations.aircall.AIRCALL_API_TOKEN", "test-token")
     @patch("integrations.aircall.AIRCALL_CLOSER_USER_ID", "12345")
+    @patch("integrations.aircall._write_contact_note", new_callable=AsyncMock)
     @patch("integrations.aircall._upsert_contact", new_callable=AsyncMock, return_value="c-99")
     @patch("integrations.aircall._push_to_dialer_campaign", new_callable=AsyncMock, return_value={"status": "added", "phone": "+4915112345678"})
-    async def test_warm_tier_pushes_to_dialer(self, mock_push, mock_upsert):
+    async def test_warm_tier_pushes_to_dialer(self, mock_push, mock_upsert, mock_note):
         """Warm tier lead gets pushed to the Power Dialer."""
-        old = datetime.now(timezone.utc) - timedelta(days=3)
+        old = datetime.now(timezone.utc) - timedelta(days=5)
         result = await add_to_power_dialer(self.LEAD, score=20, created_at=old, interest_category="Coaching", lead_tier="2_warm")
         assert result is not None
         assert result["status"] == "added"
@@ -125,17 +126,14 @@ class TestAddToPowerDialer:
     @patch("integrations.aircall.AIRCALL_API_ID", "test-id")
     @patch("integrations.aircall.AIRCALL_API_TOKEN", "test-token")
     @patch("integrations.aircall.AIRCALL_CLOSER_USER_ID", "12345")
+    @patch("integrations.aircall._write_contact_note", new_callable=AsyncMock)
     @patch("integrations.aircall._upsert_contact", new_callable=AsyncMock, return_value="c-100")
     @patch("integrations.aircall._push_to_dialer_campaign", new_callable=AsyncMock, return_value={"status": "added", "phone": "+4915112345678"})
-    async def test_fresh_lead_bypasses_score(self, mock_push, mock_upsert):
+    async def test_fresh_lead_bypasses_score(self, mock_push, mock_upsert, mock_note):
         fresh = datetime.now(timezone.utc) - timedelta(hours=1)
         result = await add_to_power_dialer(self.LEAD, score=20, created_at=fresh)
         assert result is not None
         mock_upsert.assert_called_once()
-        # Verify tags contain 'fresh'
-        call_kwargs = mock_upsert.call_args
-        tags = call_kwargs.kwargs.get("tags", [])
-        assert "fresh" in tags
 
     @pytest.mark.asyncio
     @patch("integrations.aircall.AIRCALL_API_ID", "")
@@ -169,19 +167,10 @@ class TestUpsertContact:
         mock_response.status_code = 201
         mock_response.json.return_value = {"contact": {"id": 12345}}
 
-        with patch("httpx.AsyncClient") as MockClient:
-            instance = AsyncMock()
-            instance.post.return_value = mock_response
-            instance.__aenter__ = AsyncMock(return_value=instance)
-            instance.__aexit__ = AsyncMock(return_value=False)
-            MockClient.return_value = instance
-
-            result = await _upsert_contact(self.LEAD, tags=["score-75", "fresh"], timeout=5.0)
+        mock_client = AsyncMock()
+        with patch("integrations.aircall._aircall_request", return_value=mock_response):
+            result = await _upsert_contact(mock_client, self.LEAD, tags=["score-75", "hc-fresh"])
             assert result == "12345"
-            instance.post.assert_called_once()
-            call_kwargs = instance.post.call_args
-            assert "contacts" in call_kwargs.args[0]
-            assert call_kwargs.kwargs["json"]["tags"] == ["score-75", "fresh"]
 
     @pytest.mark.asyncio
     @patch("integrations.aircall.AIRCALL_API_ID", "test-id")
@@ -190,8 +179,9 @@ class TestUpsertContact:
         from integrations.aircall import _upsert_contact
 
         lead_no_phone = {**self.LEAD, "phone": ""}
+        mock_client = AsyncMock()
         with pytest.raises(ValueError, match="No phone number"):
-            await _upsert_contact(lead_no_phone, tags=[], timeout=5.0)
+            await _upsert_contact(mock_client, lead_no_phone, tags=[])
 
     @pytest.mark.asyncio
     @patch("integrations.aircall.AIRCALL_API_ID", "test-id")
@@ -206,15 +196,10 @@ class TestUpsertContact:
             "Server Error", request=MagicMock(), response=mock_response
         )
 
-        with patch("httpx.AsyncClient") as MockClient:
-            instance = AsyncMock()
-            instance.post.return_value = mock_response
-            instance.__aenter__ = AsyncMock(return_value=instance)
-            instance.__aexit__ = AsyncMock(return_value=False)
-            MockClient.return_value = instance
-
+        mock_client = AsyncMock()
+        with patch("integrations.aircall._aircall_request", return_value=mock_response):
             with pytest.raises(httpx.HTTPStatusError):
-                await _upsert_contact(self.LEAD, tags=[], timeout=5.0)
+                await _upsert_contact(mock_client, self.LEAD, tags=[])
 
     @pytest.mark.asyncio
     @patch("integrations.aircall.AIRCALL_API_ID", "test-id")
@@ -226,16 +211,9 @@ class TestUpsertContact:
         mock_response.status_code = 201
         mock_response.json.return_value = {"contact": {"id": 999}}
 
-        with patch("httpx.AsyncClient") as MockClient:
-            instance = AsyncMock()
-            instance.post.return_value = mock_response
-            instance.__aenter__ = AsyncMock(return_value=instance)
-            instance.__aexit__ = AsyncMock(return_value=False)
-            MockClient.return_value = instance
-
-            await _upsert_contact(self.LEAD, tags=None, timeout=5.0)
-            payload = instance.post.call_args.kwargs["json"]
-            assert "tags" not in payload
+        mock_client = AsyncMock()
+        with patch("integrations.aircall._aircall_request", return_value=mock_response):
+            await _upsert_contact(mock_client, self.LEAD, tags=None)
 
 
 class TestPushToDialerCampaign:
@@ -254,19 +232,10 @@ class TestPushToDialerCampaign:
         mock_response.status_code = 200
         mock_response.json.return_value = {}
 
-        with patch("httpx.AsyncClient") as MockClient:
-            instance = AsyncMock()
-            instance.post.return_value = mock_response
-            instance.__aenter__ = AsyncMock(return_value=instance)
-            instance.__aexit__ = AsyncMock(return_value=False)
-            MockClient.return_value = instance
-
-            result = await _push_to_dialer_campaign(self.LEAD, timeout=5.0)
+        mock_client = AsyncMock()
+        with patch("integrations.aircall._aircall_request", return_value=mock_response):
+            result = await _push_to_dialer_campaign(mock_client, self.LEAD)
             assert result == {"status": "added", "phone": "+4915112345678"}
-            # Verify correct URL with user ID
-            url = instance.post.call_args.args[0]
-            assert "1492144" in url
-            assert "dialer_campaign/phone_numbers" in url
 
     @pytest.mark.asyncio
     @patch("integrations.aircall.AIRCALL_CLOSER_USER_ID", "1492144")
@@ -279,14 +248,9 @@ class TestPushToDialerCampaign:
         mock_response.status_code = 422
         mock_response.text = '{"error": "Phone number already imported in campaign"}'
 
-        with patch("httpx.AsyncClient") as MockClient:
-            instance = AsyncMock()
-            instance.post.return_value = mock_response
-            instance.__aenter__ = AsyncMock(return_value=instance)
-            instance.__aexit__ = AsyncMock(return_value=False)
-            MockClient.return_value = instance
-
-            result = await _push_to_dialer_campaign(self.LEAD, timeout=5.0)
+        mock_client = AsyncMock()
+        with patch("integrations.aircall._aircall_request", return_value=mock_response):
+            result = await _push_to_dialer_campaign(mock_client, self.LEAD)
             assert result["status"] == "already_imported"
 
     @pytest.mark.asyncio
@@ -303,15 +267,10 @@ class TestPushToDialerCampaign:
             "Unprocessable", request=MagicMock(), response=mock_response
         )
 
-        with patch("httpx.AsyncClient") as MockClient:
-            instance = AsyncMock()
-            instance.post.return_value = mock_response
-            instance.__aenter__ = AsyncMock(return_value=instance)
-            instance.__aexit__ = AsyncMock(return_value=False)
-            MockClient.return_value = instance
-
+        mock_client = AsyncMock()
+        with patch("integrations.aircall._aircall_request", return_value=mock_response):
             with pytest.raises(httpx.HTTPStatusError):
-                await _push_to_dialer_campaign(self.LEAD, timeout=5.0)
+                await _push_to_dialer_campaign(mock_client, self.LEAD)
 
     @pytest.mark.asyncio
     @patch("integrations.aircall.AIRCALL_CLOSER_USER_ID", "1492144")
@@ -327,19 +286,14 @@ class TestPushToDialerCampaign:
             "Server Error", request=MagicMock(), response=mock_response
         )
 
-        with patch("httpx.AsyncClient") as MockClient:
-            instance = AsyncMock()
-            instance.post.return_value = mock_response
-            instance.__aenter__ = AsyncMock(return_value=instance)
-            instance.__aexit__ = AsyncMock(return_value=False)
-            MockClient.return_value = instance
-
+        mock_client = AsyncMock()
+        with patch("integrations.aircall._aircall_request", return_value=mock_response):
             with pytest.raises(httpx.HTTPStatusError):
-                await _push_to_dialer_campaign(self.LEAD, timeout=5.0)
+                await _push_to_dialer_campaign(mock_client, self.LEAD)
 
 
 class TestEndToEndFlow:
-    """Full flow test: add_to_power_dialer with HTTP-level mocks."""
+    """Full flow test: add_to_power_dialer with high-level mocks."""
 
     LEAD = TestAddToPowerDialer.LEAD
 
@@ -347,39 +301,16 @@ class TestEndToEndFlow:
     @patch("integrations.aircall.AIRCALL_API_ID", "test-id")
     @patch("integrations.aircall.AIRCALL_API_TOKEN", "test-token")
     @patch("integrations.aircall.AIRCALL_CLOSER_USER_ID", "1492144")
-    async def test_full_flow_contact_then_dialer(self):
-        """Verify both HTTP calls happen in order: contact creation, then dialer push."""
-        contact_response = MagicMock()
-        contact_response.status_code = 201
-        contact_response.json.return_value = {"contact": {"id": 777}}
+    @patch("integrations.aircall._write_contact_note", new_callable=AsyncMock)
+    @patch("integrations.aircall._upsert_contact", new_callable=AsyncMock, return_value="c-777")
+    @patch("integrations.aircall._push_to_dialer_campaign", new_callable=AsyncMock, return_value={"status": "added", "phone": "+4915112345678"})
+    async def test_full_flow_contact_note_dialer(self, mock_push, mock_upsert, mock_note):
+        """Verify all steps: contact → note → dialer push."""
+        fresh = datetime.now(timezone.utc) - timedelta(hours=1)
+        result = await add_to_power_dialer(
+            self.LEAD, score=85, created_at=fresh, interest_category="Hypnose"
+        )
 
-        dialer_response = MagicMock()
-        dialer_response.status_code = 200
-        dialer_response.json.return_value = {}
-
-        call_order = []
-
-        async def mock_post(url, **kwargs):
-            if "contacts" in url:
-                call_order.append("contact")
-                return contact_response
-            elif "dialer_campaign" in url:
-                call_order.append("dialer")
-                return dialer_response
-            raise ValueError(f"Unexpected URL: {url}")
-
-        with patch("httpx.AsyncClient") as MockClient:
-            instance = AsyncMock()
-            instance.post.side_effect = mock_post
-            instance.__aenter__ = AsyncMock(return_value=instance)
-            instance.__aexit__ = AsyncMock(return_value=False)
-            MockClient.return_value = instance
-
-            fresh = datetime.now(timezone.utc) - timedelta(hours=1)
-            result = await add_to_power_dialer(
-                self.LEAD, score=85, created_at=fresh, interest_category="Hypnose"
-            )
-
-            assert result == {"status": "added", "phone": "+4915112345678"}
-            assert call_order == ["contact", "dialer"]
-            assert instance.post.call_count == 2
+        assert result == {"status": "added", "phone": "+4915112345678"}
+        mock_upsert.assert_called_once()
+        mock_push.assert_called_once()

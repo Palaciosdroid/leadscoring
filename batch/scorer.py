@@ -671,6 +671,7 @@ async def run_batch_scoring() -> None:
     hubspot_updates: list[dict[str, Any]] = []  # {"id": ..., "properties": {...}}
     hubspot_notes_queue: list[dict[str, Any]] = []  # {"contact_id": ..., "email": ..., "card": ...}
     aircall_queue: list[dict[str, Any]] = []     # leads to push to Aircall
+    new_hot_leads: list[dict[str, Any]] = []     # leads that became hot THIS run
     decay_alerts: list[dict[str, Any]] = []      # tier downgrades for Slack
     # Map list_key -> [contact_ids] for bulk HubSpot list membership updates
     list_memberships: dict[str, list[str]] = {k: [] for k in LISTS}
@@ -952,6 +953,18 @@ async def run_batch_scoring() -> None:
                     "priority_tag": priority_tag,
                 })
 
+            # Track NEW hot leads (was not hot before, now hot) for Slack alerts
+            if scoring.lead_tier == "1_hot" and old_tier != "1_hot":
+                new_hot_leads.append({
+                    "email": email,
+                    "phone": props.get("phone", ""),
+                    "firstname": props.get("firstname", ""),
+                    "lastname": props.get("lastname", ""),
+                    "score": score,
+                    "tier": scoring.lead_tier,
+                    "interest": funnel or "",
+                })
+
         except Exception as e:
             logger.error("Batch: failed to score %s: %s", email, e)
 
@@ -991,6 +1004,21 @@ async def run_batch_scoring() -> None:
                     note_item["email"], e,
                 )
         logger.info("Batch: wrote %d/%d HubSpot notes", hs_notes_written, len(hubspot_notes_queue))
+
+    # Step 4d: Send Slack Hot Lead alerts for NEW hot leads
+    if new_hot_leads:
+        from integrations.slack import send_hot_lead_alert
+        logger.info("Batch: %d NEW hot leads — sending Slack alerts", len(new_hot_leads))
+        for hl in new_hot_leads[:10]:  # cap at 10 per batch
+            try:
+                await send_hot_lead_alert(
+                    lead=hl,
+                    combined_score=hl["score"],
+                    lead_tier=hl["tier"],
+                    interest_category=hl.get("interest"),
+                )
+            except Exception as e:
+                logger.warning("Batch: Hot Lead Slack alert failed for %s: %s", hl["email"], e)
 
     # Step 5: Push qualified leads to Aircall — sorted by priority
     # EC first → Fresh (most recent first) → Hot (highest score) → Warm (highest score)
