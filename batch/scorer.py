@@ -137,7 +137,7 @@ async def _fetch_active_hubspot_leads() -> list[dict[str, Any]]:
             }
         ],
         "properties": [
-            "email", "firstname", "lastname", "phone",
+            "email", "firstname", "lastname", "phone", "mobilephone",
             "lead_engagement_score", "lead_tier",
             "lead_last_call_date", "lead_last_call_outcome",
             "lead_call_attempts", "lead_not_interested", "lead_call_booked",
@@ -775,7 +775,7 @@ async def run_batch_scoring() -> None:
                     continue
             call_booked = has_scheduled_meeting or _truthy(props.get("lead_call_booked"))
             not_interested = _truthy(props.get("lead_not_interested"))
-            has_phone = bool(props.get("phone"))
+            has_phone = bool(props.get("phone") or props.get("mobilephone"))
 
             # Read call outcome early — needed for both DNC and cooldown
             call_outcome = props.get("lead_last_call_outcome")
@@ -945,7 +945,7 @@ async def run_batch_scoring() -> None:
                     "tier_label": tier_label,
                     "funnel": funnel,
                     "lead_tier": scoring.lead_tier,
-                    "phone": props.get("phone", ""),
+                    "phone": props.get("phone") or props.get("mobilephone", ""),
                     "firstname": props.get("firstname", ""),
                     "lastname": props.get("lastname", ""),
                     "aircall_card": aircall_card,
@@ -957,7 +957,7 @@ async def run_batch_scoring() -> None:
             if scoring.lead_tier == "1_hot" and old_tier != "1_hot":
                 new_hot_leads.append({
                     "email": email,
-                    "phone": props.get("phone", ""),
+                    "phone": props.get("phone") or props.get("mobilephone", ""),
                     "firstname": props.get("firstname", ""),
                     "lastname": props.get("lastname", ""),
                     "score": score,
