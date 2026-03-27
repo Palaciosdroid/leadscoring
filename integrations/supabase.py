@@ -91,6 +91,19 @@ class SupabaseClient:
             response.raise_for_status()
         return response.json()
 
+    async def _post(self, table: str, data: dict) -> dict | None:
+        """Generic POST (insert) against PostgREST. Returns inserted row."""
+        url = f"{self._base}/{table}"
+        response = await self._client.post(url, json=data)
+        if response.status_code not in (200, 201):
+            logger.error(
+                "Supabase POST %s failed: %s %s",
+                table, response.status_code, response.text[:500],
+            )
+            response.raise_for_status()
+        rows = response.json()
+        return rows[0] if isinstance(rows, list) and rows else rows
+
 
 # ---------------------------------------------------------------------------
 # Singleton
@@ -433,3 +446,44 @@ async def fetch_contact_by_email(email: str) -> dict | None:
         return None
 
     return results[0]
+
+
+async def store_whatsapp_event(event_data: dict) -> dict | None:
+    """
+    Store a WhatsApp qualification event in the touchpoints table.
+
+    event_data should contain: phone, email, name, whatsapp_score,
+    interest_level, interest_type, wants_to_coach, personal_growth,
+    pain_points, next_action, summary, message_count, has_calendar_link,
+    opted_out, funnel, timestamp.
+    """
+    client = get_supabase_client()
+
+    # Map to touchpoints table schema
+    row = {
+        "channel": "whatsapp",
+        "source": event_data.get("funnel", "mc"),
+        "medium": "whatsapp_bot",
+        "touchpoint_type": "whatsapp_qualified",
+        "content": event_data.get("summary", ""),
+        "campaign": event_data.get("funnel", "mc"),
+        "created_at": event_data.get("timestamp", datetime.now(timezone.utc).isoformat()),
+        # Store structured data in the content field as JSON summary
+        "is_first_touch": False,
+        "is_last_touch": False,
+    }
+
+    # Try to link to existing contact by email
+    email = event_data.get("email", "")
+    if email:
+        contact = await fetch_contact_by_email(email)
+        if contact:
+            row["contact_id"] = contact["id"]
+
+    try:
+        result = await client._post("touchpoints", row)
+        logger.info("Stored whatsapp_qualified event for %s", email or event_data.get("phone", "unknown"))
+        return result
+    except Exception as e:
+        logger.error("Failed to store whatsapp event: %s", e)
+        return None

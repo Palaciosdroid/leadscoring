@@ -71,12 +71,20 @@ def _is_fresh(created_at: datetime | None) -> bool:
 def _should_dial(score: float, created_at: datetime | None = None, lead_tier: str = "") -> bool:
     """Decide if lead qualifies for the Power Dialer.
 
+    Booked: has meeting with Kevin        → never dial.
     Fresh list: any score, opted in < 24h → always dial.
     Warm list:  tier is 1_hot or 2_warm   → dial.
     Cold/Disqualified: CIO nurturing only → skip.
+    Below score 30: not worth calling     → skip.
     """
+    # Booked leads already have a meeting — never cold-call them
+    if lead_tier == "0_booked":
+        return False
     if _is_fresh(created_at):
         return True
+    # TASK B: Score < 30 never goes to Aircall
+    if score < 30:
+        return False
     return lead_tier in DIALABLE_TIERS
 
 
@@ -85,17 +93,50 @@ def _classify_list(created_at: datetime | None) -> str:
     return "fresh" if _is_fresh(created_at) else "warm"
 
 
+# Priority tag definitions — Kevin calls highest priority first
+PRIORITY_TAGS: list[tuple[str, float]] = [
+    ("priority-1-hot",     80.0),   # Score >= 80: call first
+    ("priority-2-warm",    60.0),   # Score 60-79: call second
+    ("priority-3-nurture", 30.0),   # Score 30-59: call third
+    # Score < 30: don't push to Aircall at all (handled in _should_dial)
+]
+
+# All priority tag values for cleanup when updating contacts
+ALL_PRIORITY_TAG_VALUES: frozenset[str] = frozenset(
+    tag for tag, _ in PRIORITY_TAGS
+)
+
+
+def _determine_priority_tag(score: float) -> str | None:
+    """Return the priority tag for a given score, or None if below threshold."""
+    for tag, threshold in PRIORITY_TAGS:
+        if score >= threshold:
+            return tag
+    return None
+
+
 def _build_tags(score: float, created_at: datetime | None, interest_category: str | None, list_key: str = "") -> list[str]:
     """Build Aircall contact tags for the Closer to see during calls.
 
     Uses short funnel names: HC (Hypnose), MC (Meditation), GC (Gesprächscoach).
     Combined tag format: 'hc-fresh', 'mc-warm', 'eignungscheck'.
+
+    TASK B: Adds priority tags so Kevin calls hottest leads first:
+      score >= 80: 'priority-1-hot'
+      score 60-79: 'priority-2-warm'
+      score 30-59: 'priority-3-nurture'
+      score < 30:  not pushed to Aircall at all
     """
     # Short funnel mapping
     _SHORT = {"hypnose": "HC", "meditation": "MC", "lifecoach": "GC"}
     funnel_short = _SHORT.get(interest_category or "", interest_category or "")
 
     tags = [f"score-{int(score)}"]
+
+    # Priority tag — Kevin sorts his queue by these
+    priority_tag = _determine_priority_tag(score)
+    if priority_tag:
+        tags.insert(0, priority_tag)
 
     # Primary list tag (e.g. 'hc-fresh', 'eignungscheck')
     if list_key:
@@ -154,7 +195,7 @@ def _build_call_info(
       ─────────────────────────────
       [existing HubSpot notes]
     """
-    _TIER_EMOJI = {"1_hot": "🔥 HOT", "2_warm": "🟡 WARM", "3_cold": "❄️ COLD", "4_disqualified": "🚫 DQ"}
+    _TIER_EMOJI = {"0_booked": "📅 BOOKED", "1_hot": "🔥 HOT", "2_warm": "🟡 WARM", "3_cold": "❄️ COLD", "4_disqualified": "🚫 DQ"}
     _INTEREST_LABEL = {"hypnose": "Hypnose", "meditation": "Meditation", "lifecoach": "Life Coaching"}
 
     tier_label = _TIER_EMOJI.get(lead_tier, lead_tier.upper())
@@ -247,6 +288,54 @@ async def add_to_power_dialer(
         return await _push_to_dialer_campaign(client, lead)
 
 
+async def _cleanup_stale_priority_tags(
+    client: httpx.AsyncClient,
+    contact_id: str,
+    new_priority_tag: str | None,
+    email: str = "",
+) -> None:
+    """Remove old priority tags from an Aircall contact before applying new ones.
+
+    Aircall tags accumulate — we need to explicitly remove stale priority-*
+    tags when a lead's score changes tier (e.g. priority-3-nurture -> priority-1-hot).
+    Also removes old 'score-NN' tags to keep things clean.
+    """
+    try:
+        resp = await _aircall_request(
+            client, "get", f"{AIRCALL_BASE}/contacts/{contact_id}",
+        )
+        if resp.status_code != 200:
+            return
+
+        existing_tags = resp.json().get("contact", {}).get("tags", [])
+        # Aircall returns tags as [{"id": ..., "name": "tag-name"}, ...]
+        tags_to_remove = []
+        for tag_obj in existing_tags:
+            tag_name = tag_obj.get("name", "") if isinstance(tag_obj, dict) else str(tag_obj)
+            # Remove all old priority tags except the current one
+            if tag_name in ALL_PRIORITY_TAG_VALUES and tag_name != new_priority_tag:
+                tags_to_remove.append(tag_name)
+            # Remove old score-NN tags (they get replaced with current score)
+            if tag_name.startswith("score-"):
+                tags_to_remove.append(tag_name)
+
+        if not tags_to_remove:
+            return
+
+        # Aircall API: DELETE /v1/contacts/{id}/tags/{tag_name}
+        for tag_name in tags_to_remove:
+            del_resp = await _aircall_request(
+                client, "delete",
+                f"{AIRCALL_BASE}/contacts/{contact_id}/tags/{tag_name}",
+            )
+            if del_resp.status_code in (200, 204):
+                logger.debug("Aircall: removed stale tag '%s' from contact %s", tag_name, email)
+
+    except Exception as e:
+        # Tag cleanup is best-effort — don't fail the entire push
+        logger.debug("Aircall: tag cleanup error for %s: %s", email, e)
+
+
 async def _upsert_contact(
     client: httpx.AsyncClient,
     lead: dict[str, Any],
@@ -281,6 +370,12 @@ async def _upsert_contact(
 
     contact_id = str(response.json().get("contact", {}).get("id", ""))
     logger.info("Aircall: upserted contact %s → id=%s tags=%s", lead.get("email"), contact_id, tags)
+
+    # Clean up stale priority/score tags from previous scoring runs
+    if contact_id and tags:
+        new_priority = next((t for t in tags if t in ALL_PRIORITY_TAG_VALUES), None)
+        await _cleanup_stale_priority_tags(client, contact_id, new_priority, lead.get("email", ""))
+
     return contact_id
 
 

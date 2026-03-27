@@ -803,3 +803,92 @@ async def add_note(
     except Exception as e:
         logger.error("add_note: exception for contact %s: %s", contact_id, e)
         return None
+
+
+async def has_upcoming_hubspot_meeting(
+    contact_id: str,
+    *,
+    lookahead_days: int = 14,
+    timeout: float = 15.0,
+) -> bool:
+    """
+    Check if a HubSpot contact has an upcoming meeting (next N days).
+
+    Searches meetings associated with the contact where hs_meeting_start_time
+    is in the future (up to lookahead_days ahead). Used to exclude booked leads
+    from Aircall calling lists — if they already have a meeting with Kevin,
+    there's no need to cold-call them.
+
+    Returns True if at least one upcoming meeting exists.
+    """
+    if not ACCESS_TOKEN or not contact_id:
+        return False
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            # Get meetings associated with this contact
+            assoc_resp = await client.get(
+                f"{HUBSPOT_BASE}/crm/v3/objects/contacts/{contact_id}"
+                "/associations/meetings",
+                headers=_headers(),
+            )
+
+            if assoc_resp.status_code != 200:
+                logger.debug(
+                    "has_upcoming_hubspot_meeting: assoc fetch failed for %s: %s",
+                    contact_id, assoc_resp.status_code,
+                )
+                return False
+
+            meeting_assocs = assoc_resp.json().get("results", [])
+            if not meeting_assocs:
+                return False
+
+            now = datetime.now(timezone.utc)
+            cutoff = now + timedelta(days=lookahead_days)
+
+            # Check each associated meeting for upcoming start time
+            for assoc in meeting_assocs:
+                meeting_id = assoc.get("id")
+                if not meeting_id:
+                    continue
+
+                m_resp = await client.get(
+                    f"{HUBSPOT_BASE}/crm/v3/objects/meetings/{meeting_id}",
+                    headers=_headers(),
+                    params={"properties": "hs_meeting_start_time,hs_meeting_outcome"},
+                )
+                if m_resp.status_code != 200:
+                    continue
+
+                props = m_resp.json().get("properties", {})
+                start_raw = props.get("hs_meeting_start_time")
+                outcome = (props.get("hs_meeting_outcome") or "").lower()
+
+                # Skip cancelled meetings
+                if outcome in ("cancelled", "canceled", "no_show"):
+                    continue
+
+                if not start_raw:
+                    continue
+
+                try:
+                    start_dt = datetime.fromisoformat(
+                        start_raw.replace("Z", "+00:00")
+                    )
+                    if now <= start_dt <= cutoff:
+                        logger.info(
+                            "has_upcoming_hubspot_meeting: contact %s has meeting %s at %s",
+                            contact_id, meeting_id, start_raw,
+                        )
+                        return True
+                except (ValueError, AttributeError):
+                    continue
+
+            return False
+
+    except Exception as e:
+        logger.warning(
+            "has_upcoming_hubspot_meeting: exception for %s: %s", contact_id, e,
+        )
+        return False

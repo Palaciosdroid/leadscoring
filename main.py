@@ -17,6 +17,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from analytics.buyer_journey import analyze_buyer_journeys, run_weekly_buyer_journey
 from batch.call_poller import run_call_polling
 from batch.scorer import (
     run_batch_scoring,
@@ -41,6 +42,7 @@ from integrations.hubspot import (
     write_call_outcome,
     find_contact_by_zoom_meeting,
     add_note,
+    has_upcoming_hubspot_meeting,
 )
 from integrations.zoom import (
     get_vtt_url,
@@ -53,9 +55,10 @@ from integrations.aircall import add_to_power_dialer
 from integrations.supabase import (
     fetch_touchpoints_for_emails,
     fetch_all_lead_data,
+    store_whatsapp_event,
 )
 # Slack hot lead alerts removed — Kevin handles via Aircall
-from scoring.combined import combine_scores
+from scoring.combined import combine_scores, map_whatsapp_to_engagement
 from scoring.engagement import calculate_engagement_score
 from scoring.hook_engine import generate_hook
 from scoring.interest import detect_interest_category
@@ -212,10 +215,22 @@ async def lifespan(app: FastAPI):
         id="daily_summary",
         replace_existing=True,
     )
+    # Weekly buyer journey analysis — Sunday 10:00 CET
+    # Analyzes common touchpoints across all buyers, posts findings to Slack
+    scheduler.add_job(
+        run_weekly_buyer_journey,
+        "cron",
+        day_of_week="sun",
+        hour=10,
+        minute=0,
+        timezone=ZoneInfo("Europe/Berlin"),
+        id="weekly_buyer_journey",
+        replace_existing=True,
+    )
     scheduler.start()
     logger.info(
         "Schedulers started — batch scoring every %dm, call polling every %dm (window=%dm), "
-        "decay check at 17:00 CET, daily summary (with past+scheduled calls) at 18:00 CET",
+        "decay check at 17:00 CET, daily summary at 18:00 CET, buyer journey Sun 10:00 CET",
         BATCH_INTERVAL_MINUTES, CALL_POLL_INTERVAL_MINUTES, CALL_POLL_WINDOW_MINUTES,
     )
     yield
@@ -312,6 +327,46 @@ class HubSpotCallPayload(BaseModel):
     hs_call_disposition: str = ""              # UUID — mapped via HS_DISPOSITION_MAP
     hs_call_duration:    int = 0               # milliseconds
     hs_timestamp:        int = 0               # Unix milliseconds
+
+
+class WhatsAppEventPayload(BaseModel):
+    """
+    Payload from the MC-Webinar-Setter WhatsApp bot.
+
+    Sent when a lead completes a WhatsApp qualification conversation.
+    The bot scores the lead and sends structured data here for
+    integration into the lead scoring pipeline.
+    """
+    phone: str = Field(..., description="Lead phone number (E.164 format)")
+    email: str = Field(default="", description="Lead email if collected")
+    name: str = Field(default="", description="Lead name if collected")
+    whatsapp_score: int = Field(default=0, description="Bot's qualification score (0-100)")
+    interest_level: str = Field(default="", description="interested | not_interested | undecided")
+    interest_type: str = Field(default="", description="ausbildung | coaching | meditation | hypnose")
+    wants_to_coach: bool = False
+    personal_growth: bool = False
+    pain_points: list[str] = Field(default_factory=list)
+    next_action: str = Field(default="", description="send_calendar | nurture | disqualify")
+    summary: str = Field(default="", description="Bot's summary of the conversation")
+    message_count: int = 0
+    has_calendar_link: bool = False
+    opted_out: bool = False
+    funnel: str = Field(default="mc", description="Which funnel/bot sent this")
+    timestamp: str = Field(default="", description="ISO 8601 timestamp")
+
+
+class WhatsAppEventResponse(BaseModel):
+    phone: str
+    email: str
+    whatsapp_score_mapped: float
+    engagement_score: int
+    combined_score: float
+    lead_tier: str
+    tier_label: str
+    interest_category: str | None
+    hubspot_updated: bool
+    dialer_added: bool
+    event_stored: bool
 
 
 # ---------------------------------------------------------------------------
@@ -657,6 +712,159 @@ async def realtime_score_webhook(payload: RealtimeScoreRequest):
     )
 
 
+# ---------------------------------------------------------------------------
+# WhatsApp Bot Qualification Webhook
+# ---------------------------------------------------------------------------
+@app.post("/webhook/whatsapp-event", response_model=WhatsAppEventResponse)
+async def whatsapp_event_webhook(payload: WhatsAppEventPayload):
+    """
+    Receive WhatsApp qualification data from the MC-Webinar-Setter bot.
+
+    When a lead chats with the WhatsApp bot, the bot scores them and sends
+    structured data here. This endpoint:
+      1. Stores the event in Supabase as 'whatsapp_qualified'
+      2. Maps WhatsApp signals to engagement-compatible score
+      3. Fetches existing touchpoints for this contact (if email known)
+      4. Rescores the contact with the 3-factor formula
+      5. Pushes updated score to HubSpot
+      6. Pushes to Aircall Power Dialer if qualified
+    """
+    email = payload.email.strip().lower() if payload.email else ""
+    phone = payload.phone.strip()
+    timestamp = payload.timestamp or datetime.now(timezone.utc).isoformat()
+
+    logger.info(
+        "WhatsApp event: phone=%s email=%s wa_score=%d interest=%s funnel=%s",
+        phone, email, payload.whatsapp_score, payload.interest_type, payload.funnel,
+    )
+
+    # Step 1: Store event in Supabase
+    event_stored = False
+    try:
+        event_data = payload.model_dump()
+        event_data["timestamp"] = timestamp
+        await store_whatsapp_event(event_data)
+        event_stored = True
+    except Exception as e:
+        logger.error("WhatsApp event: Supabase store failed: %s", e)
+
+    # Step 2: Build WhatsApp signal data for scoring
+    whatsapp_data = {
+        "whatsapp_score": payload.whatsapp_score,
+        "wants_to_coach": payload.wants_to_coach,
+        "personal_growth": payload.personal_growth,
+        "has_calendar_link": payload.has_calendar_link,
+        "opted_out": payload.opted_out,
+    }
+    wa_mapped = map_whatsapp_to_engagement(whatsapp_data)
+
+    # Step 3: Fetch existing touchpoints if email known (for full rescore)
+    scored_events = []
+    browser_events = []
+    purchases = []
+    touchpoints = []
+    if email:
+        try:
+            touchpoints_by_email = await fetch_touchpoints_for_emails([email], days=30)
+            all_lead_data = await fetch_all_lead_data([email], days=30)
+            touchpoints = touchpoints_by_email.get(email, [])
+            lead_data = all_lead_data.get(email, {
+                "events": [], "purchases": [], "meetings": [], "customerio_id": None,
+            })
+            browser_events = lead_data["events"]
+            purchases = lead_data["purchases"]
+
+            # Map existing touchpoints to scored events
+            from scoring.touchpoint_mapper import map_touchpoints_batch, map_browser_events_batch
+            scored_events = map_touchpoints_batch(touchpoints)
+            browser_scored = map_browser_events_batch(browser_events)
+            scored_events.extend(browser_scored)
+        except Exception as e:
+            logger.error("WhatsApp event: Supabase fetch failed for %s: %s", email, e)
+
+    # Step 4: Score with WhatsApp data included
+    engagement_result = calculate_engagement_score(scored_events)
+    interest_result = detect_interest_category(scored_events)
+
+    # Override interest category with WhatsApp bot's detection if available
+    if payload.interest_type and not interest_result.get("category"):
+        interest_result["category"] = payload.interest_type
+
+    ai_features = _build_ai_features(scored_events, engagement_result)
+    scoring = combine_scores(
+        engagement_result, interest_result, ai_features,
+        whatsapp_data=whatsapp_data,
+    )
+    score = scoring.combined_score
+    funnel = scoring.interest_category or payload.interest_type
+
+    # Determine tier label
+    tier_label = scoring.tier_label
+
+    logger.info(
+        "WhatsApp event: %s → engagement=%d wa_mapped=%.0f combined=%.1f tier=%s",
+        email or phone, scoring.engagement_score, wa_mapped or 0, score, tier_label,
+    )
+
+    # Step 5: Push to HubSpot (if email known — needed for contact lookup)
+    hubspot_ok = False
+    if email:
+        try:
+            hs_payload = scoring.to_hubspot_payload()
+            hs_payload["lead_funnel_source"] = f"whatsapp_{payload.funnel}"
+            if payload.interest_type:
+                hs_payload["lead_interest_category"] = payload.interest_type
+            await upsert_contact_score(email, hs_payload)
+            hubspot_ok = True
+        except Exception as e:
+            logger.error("WhatsApp event: HubSpot update failed for %s: %s", email, e)
+
+    # Step 6: Push to Aircall Power Dialer if qualified
+    dialer_ok = False
+    if phone and score >= SCORE_WARM and not payload.opted_out:
+        try:
+            name_parts = payload.name.split(" ", 1) if payload.name else ["", ""]
+            firstname = name_parts[0]
+            lastname = name_parts[1] if len(name_parts) > 1 else ""
+
+            notes = (
+                f"Score: {score:.0f} | Tier: {tier_label} | "
+                f"WA-Score: {payload.whatsapp_score} | "
+                f"Interesse: {funnel or 'unknown'} | "
+                f"{payload.summary}"
+            )
+            dialer_result = await add_to_power_dialer(
+                {
+                    "phone": phone,
+                    "firstname": firstname,
+                    "lastname": lastname,
+                    "email": email,
+                    "notes": notes,
+                },
+                score=score,
+                interest_category=funnel,
+                lead_tier=scoring.lead_tier,
+            )
+            dialer_ok = dialer_result is not None
+            logger.info("WhatsApp event: pushed %s to Aircall", email or phone)
+        except Exception as e:
+            logger.error("WhatsApp event: Aircall push failed for %s: %s", email or phone, e)
+
+    return WhatsAppEventResponse(
+        phone=phone,
+        email=email,
+        whatsapp_score_mapped=wa_mapped or 0,
+        engagement_score=scoring.engagement_score,
+        combined_score=score,
+        lead_tier=scoring.lead_tier,
+        tier_label=tier_label,
+        interest_category=funnel,
+        hubspot_updated=hubspot_ok,
+        dialer_added=dialer_ok,
+        event_stored=event_stored,
+    )
+
+
 @app.post("/webhook/hubspot/call")
 async def hubspot_call_webhook(payload: HubSpotCallPayload):
     """
@@ -794,6 +1002,41 @@ async def debug_poll(window_minutes: int = 10, x_api_key: str | None = Header(de
     logger.info("/debug/poll triggered manually (window=%dm)", window_minutes)
     await run_call_polling(since_minutes=window_minutes)
     return {"status": "ok", "message": f"Call polling completed (window={window_minutes}m)"}
+
+
+# ---------------------------------------------------------------------------
+# Analytics endpoints
+# ---------------------------------------------------------------------------
+@app.get("/analytics/buyer-journey")
+async def get_buyer_journey(x_api_key: str | None = Header(default=None)):
+    """
+    Run buyer journey analysis on demand.
+
+    Fetches all buyers from HubSpot (closed-won), Supabase (purchases),
+    and Customer.io (purchase events), then analyzes common touchpoints,
+    funnel sequences, and scoring correlations.
+
+    Requires DEBUG_API_KEY.
+    """
+    if DEBUG_API_KEY and x_api_key != DEBUG_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key header")
+    logger.info("/analytics/buyer-journey triggered")
+    analysis = await analyze_buyer_journeys()
+    return analysis
+
+
+@app.post("/analytics/buyer-journey/slack")
+async def post_buyer_journey_slack(x_api_key: str | None = Header(default=None)):
+    """
+    Run buyer journey analysis and post results to Slack.
+    Same as the weekly scheduled job, but triggered manually.
+    Requires DEBUG_API_KEY.
+    """
+    if DEBUG_API_KEY and x_api_key != DEBUG_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key header")
+    logger.info("/analytics/buyer-journey/slack triggered")
+    await run_weekly_buyer_journey()
+    return {"status": "ok", "message": "Buyer journey analysis posted to Slack"}
 
 
 @app.post("/debug/daily-summary")

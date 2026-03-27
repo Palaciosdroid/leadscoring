@@ -397,8 +397,10 @@ def _aircall_priority_key(item: dict) -> tuple:
     return (priority, fresh_hours, -score)
 
 
-def _determine_tier_label(score: float, is_fresh: bool) -> str:
+def _determine_tier_label(score: float, is_fresh: bool, is_booked: bool = False) -> str:
     """Human-readable tier label for Aircall card."""
+    if is_booked:
+        return "BOOKED"
     if is_fresh:
         return "FRESH"
     if score >= SCORE_HOT:
@@ -773,7 +775,35 @@ async def run_batch_scoring() -> None:
                         break
                 except (ValueError, AttributeError):
                     continue
-            call_booked = has_scheduled_meeting or _truthy(props.get("lead_call_booked"))
+
+            # Check HubSpot meetings (next 14 days) — booked leads skip Aircall
+            has_hs_meeting = False
+            try:
+                from integrations.hubspot import has_upcoming_hubspot_meeting
+                has_hs_meeting = await has_upcoming_hubspot_meeting(contact_id)
+            except Exception as e:
+                logger.debug("Batch: HubSpot meeting check failed for %s: %s", email, e)
+
+            # Check for calendar_link_sent in browser events / touchpoints
+            # (WhatsApp INA bot sends Kevin's calendar link — lead may book soon)
+            calendar_link_sent = any(
+                (ev.get("event_type") or "").lower() in (
+                    "calendar_link_sent", "calendar_link_clicked",
+                    "wa_calendar_link_sent",
+                )
+                for ev in browser_events
+            ) or any(
+                (tp.get("touchpoint_type") or "").lower() in (
+                    "calendar_link_sent", "calendar_link_clicked",
+                )
+                for tp in touchpoints
+            )
+
+            call_booked = (
+                has_scheduled_meeting
+                or has_hs_meeting
+                or _truthy(props.get("lead_call_booked"))
+            )
             not_interested = _truthy(props.get("lead_not_interested"))
             has_phone = bool(props.get("phone") or props.get("mobilephone"))
 
@@ -792,6 +822,21 @@ async def run_batch_scoring() -> None:
                 purchased_funnels=purchased_funnels,
                 call_outcome=call_outcome,
             )
+
+            # --- TASK A: Booked leads skip Aircall ---
+            # If a meeting is booked (HubSpot, Supabase, or calendar link sent),
+            # override tier to 'booked' and remove from all calling lists.
+            # Calendar link sent = lead received Kevin's booking link via WhatsApp,
+            # they may book imminently, so don't cold-call them.
+            if call_booked:
+                scoring.lead_tier = "0_booked"
+                tier_label = "BOOKED"
+                logger.info(
+                    "Batch: %s has booked meeting — tier=0_booked, skipping Aircall "
+                    "(hs_meeting=%s, supabase=%s, hs_prop=%s, calendar_link=%s)",
+                    email, has_hs_meeting, has_scheduled_meeting,
+                    _truthy(props.get("lead_call_booked")), calendar_link_sent,
+                )
 
             # Eignungscheck qualification — ONLY for leads who submitted the form.
             # Warm/fresh leads without a form submission go to their funnel list instead.
@@ -815,14 +860,19 @@ async def run_batch_scoring() -> None:
                 funnel, is_fresh, score, qualifies_eignungscheck, purchased_funnels
             )
 
-            # Eignungscheck leads always get called — form submission is the qualifier,
-            # no score threshold applies. Score is shown on the Aircall card for context only.
-            # Fresh/warm funnel lists require score >= 30 or freshness as a quality gate.
-            should_push = has_phone and (
-                list_key == "eignungscheck"
-                or is_fresh
-                or score >= SCORE_WARM
-            )
+            # Booked leads never go to Aircall — they already have a meeting
+            if call_booked:
+                list_key = None
+                should_push = False
+            else:
+                # Eignungscheck leads always get called — form submission is the qualifier,
+                # no score threshold applies. Score is shown on the Aircall card for context only.
+                # Fresh/warm funnel lists require score >= 30 or freshness as a quality gate.
+                should_push = has_phone and (
+                    list_key == "eignungscheck"
+                    or is_fresh
+                    or score >= SCORE_WARM
+                )
 
             # Exclusion check: cooldown, permanent remove, max attempts
             # (call_outcome already read above for DNC check)

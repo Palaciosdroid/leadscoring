@@ -43,9 +43,19 @@ class TestShouldDial:
         assert _should_dial(30, old, lead_tier="1_hot") is True
 
     def test_warm_tier_dials(self):
-        """Warm tier (2_warm) qualifies for the Power Dialer."""
+        """Warm tier (2_warm) with score >= 30 qualifies for the Power Dialer."""
         old = datetime.now(timezone.utc) - timedelta(days=3)
-        assert _should_dial(20, old, lead_tier="2_warm") is True
+        assert _should_dial(40, old, lead_tier="2_warm") is True
+
+    def test_warm_tier_low_score_skipped(self):
+        """Warm tier (2_warm) with score < 30 does NOT qualify (TASK B)."""
+        old = datetime.now(timezone.utc) - timedelta(days=3)
+        assert _should_dial(20, old, lead_tier="2_warm") is False
+
+    def test_booked_tier_skipped(self):
+        """Booked tier (0_booked) never dials — lead already has a meeting."""
+        fresh = datetime.now(timezone.utc) - timedelta(hours=1)
+        assert _should_dial(90, fresh, lead_tier="0_booked") is False
 
     def test_cold_tier_skipped(self):
         """Cold tier (3_cold) does NOT qualify — CIO nurturing only."""
@@ -70,6 +80,7 @@ class TestBuildTags:
         assert "score-75" in tags
         assert "hc-fresh" in tags
         assert "HC" in tags
+        assert "priority-2-warm" in tags  # 60 <= 75 < 80
 
     def test_warm_lead_tags_with_list_key(self):
         created = datetime.now(timezone.utc) - timedelta(days=5)
@@ -77,12 +88,45 @@ class TestBuildTags:
         assert "score-60" in tags
         assert "mc-warm" in tags
         assert "MC" in tags
+        assert "priority-2-warm" in tags  # 60 <= 60 < 80
 
     def test_no_interest_category(self):
         created = datetime.now(timezone.utc) - timedelta(days=5)
         tags = _build_tags(55, created, None)
         assert "score-55" in tags
-        assert len(tags) == 1  # score only (no list_key, no interest)
+        assert "priority-3-nurture" in tags  # 30 <= 55 < 60
+
+    def test_no_interest_category_priority(self):
+        """Score 55 without interest -> has priority-3-nurture tag."""
+        created = datetime.now(timezone.utc) - timedelta(days=5)
+        tags = _build_tags(55, created, None)
+        assert "score-55" in tags
+        assert "priority-3-nurture" in tags  # 30 <= 55 < 60
+
+    def test_priority_1_hot_tag(self):
+        """Score >= 80 gets priority-1-hot tag."""
+        created = datetime.now(timezone.utc) - timedelta(days=5)
+        tags = _build_tags(85, created, "hypnose", list_key="hc-warm")
+        assert "priority-1-hot" in tags
+        assert "score-85" in tags
+
+    def test_priority_2_warm_tag(self):
+        """Score 60-79 gets priority-2-warm tag."""
+        created = datetime.now(timezone.utc) - timedelta(days=5)
+        tags = _build_tags(65, created, "meditation")
+        assert "priority-2-warm" in tags
+
+    def test_priority_3_nurture_tag(self):
+        """Score 30-59 gets priority-3-nurture tag."""
+        created = datetime.now(timezone.utc) - timedelta(days=5)
+        tags = _build_tags(45, created, "lifecoach")
+        assert "priority-3-nurture" in tags
+
+    def test_no_priority_tag_below_30(self):
+        """Score < 30 gets no priority tag."""
+        created = datetime.now(timezone.utc) - timedelta(days=5)
+        tags = _build_tags(15, created, None)
+        assert not any(t.startswith("priority-") for t in tags)
 
 
 class TestAddToPowerDialer:
@@ -114,9 +158,9 @@ class TestAddToPowerDialer:
     @patch("integrations.aircall._upsert_contact", new_callable=AsyncMock, return_value="c-99")
     @patch("integrations.aircall._push_to_dialer_campaign", new_callable=AsyncMock, return_value={"status": "added", "phone": "+4915112345678"})
     async def test_warm_tier_pushes_to_dialer(self, mock_push, mock_upsert, mock_note):
-        """Warm tier lead gets pushed to the Power Dialer."""
+        """Warm tier lead with score >= 30 gets pushed to the Power Dialer."""
         old = datetime.now(timezone.utc) - timedelta(days=5)
-        result = await add_to_power_dialer(self.LEAD, score=20, created_at=old, interest_category="Coaching", lead_tier="2_warm")
+        result = await add_to_power_dialer(self.LEAD, score=40, created_at=old, interest_category="Coaching", lead_tier="2_warm")
         assert result is not None
         assert result["status"] == "added"
         mock_upsert.assert_called_once()
@@ -160,7 +204,8 @@ class TestUpsertContact:
     @pytest.mark.asyncio
     @patch("integrations.aircall.AIRCALL_API_ID", "test-id")
     @patch("integrations.aircall.AIRCALL_API_TOKEN", "test-token")
-    async def test_success_returns_contact_id(self):
+    @patch("integrations.aircall._cleanup_stale_priority_tags", new_callable=AsyncMock)
+    async def test_success_returns_contact_id(self, mock_cleanup):
         from integrations.aircall import _upsert_contact
 
         mock_response = MagicMock()
