@@ -106,6 +106,7 @@ CIO_METRIC_MAP: dict[str, str | None] = {
     "opened":        "email_opened",
     "clicked":       "email_link_clicked",
     "converted":     "application_submitted",
+    "subscribed":    "webinar_registered",     # CIO attribute change → webinar signup
     "unsubscribed":  "email_unsubscribed",
     # Delivery/technical events — not useful for scoring
     "sent":          None,
@@ -1375,4 +1376,107 @@ async def zoom_recording_webhook(request: Request):
         "note_id": note_id,
         "meeting_id": meeting_id,
         "duration_minutes": duration_min,
+    }
+
+
+# ---------------------------------------------------------------------------
+# CIO Segment Sync — Pull segment members and store as touchpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/admin/sync-cio-segment")
+async def sync_cio_segment(
+    request: Request,
+    segment_id: int = 296,
+    event_type: str = "webinar_registered",
+):
+    """
+    Pull all members from a CIO segment and store as touchpoints in Supabase.
+
+    Used for bulk-importing CIO segment members (e.g. MC Launchcall registrants)
+    into the scoring pipeline. Each member gets a touchpoint with the specified
+    event_type, so the batch scorer picks them up on the next run.
+
+    Requires DEBUG_API_KEY header for auth.
+    """
+    debug_key = os.environ.get("DEBUG_API_KEY", "")
+    auth = request.headers.get("x-api-key", "")
+    if not debug_key or auth != debug_key:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    import urllib.request as _urllib_req
+    cio_app_key = os.environ.get("CIO_APP_API_KEY", "")
+    if not cio_app_key:
+        raise HTTPException(status_code=500, detail="CIO_APP_API_KEY not set")
+
+    # Paginate through CIO segment members
+    all_members: list[dict] = []
+    cursor: str | None = None
+    for _ in range(200):  # safety limit
+        url = f"https://api-eu.customer.io/v1/segments/{segment_id}/membership?limit=100"
+        if cursor:
+            url += f"&start={cursor}"
+        req = _urllib_req.Request(url, headers={
+            "Authorization": f"Bearer {cio_app_key}",
+        })
+        try:
+            with _urllib_req.urlopen(req) as resp:
+                import json as _json
+                page = _json.loads(resp.read())
+        except Exception as e:
+            logger.error("CIO segment sync: fetch page failed: %s", e)
+            break
+
+        identifiers = page.get("identifiers", [])
+        all_members.extend(identifiers)
+        cursor = page.get("next", "")
+        if not cursor or not identifiers:
+            break
+
+    logger.info("CIO segment sync: fetched %d members from segment %d", len(all_members), segment_id)
+
+    # Store each member as a touchpoint in Supabase
+    from integrations.supabase import store_cio_email_event, fetch_contact_by_email, get_supabase_client
+
+    stored = 0
+    skipped = 0
+    client = get_supabase_client()
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    for member in all_members:
+        email = member.get("email", "")
+        if not email:
+            skipped += 1
+            continue
+
+        # Check if contact exists in Supabase
+        contact = await fetch_contact_by_email(email)
+        if not contact:
+            skipped += 1
+            continue
+
+        # Store as touchpoint
+        try:
+            await client._post("touchpoints", {
+                "contact_id": contact["id"],
+                "channel": "direct",
+                "source": "customerio",
+                "medium": "segment",
+                "touchpoint_type": "form_submit",
+                "content": f"CIO Segment {segment_id}: MC Launchcall",
+                "campaign": f"segment_{segment_id}",
+                "created_at": now_iso,
+                "is_first_touch": False,
+                "is_last_touch": False,
+            })
+            stored += 1
+        except Exception as e:
+            logger.warning("CIO segment sync: store failed for %s: %s", email, e)
+
+    logger.info("CIO segment sync: stored %d, skipped %d", stored, skipped)
+    return {
+        "status": "ok",
+        "segment_id": segment_id,
+        "total_members": len(all_members),
+        "stored": stored,
+        "skipped": skipped,
     }

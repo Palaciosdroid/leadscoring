@@ -699,6 +699,13 @@ async def run_batch_scoring() -> None:
         # Derive purchased funnels from Supabase purchases (product_key -> funnel)
         purchased_funnels = _extract_purchased_funnels(purchases)
 
+        # Fallback: if Supabase has no purchases but HubSpot has lead_purchased_products,
+        # use the HubSpot value. Most buyers aren't in Supabase yet (Bexio sync incomplete).
+        hs_purchased = (props.get("lead_purchased_products") or "").strip()
+        if not purchased_funnels and hs_purchased:
+            # HubSpot stores funnel slugs: "meditation", "hypnose", "lifecoach"
+            purchased_funnels = [f.strip() for f in hs_purchased.split(",") if f.strip()]
+
         try:
             # Map touchpoints to scored events
             scored_events = map_touchpoints_batch(touchpoints)
