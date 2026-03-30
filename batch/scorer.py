@@ -287,7 +287,7 @@ async def _write_hubspot_note(contact_id: str, body: str) -> None:
                         "types": [
                             {
                                 "associationCategory": "HUBSPOT_DEFINED",
-                                "associationTypeId": 202,  # note_to_contact
+                                "associationTypeId": 10,  # note_to_contact (HubSpot v3)
                             }
                         ],
                     }
@@ -743,7 +743,12 @@ async def run_batch_scoring() -> None:
             first_touch, last_touch = extract_first_last_touch(touchpoints)
 
             # Email activity summary (14 days)
-            email_summary = summarize_email_activity(touchpoints, days=14)
+            # Pass both touchpoints AND scored_events — CIO email events may
+            # appear in events table (as email_opened/email_link_clicked) rather
+            # than in touchpoints table (as channel=email, touchpoint_type=opened).
+            email_summary = summarize_email_activity(
+                touchpoints, days=14, scored_events=scored_events,
+            )
 
             # Build funnel source string
             funnel_source = _build_funnel_source(touchpoints)
@@ -868,9 +873,12 @@ async def run_batch_scoring() -> None:
                 # Eignungscheck leads always get called — form submission is the qualifier,
                 # no score threshold applies. Score is shown on the Aircall card for context only.
                 # Fresh/warm funnel lists require score >= 30 or freshness as a quality gate.
+                # Fresh leads still need a minimum score of 10 to avoid pushing
+                # leads with only a single page_visited (3 points) into the dialer.
+                FRESH_MIN_SCORE = 10
                 should_push = has_phone and (
                     list_key == "eignungscheck"
-                    or is_fresh
+                    or (is_fresh and score >= FRESH_MIN_SCORE)
                     or score >= SCORE_WARM
                 )
 

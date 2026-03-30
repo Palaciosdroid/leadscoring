@@ -12,7 +12,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Cooldown period between calls to the same lead
+# Cooldown is handled by _is_in_cooldown() in scorer.py (7d answered, 3d no-answer).
+# DNC only checks the hard 24h minimum to prevent double-calling on the same day.
 CALL_COOLDOWN = timedelta(hours=24)
 
 
@@ -86,7 +87,7 @@ async def check_do_not_call(
         return DoNotCallResult(should_skip=True, reason="not_interested")
 
     # 6. Disqualified / not qualified / cancelled — permanent removal outcomes
-    call_outcome = kwargs.get("call_outcome", "")
+    # NOTE: call_outcome comes from the function parameter (line 39), NOT kwargs.
     if call_outcome:
         _PERMANENT_OUTCOMES = {
             "falsche nummer", "nicht_qualifiziert", "nicht qualifiziert",

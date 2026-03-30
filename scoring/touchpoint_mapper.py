@@ -237,19 +237,27 @@ def extract_first_last_touch(
     return first_touch, last_touch
 
 
-def summarize_email_activity(touchpoints: list[dict], days: int = 14) -> dict:
+def summarize_email_activity(
+    touchpoints: list[dict],
+    days: int = 14,
+    scored_events: list[dict] | None = None,
+) -> dict:
     """
     Summarize email activity within the last *days* for card display.
 
-    Looks at touchpoints where ``channel == "email"`` and
-    ``created_at`` falls within the window.
+    Checks TWO sources:
+    1. Touchpoints table (channel=email, touchpoint_type=opened/clicked)
+    2. Scored events (event_type=email_opened/email_link_clicked)
+
+    This dual-source approach handles both CIO webhook events (which land
+    in the events table) and Supabase touchpoints (from attribution tracking).
 
     Returns::
 
         {
             "opens": int,
             "clicks": int,
-            "last_email_subject": str   # from the most recent email touchpoint's content field
+            "last_email_subject": str
         }
     """
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
@@ -259,11 +267,11 @@ def summarize_email_activity(touchpoints: list[dict], days: int = 14) -> dict:
     last_email_subject: str = ""
     last_email_time: Optional[datetime] = None
 
+    # Source 1: Touchpoints table (channel=email)
     for tp in touchpoints:
         if (tp.get("channel") or "").lower() != "email":
             continue
 
-        # Parse timestamp
         created_at_raw = tp.get("created_at")
         if not created_at_raw:
             continue
@@ -282,10 +290,33 @@ def summarize_email_activity(touchpoints: list[dict], days: int = 14) -> dict:
         elif tp_type in ("clicked", "email_action"):
             clicks += 1
 
-        # Track the most recent email touchpoint for subject extraction
         if last_email_time is None or created_at > last_email_time:
             last_email_time = created_at
             last_email_subject = tp.get("content") or ""
+
+    # Source 2: Scored events (from CIO webhooks / browser events)
+    if scored_events:
+        for ev in scored_events:
+            et = (ev.get("event_type") or "").lower()
+            if et not in ("email_opened", "email_link_clicked"):
+                continue
+
+            ts_raw = ev.get("timestamp")
+            if not ts_raw:
+                continue
+
+            try:
+                ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            except (ValueError, AttributeError):
+                continue
+
+            if ts < cutoff:
+                continue
+
+            if et == "email_opened":
+                opens += 1
+            elif et == "email_link_clicked":
+                clicks += 1
 
     return {
         "opens": opens,
