@@ -27,6 +27,11 @@ _MAPPING_RULES: list[tuple[str | None, str | None, str | None, str]] = [
 
     # Ad click by touchpoint_type regardless of channel
     ("*", "*", "ad_click", "cta_clicked"),
+
+    # Catch-all: email touchpoints with NULL type → count as email_opened
+    # 407 touchpoints in Supabase have channel=email but touchpoint_type=None.
+    # Conservative: count as open (5pts) rather than ignoring entirely.
+    ("email", "*", None, "email_opened"),
 ]
 
 

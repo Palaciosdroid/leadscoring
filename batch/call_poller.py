@@ -78,6 +78,23 @@ async def run_call_polling(since_minutes: int = 10) -> None:
         # 1. Write outcome back to HubSpot contact
         await write_call_outcome(contact_id, outcome)
 
+        # 1b. Snapshot tier + score at first call (feedback loop for scoring calibration)
+        try:
+            from integrations.hubspot import get_contact_properties
+            props = await get_contact_properties(contact_id, [
+                "lead_tier_at_first_call", "lead_tier", "lead_combined_score",
+            ])
+            if not props.get("lead_tier_at_first_call"):
+                from integrations.hubspot import update_contact_properties
+                await update_contact_properties(contact_id, {
+                    "lead_tier_at_first_call": props.get("lead_tier", ""),
+                    "lead_score_at_first_call": props.get("lead_combined_score", "0"),
+                })
+                logger.info("call_poller: snapshotted tier=%s score=%s at first call for %s",
+                            props.get("lead_tier"), props.get("lead_combined_score"), contact_name)
+        except Exception as e:
+            logger.debug("call_poller: tier snapshot failed for %s: %s", contact_name, e)
+
         # 2. Log outcome to Aircall contact (information field) — silently skips if not in Aircall
         if phone:
             try:

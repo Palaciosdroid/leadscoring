@@ -42,10 +42,10 @@ HUBSPOT_TOKEN = os.environ.get("HUBSPOT_ACCESS_TOKEN", "")
 # Only re-score leads updated in the last N days to keep API calls low
 RESCORE_WINDOW_DAYS = int(os.environ.get("RESCORE_WINDOW_DAYS", "30"))
 
-# Score thresholds
-SCORE_WARM = 30      # >= 30 -> push to HubSpot/Aircall
-SCORE_HOT = 65       # >= 65 -> same list as warm, tagged hot
-FRESH_WINDOW = timedelta(hours=72)
+# Score thresholds (v2: raised for 0-200 scale)
+SCORE_WARM = 40      # >= 40 -> push to HubSpot/Aircall
+SCORE_HOT = 100      # >= 100 -> same list as warm, tagged hot
+FRESH_WINDOW = timedelta(days=7)  # Wave 4: was 72h, now 7d
 
 # Cooldown after call — prevent Kevin from calling the same person repeatedly
 COOLDOWN_ANSWERED_HOURS = 7 * 24      # 7 days after answered call
@@ -828,7 +828,8 @@ async def run_batch_scoring() -> None:
                 or _truthy(props.get("lead_call_booked"))
             )
             not_interested = _truthy(props.get("lead_not_interested"))
-            has_phone = bool(props.get("phone") or props.get("mobilephone"))
+            _raw_phone = (props.get("phone") or props.get("mobilephone") or "").strip()
+            has_phone = len(_raw_phone) > 6  # reject stubs like "+41", "+49", "+"
 
             # Read call outcome early — needed for both DNC and cooldown
             call_outcome = props.get("lead_last_call_outcome")
@@ -1021,7 +1022,7 @@ async def run_batch_scoring() -> None:
                     "tier_label": tier_label,
                     "funnel": funnel,
                     "lead_tier": scoring.lead_tier,
-                    "phone": props.get("phone") or props.get("mobilephone", ""),
+                    "phone": _raw_phone,
                     "firstname": props.get("firstname", ""),
                     "lastname": props.get("lastname", ""),
                     "aircall_card": aircall_card,
@@ -1033,7 +1034,7 @@ async def run_batch_scoring() -> None:
             if scoring.lead_tier == "1_hot" and old_tier != "1_hot":
                 new_hot_leads.append({
                     "email": email,
-                    "phone": props.get("phone") or props.get("mobilephone", ""),
+                    "phone": _raw_phone,
                     "firstname": props.get("firstname", ""),
                     "lastname": props.get("lastname", ""),
                     "score": score,

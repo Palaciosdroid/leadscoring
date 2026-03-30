@@ -892,3 +892,42 @@ async def has_upcoming_hubspot_meeting(
             "has_upcoming_hubspot_meeting: exception for %s: %s", contact_id, e,
         )
         return False
+
+
+async def get_contact_properties(
+    contact_id: str,
+    properties: list[str],
+    *,
+    timeout: float = 10.0,
+) -> dict[str, str]:
+    """Fetch specific properties for a HubSpot contact. Returns {prop: value}."""
+    if not ACCESS_TOKEN:
+        return {}
+    props_csv = ",".join(properties)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.get(
+            f"{HUBSPOT_BASE}/crm/v3/objects/contacts/{contact_id}",
+            headers=_headers(),
+            params={"properties": props_csv},
+        )
+    if resp.status_code != 200:
+        return {}
+    return resp.json().get("properties", {})
+
+
+async def update_contact_properties(
+    contact_id: str,
+    properties: dict[str, str],
+    *,
+    timeout: float = 10.0,
+) -> bool:
+    """Update specific properties on a HubSpot contact. Returns True on success."""
+    if not ACCESS_TOKEN:
+        return False
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.patch(
+            f"{HUBSPOT_BASE}/crm/v3/objects/contacts/{contact_id}",
+            headers=_headers(),
+            json={"properties": properties},
+        )
+    return resp.status_code in (200, 204)

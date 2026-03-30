@@ -11,18 +11,18 @@ from scoring.combined import (
 
 class TestDetermineTier:
     def test_hot(self):
-        assert _determine_tier(65) == "1_hot"
-        assert _determine_tier(75) == "1_hot"
         assert _determine_tier(100) == "1_hot"
+        assert _determine_tier(150) == "1_hot"
+        assert _determine_tier(200) == "1_hot"
 
     def test_warm(self):
-        assert _determine_tier(30) == "2_warm"
         assert _determine_tier(40) == "2_warm"
-        assert _determine_tier(64.9) == "2_warm"
+        assert _determine_tier(60) == "2_warm"
+        assert _determine_tier(99.9) == "2_warm"
 
     def test_cold(self):
         assert _determine_tier(0) == "3_cold"
-        assert _determine_tier(29.9) == "3_cold"
+        assert _determine_tier(39.9) == "3_cold"
 
     def test_disqualified(self):
         assert _determine_tier(-1) == "4_disqualified"
@@ -44,13 +44,13 @@ class TestCombineScores:
         return {"category": cat, "confidence": conf, "category_scores": {}}
 
     def test_engagement_only_hot(self):
-        result = combine_scores(self._engagement(80), self._interest("hypnose", 0.9))
+        result = combine_scores(self._engagement(120), self._interest("hypnose", 0.9))
         assert result.lead_tier == "1_hot"
-        assert result.combined_score == 80.0
+        assert result.combined_score == 120.0
         assert result.ai_score is None
 
     def test_engagement_only_warm(self):
-        result = combine_scores(self._engagement(50), self._interest())
+        result = combine_scores(self._engagement(60), self._interest())
         assert result.lead_tier == "2_warm"
 
     def test_engagement_only_cold(self):

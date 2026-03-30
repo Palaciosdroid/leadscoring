@@ -12,8 +12,10 @@ from scoring.engagement import (
 
 class TestRecencyMultiplier:
     def test_within_7_days(self):
-        assert recency_multiplier(0) == 1.0
-        assert recency_multiplier(3) == 1.0
+        assert recency_multiplier(0) == 1.3   # <=3d boost
+        assert recency_multiplier(1) == 1.3
+        assert recency_multiplier(3) == 1.3
+        assert recency_multiplier(5) == 1.0   # 4-7d normal
         assert recency_multiplier(7) == 1.0
 
     def test_8_to_14_days(self):
@@ -61,19 +63,27 @@ class TestCalculateEngagementScore:
     def test_single_recent_event(self):
         events = [self._make_event("checkout_visited", days_ago=1)]
         result = calculate_engagement_score(events)
-        # 40 base * 1.0 recency = 40
-        assert result["score"] == 40
+        # 40 base * 1.3 recency (<=3d boost) = 52
+        assert result["score"] == 52
         assert len(result["event_breakdown"]) == 1
 
-    def test_high_score_capped_at_100(self):
-        # Stack enough events to exceed 100
+    def test_high_score_capped_at_200(self):
+        # Stack enough events to exceed 200
         events = [
             self._make_event("checkout_visited", days_ago=1),
+            self._make_event("checkout_visited", days_ago=1),
+            self._make_event("checkout_visited", days_ago=2),
+            self._make_event("checkout_visited", days_ago=2),
+            self._make_event("checkout_visited", days_ago=3),
             self._make_event("application_submitted", days_ago=1),
+            self._make_event("application_submitted", days_ago=1),
+            self._make_event("application_submitted", days_ago=2),
+            self._make_event("application_submitted", days_ago=2),
+            self._make_event("application_submitted", days_ago=3),
             self._make_event("video_watched_100", days_ago=2),
         ]
         result = calculate_engagement_score(events)
-        assert result["score"] <= 100
+        assert result["score"] <= 200
 
     def test_unknown_event_ignored(self):
         events = [{"event_type": "unknown_event", "timestamp": datetime.now(timezone.utc).isoformat()}]
@@ -110,9 +120,10 @@ class TestCalculateEngagementScore:
 
     def test_multiple_events_accumulate(self):
         events = [
-            self._make_event("email_opened", days_ago=1),      # 5
-            self._make_event("email_link_clicked", days_ago=2), # 10
-            self._make_event("sales_page_visited", days_ago=3), # 20
+            self._make_event("email_opened", days_ago=1),      # 5 * 1.3 = 6.5
+            self._make_event("email_link_clicked", days_ago=2), # 10 * 1.3 = 13
+            self._make_event("sales_page_visited", days_ago=5), # 20 * 1.0 = 20
         ]
         result = calculate_engagement_score(events)
-        assert result["score"] == 35  # all within 7 days → full points
+        # 6.5 + 13 + 20 = 39.5 → 40
+        assert result["score"] == 40

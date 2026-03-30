@@ -32,7 +32,9 @@ BASE_POINTS: dict[str, int] = {
 # Recency multipliers — based on days since event
 # ---------------------------------------------------------------------------
 def recency_multiplier(days_ago: float) -> float:
-    if days_ago <= 7:
+    if days_ago <= 3:
+        return 1.3       # very recent = boost
+    elif days_ago <= 7:
         return 1.0
     elif days_ago <= 14:
         return 0.7
@@ -46,7 +48,7 @@ def recency_multiplier(days_ago: float) -> float:
 # Inactivity + unsubscribe malus
 # ---------------------------------------------------------------------------
 # Maximum number of times the same event type is counted (prevents score inflation)
-MAX_EVENTS_PER_TYPE = 3
+MAX_EVENTS_PER_TYPE = 5
 
 
 def inactivity_malus(days_since_last_activity: float, unsubscribed: bool) -> int:
@@ -156,7 +158,7 @@ def calculate_engagement_score(events: list[dict[str, Any]]) -> dict[str, Any]:
     if decay < 1.0:
         raw_score = raw_score * decay
 
-    score = max(min(round(raw_score), 100), -100)  # allow negative for Disqualified tier
+    score = max(min(round(raw_score), 200), -100)  # cap at 200 for better differentiation
 
     return {
         "score": score,
