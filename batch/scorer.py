@@ -1089,9 +1089,11 @@ async def run_batch_scoring() -> None:
             except Exception as e:
                 logger.warning("Batch: Hot Lead Slack alert failed for %s: %s", hl["email"], e)
 
-    # Step 5: Push qualified leads to Aircall — sorted by priority
-    # EC first → Fresh (most recent first) → Hot (highest score) → Warm (highest score)
-    aircall_queue.sort(key=_aircall_priority_key)
+    # Step 5: Push qualified leads to Aircall — sorted by REVERSE priority
+    # Aircall Power Dialer shows the LAST-added contact on TOP.
+    # So we push lowest priority FIRST, highest priority LAST:
+    # Warm (lowest score) → Hot → Fresh → EC (pushed last = shown first)
+    aircall_queue.sort(key=_aircall_priority_key, reverse=True)
     logger.info(
         "Batch: Aircall queue has %d leads (sorted: EC→Fresh→Hot→Warm)",
         len(aircall_queue),
