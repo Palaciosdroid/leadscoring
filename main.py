@@ -510,6 +510,21 @@ async def _handle_cio_reporting_webhook(body: dict[str, Any]) -> ScoreResponse:
     logger.info("CIO webhook: metric=%s → event_type=%s for %s",
                 metric, mapped_events[0]["event_type"], contact_id)
 
+    # Persist email events to Supabase so the batch scorer sees them
+    # when building the Aircall card (summarize_email_activity).
+    if event_type in ("email_opened", "email_link_clicked"):
+        from integrations.supabase import store_cio_email_event
+        try:
+            await store_cio_email_event(
+                email=lead.email,
+                event_type=event_type,
+                timestamp=ts_iso,
+                campaign_name=campaign_name,
+                url=url,
+            )
+        except Exception as e:
+            logger.warning("CIO webhook: failed to persist %s to Supabase: %s", event_type, e)
+
     return await _score_and_update(mapped_events, lead, pre_mapped=True)
 
 

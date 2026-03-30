@@ -487,3 +487,57 @@ async def store_whatsapp_event(event_data: dict) -> dict | None:
     except Exception as e:
         logger.error("Failed to store whatsapp event: %s", e)
         return None
+
+
+async def store_cio_email_event(
+    email: str,
+    event_type: str,
+    timestamp: str,
+    campaign_name: str = "",
+    url: str = "",
+) -> dict | None:
+    """
+    Persist a CIO email event (opened/clicked) as a touchpoint in Supabase.
+
+    This ensures the batch scorer can see email activity when building
+    the Aircall card (summarize_email_activity reads from touchpoints).
+    Without this, CIO webhook events are scored in realtime but lost
+    for batch processing.
+    """
+    client = get_supabase_client()
+
+    # Map event_type to touchpoint_type
+    tp_type_map = {
+        "email_opened": "opened",
+        "email_link_clicked": "clicked",
+    }
+    tp_type = tp_type_map.get(event_type)
+    if not tp_type:
+        return None
+
+    # Find contact_id by email
+    contact = await fetch_contact_by_email(email)
+    if not contact:
+        logger.debug("store_cio_email_event: no contact for %s — skipping", email)
+        return None
+
+    row = {
+        "contact_id": contact["id"],
+        "channel": "email",
+        "source": "customerio",
+        "medium": "email",
+        "touchpoint_type": tp_type,
+        "content": campaign_name,
+        "campaign": campaign_name,
+        "created_at": timestamp,
+        "is_first_touch": False,
+        "is_last_touch": False,
+    }
+
+    try:
+        result = await client._post("touchpoints", row)
+        logger.info("Stored CIO %s event for %s", tp_type, email)
+        return result
+    except Exception as e:
+        logger.error("Failed to store CIO email event for %s: %s", email, e)
+        return None

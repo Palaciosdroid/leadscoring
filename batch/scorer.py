@@ -141,6 +141,7 @@ async def _fetch_active_hubspot_leads() -> list[dict[str, Any]]:
             "lead_engagement_score", "lead_tier",
             "lead_last_call_date", "lead_last_call_outcome",
             "lead_call_attempts", "lead_not_interested", "lead_call_booked",
+            "hs_email_open_count", "hs_email_click_count",
         ],
         "limit": 100,
     }
@@ -749,6 +750,16 @@ async def run_batch_scoring() -> None:
             email_summary = summarize_email_activity(
                 touchpoints, days=14, scored_events=scored_events,
             )
+            # Fallback: if Supabase has no email data, use HubSpot's native
+            # email tracking (hs_email_open_count / hs_email_click_count).
+            # These are cumulative (all-time), not 14-day windowed, but better
+            # than showing 0/0 on the Aircall card.
+            if email_summary["opens"] == 0 and email_summary["clicks"] == 0:
+                hs_opens = int(props.get("hs_email_open_count") or 0)
+                hs_clicks = int(props.get("hs_email_click_count") or 0)
+                if hs_opens or hs_clicks:
+                    email_summary["opens"] = hs_opens
+                    email_summary["clicks"] = hs_clicks
 
             # Build funnel source string
             funnel_source = _build_funnel_source(touchpoints)
