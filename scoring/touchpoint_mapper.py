@@ -299,8 +299,10 @@ def summarize_email_activity(
             last_email_time = created_at
             last_email_subject = tp.get("content") or ""
 
-    # Source 2: Scored events (from CIO webhooks / browser events)
-    if scored_events:
+    # Source 2: Scored events — ONLY if Source 1 found nothing.
+    # If touchpoints already yielded email data, scored_events would double-count
+    # because the same touchpoint gets mapped to a scored_event AND counted here.
+    if scored_events and opens == 0 and clicks == 0:
         for ev in scored_events:
             et = (ev.get("event_type") or "").lower()
             if et not in ("email_opened", "email_link_clicked"):
