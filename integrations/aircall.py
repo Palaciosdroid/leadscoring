@@ -342,20 +342,62 @@ async def _upsert_contact(
     *,
     tags: list[str] | None = None,
 ) -> str:
-    """Create or update an Aircall contact. Returns the Aircall contact ID."""
+    """Create or update an Aircall contact. Returns the Aircall contact ID.
+
+    Search-first approach: looks up the contact by phone/email before creating.
+    If found → PATCH (update info, tags). If not found → POST (create new).
+    This prevents duplicate contacts that lose their tags.
+    """
     phone = lead.get("phone", "")
+    email = lead.get("email", "")
     if not phone:
-        raise ValueError(f"No phone number for lead {lead.get('email')}")
+        raise ValueError(f"No phone number for lead {email}")
+
+    # Step 1: Search for existing contact by phone or email
+    existing_id: str | None = None
+    for query in (phone, email):
+        if not query:
+            continue
+        try:
+            search_resp = await _aircall_request(
+                client, "get",
+                f"{AIRCALL_BASE}/contacts/search",
+                params={"phone_number": query} if query == phone else {"email": query},
+            )
+            if search_resp.status_code == 200:
+                contacts = search_resp.json().get("contacts", [])
+                if contacts:
+                    existing_id = str(contacts[0].get("id", ""))
+                    break
+        except Exception:
+            pass  # Search failure is non-fatal — fall through to POST
 
     payload: dict[str, Any] = {
         "first_name":    lead.get("firstname", ""),
         "last_name":     lead.get("lastname", ""),
         "information":   lead.get("notes", ""),
-        "phone_numbers": [{"label": "mobile", "value": phone}],
-        "emails":        [{"label": "work",   "value": lead.get("email", "")}],
     }
     if tags:
         payload["tags"] = tags
+
+    if existing_id:
+        # Step 2a: PATCH existing contact (update info + tags)
+        response = await _aircall_request(
+            client, "put", f"{AIRCALL_BASE}/contacts/{existing_id}",
+            json=payload,
+        )
+        if response.status_code in (200, 201):
+            logger.info("Aircall: updated contact %s → id=%s tags=%s", email, existing_id, tags)
+            return existing_id
+        else:
+            logger.warning(
+                "Aircall: PATCH failed for %s (id=%s): %s — falling through to POST",
+                email, existing_id, response.status_code,
+            )
+
+    # Step 2b: POST new contact (no existing found, or PATCH failed)
+    payload["phone_numbers"] = [{"label": "mobile", "value": phone}]
+    payload["emails"] = [{"label": "work", "value": email}]
 
     response = await _aircall_request(
         client, "post", f"{AIRCALL_BASE}/contacts", json=payload,
@@ -363,18 +405,18 @@ async def _upsert_contact(
 
     if response.status_code not in (200, 201):
         logger.error(
-            "Aircall: contact upsert failed for %s: %s %s",
-            lead.get("email"), response.status_code, response.text,
+            "Aircall: contact create failed for %s: %s %s",
+            email, response.status_code, response.text,
         )
         response.raise_for_status()
 
     contact_id = str(response.json().get("contact", {}).get("id", ""))
-    logger.info("Aircall: upserted contact %s → id=%s tags=%s", lead.get("email"), contact_id, tags)
+    logger.info("Aircall: created contact %s → id=%s tags=%s", email, contact_id, tags)
 
     # Clean up stale priority/score tags from previous scoring runs
     if contact_id and tags:
         new_priority = next((t for t in tags if t in ALL_PRIORITY_TAG_VALUES), None)
-        await _cleanup_stale_priority_tags(client, contact_id, new_priority, lead.get("email", ""))
+        await _cleanup_stale_priority_tags(client, contact_id, new_priority, email)
 
     return contact_id
 
