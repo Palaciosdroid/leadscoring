@@ -258,10 +258,11 @@ async def add_to_power_dialer(
     # Use pre-built card from scorer if provided (V1: includes Kauf, Naechstes Produkt, Hook).
     # Fall back to _build_call_info header if no card was passed.
     existing_notes = lead.get("notes", "")
-    if existing_notes and any(
-        kw in existing_notes for kw in ("Score:", "Hook:", "Ziel:")
+    if existing_notes and all(
+        kw in existing_notes for kw in ("Hook:", "Ziel:")
     ):
-        # Card already built by _build_aircall_card() in scorer.py — use as-is
+        # Card built by _build_aircall_card() in scorer.py (has Hook + Ziel) — use as-is.
+        # Old WhatsApp bot cards have "Score:" but NOT "Hook:"/"Ziel:" → they get overwritten.
         call_info = existing_notes
     else:
         call_info = _build_call_info(
