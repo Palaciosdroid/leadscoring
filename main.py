@@ -251,6 +251,22 @@ app = FastAPI(
 WEBHOOK_SECRET = os.environ.get("CIO_WEBHOOK_SECRET", "")
 DEBUG_API_KEY = os.environ.get("DEBUG_API_KEY", "")
 
+# Startup validation — warn about missing critical secrets
+_REQUIRED_ENV_VARS = [
+    "HUBSPOT_ACCESS_TOKEN",
+    "SUPABASE_URL",
+    "SUPABASE_SERVICE_KEY",
+    "AIRCALL_API_ID",
+    "AIRCALL_API_TOKEN",
+    "DEBUG_API_KEY",
+]
+_missing = [v for v in _REQUIRED_ENV_VARS if not os.environ.get(v)]
+if _missing:
+    import logging as _startup_log
+    _startup_log.getLogger(__name__).warning(
+        "⚠️  Missing required environment variables: %s  — some features will fail.", _missing
+    )
+
 
 # ---------------------------------------------------------------------------
 # Pydantic models
@@ -988,7 +1004,7 @@ async def batch_run():
 @app.post("/debug/batch")
 async def debug_batch(x_api_key: str | None = Header(default=None)):
     """Run batch scoring synchronously — returns result or error. Requires DEBUG_API_KEY."""
-    if DEBUG_API_KEY and x_api_key != DEBUG_API_KEY:
+    if not DEBUG_API_KEY or x_api_key != DEBUG_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key header")
     import io, logging as _log
     buf = io.StringIO()
@@ -1013,7 +1029,7 @@ async def debug_batch(x_api_key: str | None = Header(default=None)):
 @app.post("/debug/poll")
 async def debug_poll(window_minutes: int = 10, x_api_key: str | None = Header(default=None)):
     """Manually trigger the call poller for E2E testing. Requires DEBUG_API_KEY."""
-    if DEBUG_API_KEY and x_api_key != DEBUG_API_KEY:
+    if not DEBUG_API_KEY or x_api_key != DEBUG_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key header")
     logger.info("/debug/poll triggered manually (window=%dm)", window_minutes)
     await run_call_polling(since_minutes=window_minutes)
@@ -1034,7 +1050,7 @@ async def get_buyer_journey(x_api_key: str | None = Header(default=None)):
 
     Requires DEBUG_API_KEY.
     """
-    if DEBUG_API_KEY and x_api_key != DEBUG_API_KEY:
+    if not DEBUG_API_KEY or x_api_key != DEBUG_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key header")
     logger.info("/analytics/buyer-journey triggered")
     analysis = await analyze_buyer_journeys()
@@ -1048,7 +1064,7 @@ async def post_buyer_journey_slack(x_api_key: str | None = Header(default=None))
     Same as the weekly scheduled job, but triggered manually.
     Requires DEBUG_API_KEY.
     """
-    if DEBUG_API_KEY and x_api_key != DEBUG_API_KEY:
+    if not DEBUG_API_KEY or x_api_key != DEBUG_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key header")
     logger.info("/analytics/buyer-journey/slack triggered")
     await run_weekly_buyer_journey()
@@ -1058,7 +1074,7 @@ async def post_buyer_journey_slack(x_api_key: str | None = Header(default=None))
 @app.post("/debug/daily-summary")
 async def debug_daily_summary(x_api_key: str | None = Header(default=None)):
     """Manually trigger the EOD daily summary card. Requires DEBUG_API_KEY."""
-    if DEBUG_API_KEY and x_api_key != DEBUG_API_KEY:
+    if not DEBUG_API_KEY or x_api_key != DEBUG_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key header")
     logger.info("/debug/daily-summary triggered manually")
     await run_scheduled_calls_summarizer()
@@ -1077,7 +1093,7 @@ async def debug_realtime_score(
     Test realtime scoring for a specific email without HubSpot Workflow trigger.
     Requires DEBUG_API_KEY. Calls the same pipeline as /webhook/hubspot/new-contact.
     """
-    if DEBUG_API_KEY and x_api_key != DEBUG_API_KEY:
+    if not DEBUG_API_KEY or x_api_key != DEBUG_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key header")
     logger.info("/debug/realtime-score triggered for %s", email)
     return await realtime_score_webhook(RealtimeScoreRequest(

@@ -98,6 +98,8 @@ def predict_ai_score(features: dict[str, float]) -> float | None:
     ]
     try:
         prob = _AI_MODEL.predict_proba([feature_vector])[0][1]  # P(purchase)
+        if not (0.0 <= prob <= 1.0):  # guard against NaN / corrupt model output
+            return None
         return round(prob * 100, 2)
     except Exception:
         return None
