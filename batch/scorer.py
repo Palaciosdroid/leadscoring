@@ -47,6 +47,7 @@ RESCORE_WINDOW_DAYS = int(os.environ.get("RESCORE_WINDOW_DAYS", "30"))
 SCORE_WARM = 30      # >= 30 -> push to HubSpot/Aircall
 SCORE_HOT = 65       # >= 65 -> same list as warm, tagged hot
 FRESH_WINDOW = timedelta(days=7)  # Wave 4: was 72h, now 7d
+FRESH_MIN_SCORE = 10  # fresh leads need at least this to enter Aircall (avoids single page_visited)
 
 # Cooldown after call — prevent Kevin from calling the same person repeatedly
 COOLDOWN_ANSWERED_HOURS = 7 * 24      # 7 days after answered call
@@ -893,9 +894,7 @@ async def run_batch_scoring() -> None:
                 # Eignungscheck leads always get called — form submission is the qualifier,
                 # no score threshold applies. Score is shown on the Aircall card for context only.
                 # Fresh/warm funnel lists require score >= 30 or freshness as a quality gate.
-                # Fresh leads still need a minimum score of 10 to avoid pushing
-                # leads with only a single page_visited (3 points) into the dialer.
-                FRESH_MIN_SCORE = 10
+                # FRESH_MIN_SCORE (10) prevents single page_visited leads (3 pts) from being dialled.
                 should_push = has_phone and (
                     list_key == "eignungscheck"
                     or (is_fresh and score >= FRESH_MIN_SCORE)

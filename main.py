@@ -990,11 +990,14 @@ async def batch_prioritize(limit: int = 200):
 
 
 @app.post("/batch/run")
-async def batch_run():
+async def batch_run(x_api_key: str | None = Header(default=None)):
     """
     Manually trigger a batch re-score of all HubSpot contacts.
     Fire-and-forget: returns immediately while scoring runs in the background.
+    Requires DEBUG_API_KEY.
     """
+    if not DEBUG_API_KEY or x_api_key != DEBUG_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key header")
     import asyncio
     asyncio.create_task(run_batch_scoring())
     logger.info("/batch/run triggered manually")

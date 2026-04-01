@@ -188,6 +188,35 @@ class TestAddToPowerDialer:
         mock_upsert.assert_called_once()
 
     @pytest.mark.asyncio
+    @patch("integrations.aircall.AIRCALL_API_ID", "test-id")
+    @patch("integrations.aircall.AIRCALL_API_TOKEN", "test-token")
+    @patch("integrations.aircall.AIRCALL_CLOSER_USER_ID", "12345")
+    @patch("integrations.aircall._write_contact_note", new_callable=AsyncMock)
+    @patch("integrations.aircall._upsert_contact", new_callable=AsyncMock, return_value="c-101")
+    @patch("integrations.aircall._push_to_dialer_campaign", new_callable=AsyncMock, return_value={"status": "added", "phone": "+4915112345678"})
+    async def test_is_fresh_flag_with_old_created_at_pushes_to_dialer(self, mock_push, mock_upsert, mock_note):
+        """is_fresh=True bypasses created_at age — scorer's 7-day freshness is honoured."""
+        old = datetime.now(timezone.utc) - timedelta(days=5)  # 5 days old — would fail _is_fresh 24h check
+        result = await add_to_power_dialer(
+            self.LEAD, score=15, created_at=old, lead_tier="3_cold", is_fresh=True
+        )
+        assert result is not None
+        mock_upsert.assert_called_once()
+        mock_push.assert_called_once()
+
+    @pytest.mark.asyncio
+    @patch("integrations.aircall.AIRCALL_API_ID", "test-id")
+    @patch("integrations.aircall.AIRCALL_API_TOKEN", "test-token")
+    @patch("integrations.aircall.AIRCALL_CLOSER_USER_ID", "12345")
+    async def test_is_fresh_false_with_old_created_at_cold_score_returns_none(self):
+        """is_fresh=False + old created_at + score < 30 = correctly rejected."""
+        old = datetime.now(timezone.utc) - timedelta(days=5)
+        result = await add_to_power_dialer(
+            self.LEAD, score=15, created_at=old, lead_tier="3_cold", is_fresh=False
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
     @patch("integrations.aircall.AIRCALL_API_ID", "")
     @patch("integrations.aircall.AIRCALL_API_TOKEN", "")
     async def test_missing_credentials_raises(self):
