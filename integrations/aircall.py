@@ -68,21 +68,27 @@ def _is_fresh(created_at: datetime | None) -> bool:
     return age_hours < FRESH_WINDOW_HOURS
 
 
-def _should_dial(score: float, created_at: datetime | None = None, lead_tier: str = "") -> bool:
+def _should_dial(
+    score: float,
+    created_at: datetime | None = None,
+    lead_tier: str = "",
+    is_fresh: bool = False,
+) -> bool:
     """Decide if lead qualifies for the Power Dialer.
 
-    Booked: has meeting with Kevin        → never dial.
-    Fresh list: any score, opted in < 24h → always dial.
-    Warm list:  tier is 1_hot or 2_warm   → dial.
-    Cold/Disqualified: CIO nurturing only → skip.
-    Below score 30: not worth calling     → skip.
+    Booked: has meeting with Kevin                     → never dial.
+    Fresh list: scorer marked fresh OR opted in <24h   → always dial.
+    Warm list:  tier is 1_hot or 2_warm                → dial.
+    Cold/Disqualified: CIO nurturing only              → skip.
+    Below score 30: not worth calling                  → skip.
     """
     # Booked leads already have a meeting — never cold-call them
     if lead_tier == "0_booked":
         return False
-    if _is_fresh(created_at):
+    # Accept scorer's freshness signal (7-day window) OR Aircall's own 24h check
+    if is_fresh or _is_fresh(created_at):
         return True
-    # TASK B: Score < 30 never goes to Aircall
+    # Score < 30 never goes to Aircall
     if score < 30:
         return False
     return lead_tier in DIALABLE_TIERS
@@ -218,6 +224,7 @@ async def add_to_power_dialer(
     *,
     score: float = 0,
     created_at: datetime | None = None,
+    is_fresh: bool = False,
     interest_category: str | None = None,
     lead_tier: str = "",
     list_key: str = "",
@@ -238,8 +245,11 @@ async def add_to_power_dialer(
     if not AIRCALL_CLOSER_USER_ID:
         raise EnvironmentError("AIRCALL_CLOSER_USER_ID must be set")
 
-    if not _should_dial(score, created_at, lead_tier):
-        logger.debug("Aircall: score %.0f too low, not fresh — skipping %s", score, lead.get("email"))
+    if not _should_dial(score, created_at, lead_tier, is_fresh=is_fresh):
+        logger.debug(
+            "Aircall: score %.0f too low, not fresh (is_fresh=%s) — skipping %s",
+            score, is_fresh, lead.get("email"),
+        )
         return None
 
     phone = lead.get("phone", "")

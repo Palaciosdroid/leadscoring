@@ -72,6 +72,14 @@ class TestShouldDial:
         old = datetime.now(timezone.utc) - timedelta(days=3)
         assert _should_dial(50, old, lead_tier="") is False
 
+    def test_is_fresh_flag_overrides_created_at_none(self):
+        """is_fresh=True bypasses created_at=None — scorer's 7-day freshness is accepted."""
+        assert _should_dial(15, None, lead_tier="3_cold", is_fresh=True) is True
+
+    def test_is_fresh_flag_blocked_for_booked(self):
+        """is_fresh=True still cannot override booked tier."""
+        assert _should_dial(15, None, lead_tier="0_booked", is_fresh=True) is False
+
 
 class TestBuildTags:
     def test_fresh_lead_tags_with_list_key(self):
