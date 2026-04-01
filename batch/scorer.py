@@ -42,9 +42,10 @@ HUBSPOT_TOKEN = os.environ.get("HUBSPOT_ACCESS_TOKEN", "")
 # Only re-score leads updated in the last N days to keep API calls low
 RESCORE_WINDOW_DAYS = int(os.environ.get("RESCORE_WINDOW_DAYS", "30"))
 
-# Score thresholds (v2: raised for 0-200 scale)
-SCORE_WARM = 40      # >= 40 -> push to HubSpot/Aircall
-SCORE_HOT = 100      # >= 100 -> same list as warm, tagged hot
+# Score thresholds (reverted to v1 — v2 thresholds were too aggressive,
+# caused 152 leads to drop from Warm to Cold and disappear from Aircall)
+SCORE_WARM = 30      # >= 30 -> push to HubSpot/Aircall
+SCORE_HOT = 65       # >= 65 -> same list as warm, tagged hot
 FRESH_WINDOW = timedelta(days=7)  # Wave 4: was 72h, now 7d
 
 # Cooldown after call — prevent Kevin from calling the same person repeatedly

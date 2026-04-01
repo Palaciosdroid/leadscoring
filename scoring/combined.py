@@ -37,8 +37,8 @@ WHATSAPP_WEIGHT_WA = 0.40
 # Using threshold-only (>= check) avoids float boundary gaps (e.g. 39.5)
 # ---------------------------------------------------------------------------
 TIERS: list[tuple[str, float]] = [
-    ("1_hot",         100.0),
-    ("2_warm",         40.0),
+    ("1_hot",          65.0),
+    ("2_warm",         30.0),
     ("3_cold",          0.0),
     ("4_disqualified", float("-inf")),
 ]

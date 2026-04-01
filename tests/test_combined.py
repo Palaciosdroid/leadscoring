@@ -11,18 +11,18 @@ from scoring.combined import (
 
 class TestDetermineTier:
     def test_hot(self):
+        assert _determine_tier(65) == "1_hot"
         assert _determine_tier(100) == "1_hot"
-        assert _determine_tier(150) == "1_hot"
         assert _determine_tier(200) == "1_hot"
 
     def test_warm(self):
-        assert _determine_tier(40) == "2_warm"
-        assert _determine_tier(60) == "2_warm"
-        assert _determine_tier(99.9) == "2_warm"
+        assert _determine_tier(30) == "2_warm"
+        assert _determine_tier(50) == "2_warm"
+        assert _determine_tier(64.9) == "2_warm"
 
     def test_cold(self):
         assert _determine_tier(0) == "3_cold"
-        assert _determine_tier(39.9) == "3_cold"
+        assert _determine_tier(29.9) == "3_cold"
 
     def test_disqualified(self):
         assert _determine_tier(-1) == "4_disqualified"
