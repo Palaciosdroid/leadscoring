@@ -259,6 +259,7 @@ _REQUIRED_ENV_VARS = [
     "AIRCALL_API_ID",
     "AIRCALL_API_TOKEN",
     "DEBUG_API_KEY",
+    "CIO_WEBHOOK_SECRET",   # Required — skip-when-empty silently opens CIO endpoint to anyone
 ]
 _missing = [v for v in _REQUIRED_ENV_VARS if not os.environ.get(v)]
 if _missing:
@@ -560,11 +561,15 @@ async def _handle_custom_batch(body: dict[str, Any]) -> ScoreResponse:
 async def score_lead(
     events: list[dict[str, Any]],
     lead: LeadContext,
+    x_api_key: str | None = Header(default=None),
 ):
     """
     Direct scoring endpoint (useful for manual triggers or testing).
     Accepts pre-mapped events (with event_type already set).
+    Requires DEBUG_API_KEY — writes HubSpot properties and can push to Aircall.
     """
+    if not DEBUG_API_KEY or x_api_key != DEBUG_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key header")
     return await _score_and_update(events, lead, pre_mapped=True)
 
 
@@ -960,14 +965,21 @@ async def hubspot_call_webhook(payload: HubSpotCallPayload):
 
 
 @app.get("/batch/prioritize")
-async def batch_prioritize(limit: int = 200):
+async def batch_prioritize(
+    limit: int = 200,
+    x_api_key: str | None = Header(default=None),
+):
     """
     Return the outbound calling queue sorted by priority:
       1. Hot  (lead_tier=1_hot)  — not called in last 24h
       2. Warm (lead_tier=2_warm) — not called in last 48h
       3. Cold (lead_tier=3_cold) — not called in last 7d
     Only contacts with a phone number. Never-called contacts are always included.
+    Requires DEBUG_API_KEY — returns PII (name, phone, email) for all queued leads.
     """
+    if not DEBUG_API_KEY or x_api_key != DEBUG_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key header")
+    limit = min(limit, 200)  # Hard cap — prevent unbounded PII dump
     contacts = await get_prioritized_contacts(limit=limit)
 
     queue = []
@@ -1254,14 +1266,19 @@ def _build_ai_features(
 
 
 def _verify_signature(raw_body: bytes, signature: str) -> None:
-    """HMAC-SHA256 verification for Customer.io webhook secret."""
+    """HMAC-SHA256 verification for Customer.io webhook secret.
+
+    CIO may send either "sha256=<hex>" or raw "<hex>" — strip prefix before comparing.
+    """
     import hashlib
     import hmac
 
     expected = hmac.new(
         WEBHOOK_SECRET.encode(), raw_body, hashlib.sha256
     ).hexdigest()
-    if not hmac.compare_digest(expected, signature):
+    # Strip "sha256=" prefix if present (CIO format varies by account/version)
+    canonical = signature.removeprefix("sha256=")
+    if not hmac.compare_digest(expected, canonical):
         raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
 
@@ -1289,10 +1306,14 @@ async def zoom_recording_webhook(request: Request):
     """
     raw_body = await request.body()
 
-    # Zoom webhook signature verification
+    # Zoom webhook signature verification — always enforce when secret is configured.
+    # Never skip: an attacker can simply omit the headers to bypass an "if headers present" check.
+    zoom_secret = os.environ.get("ZOOM_WEBHOOK_SECRET", "")
     timestamp = request.headers.get("x-zm-request-timestamp", "")
     signature = request.headers.get("x-zm-signature", "")
-    if timestamp and signature:
+    if zoom_secret:
+        if not timestamp or not signature:
+            raise HTTPException(status_code=401, detail="Missing Zoom webhook signature headers")
         if not verify_zoom_signature(raw_body, timestamp, signature):
             raise HTTPException(status_code=401, detail="Invalid Zoom webhook signature")
 

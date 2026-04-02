@@ -967,7 +967,7 @@ async def run_batch_scoring() -> None:
             # - Fresh: is_fresh=True AND score >= FRESH_MIN_SCORE (10)
             # This card is used for both Aircall notes AND HubSpot notes
             aircall_card = ""
-            if has_phone and (score >= SCORE_WARM or (is_fresh and score >= FRESH_MIN_SCORE)):
+            if has_phone and not call_booked and (score >= SCORE_WARM or (is_fresh and score >= FRESH_MIN_SCORE)):
                 offer_signals = _extract_offer_signals(browser_events)
                 hook_context = {
                     "email_clicked": email_summary.get("clicks", 0) > 0,
@@ -1139,7 +1139,7 @@ async def run_batch_scoring() -> None:
                     logger.warning(
                         "Batch: Aircall rejected %s — score=%.0f tier=%s is_fresh=%s "
                         "(check _should_dial logic)",
-                        item["email"], item["score"], item["lead_tier"], item.get("is_fresh"),
+                        item["email"], item["score"], item["tier_label"], item.get("is_fresh"),
                     )
         except Exception as e:
             logger.error("Batch: Aircall push failed for %s: %s", item["email"], e)
