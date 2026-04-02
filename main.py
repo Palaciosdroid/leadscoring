@@ -574,7 +574,10 @@ async def score_lead(
 
 
 @app.post("/webhook/hubspot/new-contact", response_model=RealtimeScoreResponse)
-async def realtime_score_webhook(payload: RealtimeScoreRequest):
+async def realtime_score_webhook(
+    payload: RealtimeScoreRequest,
+    x_api_key: str | None = Header(default=None),
+):
     """
     Realtime lead scoring — scores a single lead on-demand in <5 seconds.
 
@@ -590,7 +593,10 @@ async def realtime_score_webhook(payload: RealtimeScoreRequest):
 
     This replaces the 30-min batch wait for fresh leads — they now get
     scored and pushed to the closer's dialer within minutes of opt-in.
+    Requires X-Api-Key header (set in HubSpot Workflow HTTP request config).
     """
+    if not DEBUG_API_KEY or x_api_key != DEBUG_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key header")
     email = payload.email.strip().lower()
     if not email:
         raise HTTPException(status_code=422, detail="email is required")
@@ -753,7 +759,10 @@ async def realtime_score_webhook(payload: RealtimeScoreRequest):
 # WhatsApp Bot Qualification Webhook
 # ---------------------------------------------------------------------------
 @app.post("/webhook/whatsapp-event", response_model=WhatsAppEventResponse)
-async def whatsapp_event_webhook(payload: WhatsAppEventPayload):
+async def whatsapp_event_webhook(
+    payload: WhatsAppEventPayload,
+    x_api_key: str | None = Header(default=None),
+):
     """
     Receive WhatsApp qualification data from the MC-Webinar-Setter bot.
 
@@ -765,7 +774,10 @@ async def whatsapp_event_webhook(payload: WhatsAppEventPayload):
       4. Rescores the contact with the 3-factor formula
       5. Pushes updated score to HubSpot
       6. Pushes to Aircall Power Dialer if qualified
+    Requires X-Api-Key header (configured in the MC-Webinar-Setter bot env).
     """
+    if not DEBUG_API_KEY or x_api_key != DEBUG_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key header")
     email = payload.email.strip().lower() if payload.email else ""
     phone = payload.phone.strip()
     timestamp = payload.timestamp or datetime.now(timezone.utc).isoformat()
@@ -903,7 +915,10 @@ async def whatsapp_event_webhook(payload: WhatsAppEventPayload):
 
 
 @app.post("/webhook/hubspot/call")
-async def hubspot_call_webhook(payload: HubSpotCallPayload):
+async def hubspot_call_webhook(
+    payload: HubSpotCallPayload,
+    x_api_key: str | None = Header(default=None),
+):
     """
     Receive a HubSpot Call activity webhook.
     Setup: HubSpot Workflow → "notes_last_contacted changed" → Custom Webhook → this endpoint.
@@ -911,7 +926,10 @@ async def hubspot_call_webhook(payload: HubSpotCallPayload):
     When contact_id is provided, fetches live call details from HubSpot via the
     associations API (the workflow can only pass contact properties, not call properties).
     Also writes lead_last_call_date + lead_last_call_outcome back to the contact.
+    Requires X-Api-Key header (set in HubSpot Workflow HTTP request config).
     """
+    if not DEBUG_API_KEY or x_api_key != DEBUG_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key header")
     contact_name = f"{payload.contact_firstname} {payload.contact_lastname}".strip() or "Unknown"
 
     # Resolve call properties: prefer live HubSpot data over payload fields
