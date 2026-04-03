@@ -211,41 +211,39 @@ def _build_slack_blocks(
     now = datetime.now(tz=timezone.utc)
     today_str = now.strftime("%d. %B %Y")
 
-    connect_rate_today = (
-        f"{today_stats['connected'] / today_stats['total'] * 100:.0f}%"
-        if today_stats["total"] > 0 else "-"
-    )
-    connect_rate_week = (
-        f"{week_stats['connected'] / week_stats['total'] * 100:.0f}%"
-        if week_stats["total"] > 0 else "-"
-    )
-    connect_rate_month = (
-        f"{month_stats['connected'] / month_stats['total'] * 100:.0f}%"
-        if month_stats["total"] > 0 else "-"
-    )
+    def _conv_badge(connected: int, total: int) -> str:
+        if total == 0:
+            return "-"
+        pct = connected / total * 100
+        badge = "🟢" if pct >= 20 else ("🟡" if pct >= 10 else "🔴")
+        return f"{badge} {pct:.0f}%"
+
+    connect_rate_today = _conv_badge(today_stats["connected"], today_stats["total"])
+    connect_rate_week  = _conv_badge(week_stats["connected"], week_stats["total"])
+    connect_rate_month = _conv_badge(month_stats["connected"], month_stats["total"])
 
     blocks: list[dict[str, Any]] = [
-        {"type": "header", "text": {"type": "plain_text", "text": f"Sales Report - {today_str}"}},
+        {"type": "header", "text": {"type": "plain_text", "text": f"📊 Sales Report — {today_str}"}},
 
         # TODAY
         {"type": "section", "text": {"type": "mrkdwn", "text": "*HEUTE*"}},
         {"type": "section", "fields": [
-            {"type": "mrkdwn", "text": f"*Calls:* {today_stats['total']}"},
-            {"type": "mrkdwn", "text": f"*Gespraeche:* {today_stats['connected']} ({connect_rate_today})"},
+            {"type": "mrkdwn", "text": f"*Anrufe:* {today_stats['total']}"},
+            {"type": "mrkdwn", "text": f"*Gespräche:* {today_stats['connected']} ({connect_rate_today})"},
             {"type": "mrkdwn", "text": f"*Kurzverbindung (<10s):* {today_stats['short_connect']}"},
             {"type": "mrkdwn", "text": f"*Keine Antwort:* {today_stats['no_answer']}"},
-            {"type": "mrkdwn", "text": f"*Gespraechszeit:* {_format_duration(today_stats['talk_time_sec'])}"},
-            {"type": "mrkdwn", "text": f"*Outbound/Inbound:* {today_stats['outbound']}/{today_stats['inbound']}"},
+            {"type": "mrkdwn", "text": f"*Gesprächszeit:* {_format_duration(today_stats['talk_time_sec'])}"},
+            {"type": "mrkdwn", "text": f"*Ausgehend/Eingehend:* {today_stats['outbound']}/{today_stats['inbound']}"},
         ]},
         {"type": "divider"},
 
         # 7 DAYS
         {"type": "section", "text": {"type": "mrkdwn", "text": "*LETZTE 7 TAGE*"}},
         {"type": "section", "fields": [
-            {"type": "mrkdwn", "text": f"*Calls:* {week_stats['total']}"},
-            {"type": "mrkdwn", "text": f"*Connected:* {week_stats['connected']} ({connect_rate_week})"},
-            {"type": "mrkdwn", "text": f"*Gespraechszeit:* {_format_duration(week_stats['talk_time_sec'])}"},
-            {"type": "mrkdwn", "text": f"*Avg/Tag:* {week_stats['total'] // max(len(week_stats['by_date']), 1)}"},
+            {"type": "mrkdwn", "text": f"*Anrufe:* {week_stats['total']}"},
+            {"type": "mrkdwn", "text": f"*Gespräche:* {week_stats['connected']} ({connect_rate_week})"},
+            {"type": "mrkdwn", "text": f"*Gesprächszeit:* {_format_duration(week_stats['talk_time_sec'])}"},
+            {"type": "mrkdwn", "text": f"*Ø pro Tag:* {week_stats['total'] // max(len(week_stats['by_date']), 1)}"},
         ]},
     ]
 
@@ -265,18 +263,18 @@ def _build_slack_blocks(
     # MONTH
     blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "*DIESER MONAT*"}})
     blocks.append({"type": "section", "fields": [
-        {"type": "mrkdwn", "text": f"*Calls:* {month_stats['total']}"},
-        {"type": "mrkdwn", "text": f"*Connected:* {month_stats['connected']} ({connect_rate_month})"},
-        {"type": "mrkdwn", "text": f"*Gespraechszeit:* {_format_duration(month_stats['talk_time_sec'])}"},
-        {"type": "mrkdwn", "text": f"*Falsche Nr:* {month_stats['wrong_number']}"},
+        {"type": "mrkdwn", "text": f"*Anrufe:* {month_stats['total']}"},
+        {"type": "mrkdwn", "text": f"*Gespräche:* {month_stats['connected']} ({connect_rate_month})"},
+        {"type": "mrkdwn", "text": f"*Gesprächszeit:* {_format_duration(month_stats['talk_time_sec'])}"},
+        {"type": "mrkdwn", "text": f"*Falsche Nr.:* {month_stats['wrong_number']}"},
     ]})
 
     # Top calls (week)
     if week_stats["top_calls"]:
-        top_lines = ["*Top Gespraeche (7d):*"]
+        top_lines = ["*Top Gespräche (7d):*"]
         for i, tc in enumerate(week_stats["top_calls"][:5], 1):
             title = tc.get("title", "").split(" - ")[-1] if tc.get("title") else "Unbekannt"
-            top_lines.append(f"{i}. {title} - {_format_duration(tc['duration_sec'])}")
+            top_lines.append(f"{i}. {title} — {_format_duration(tc['duration_sec'])}")
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(top_lines)}})
 
     return blocks
