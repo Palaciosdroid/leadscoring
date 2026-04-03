@@ -16,7 +16,6 @@ from typing import Any
 
 import httpx
 
-from integrations.slack import send_daily_summary
 from integrations.hubspot import CONNECTED_DISPOSITIONS, HS_DISPOSITION_MAP
 
 logger = logging.getLogger(__name__)
