@@ -41,8 +41,10 @@ from integrations.hubspot import (
     get_prioritized_contacts,
     write_call_outcome,
     find_contact_by_zoom_meeting,
+    find_contact_by_phone,
     add_note,
     has_upcoming_hubspot_meeting,
+    update_contact_properties,
 )
 from integrations.zoom import (
     get_vtt_url,
@@ -915,6 +917,48 @@ async def whatsapp_event_webhook(
         dialer_added=dialer_ok,
         event_stored=event_stored,
     )
+
+
+# ---------------------------------------------------------------------------
+# WhatsApp Booking Confirmed Webhook
+# ---------------------------------------------------------------------------
+@app.post("/webhook/booking-confirmed")
+async def booking_confirmed_webhook(
+    request: Request,
+    x_api_key: str | None = Header(default=None),
+):
+    """
+    Called by MC-Webinar-Setter when a lead books a meeting via the WhatsApp bot.
+
+    Sets lead_call_booked=true and forces tier to 1_hot in HubSpot so the
+    lead doesn't get re-assigned to a lower tier by the next batch run.
+    Looks up contact by phone number (payload: phone, hubspotMeetingId, source).
+    """
+    if not DEBUG_API_KEY or x_api_key != DEBUG_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key header")
+
+    body = await request.json()
+    phone = (body.get("phone") or "").strip()
+    meeting_id = body.get("hubspotMeetingId", "")
+    source = body.get("source", "mc-setter")
+
+    if not phone:
+        raise HTTPException(status_code=422, detail="phone is required")
+
+    logger.info("Booking confirmed: phone=%s meeting_id=%s source=%s", phone, meeting_id, source)
+
+    contact_id = await find_contact_by_phone(phone)
+    if not contact_id:
+        logger.warning("Booking confirmed: no HubSpot contact found for phone=%s", phone)
+        return {"status": "ok", "found": False, "phone": phone}
+
+    ok = await update_contact_properties(contact_id, {
+        "lead_call_booked": "true",
+        "lead_tier": "1_hot",
+        "lead_funnel_source": f"whatsapp_{source}",
+    })
+    logger.info("Booking confirmed: HubSpot updated contact %s → call_booked=true, tier=1_hot (ok=%s)", contact_id, ok)
+    return {"status": "ok", "found": True, "contact_id": contact_id, "hubspot_updated": ok}
 
 
 @app.post("/webhook/hubspot/call")

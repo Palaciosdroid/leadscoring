@@ -931,3 +931,31 @@ async def update_contact_properties(
             json={"properties": properties},
         )
     return resp.status_code in (200, 204)
+
+
+async def find_contact_by_phone(phone: str, *, timeout: float = 10.0) -> str | None:
+    """
+    Search HubSpot contacts by phone number. Returns HubSpot contact ID or None.
+    Normalizes phone for search (strips leading + and spaces).
+    """
+    if not ACCESS_TOKEN or not phone:
+        return None
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(
+            f"{HUBSPOT_BASE}/crm/v3/objects/contacts/search",
+            headers=_headers(),
+            json={
+                "filterGroups": [
+                    {"filters": [{"propertyName": "phone", "operator": "EQ", "value": phone}]}
+                ],
+                "properties": ["hs_object_id", "email", "phone"],
+                "limit": 1,
+            },
+        )
+    if resp.status_code != 200:
+        logger.warning("HubSpot phone search failed (%s): %s", resp.status_code, resp.text[:200])
+        return None
+    results = resp.json().get("results", [])
+    if not results:
+        return None
+    return results[0]["id"]
