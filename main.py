@@ -216,12 +216,12 @@ async def lifespan(app: FastAPI):
         id="daily_summary",
         replace_existing=True,
     )
-    # Weekly buyer journey analysis — Sunday 10:00 CET
+    # Buyer journey analysis — Mon/Wed/Fri 10:00 CET
     # Analyzes common touchpoints across all buyers, posts findings to Slack
     scheduler.add_job(
         run_weekly_buyer_journey,
         "cron",
-        day_of_week="sun",
+        day_of_week="mon,wed,fri",
         hour=10,
         minute=0,
         timezone=ZoneInfo("Europe/Berlin"),
@@ -231,7 +231,7 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     logger.info(
         "Schedulers started — batch scoring every %dm, call polling every %dm (window=%dm), "
-        "decay check at 17:00 CET, daily summary at 18:00 CET, buyer journey Sun 10:00 CET",
+        "decay check at 17:00 CET, daily summary at 18:00 CET, buyer journey Mon/Wed/Fri 10:00 CET",
         BATCH_INTERVAL_MINUTES, CALL_POLL_INTERVAL_MINUTES, CALL_POLL_WINDOW_MINUTES,
     )
     yield
