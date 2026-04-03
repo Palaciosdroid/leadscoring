@@ -14,7 +14,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from analytics.buyer_journey import analyze_buyer_journeys, run_weekly_buyer_journey
@@ -577,6 +577,7 @@ async def score_lead(
 async def realtime_score_webhook(
     payload: RealtimeScoreRequest,
     x_api_key: str | None = Header(default=None),
+    api_key: str | None = Query(default=None),
 ):
     """
     Realtime lead scoring — scores a single lead on-demand in <5 seconds.
@@ -593,9 +594,11 @@ async def realtime_score_webhook(
 
     This replaces the 30-min batch wait for fresh leads — they now get
     scored and pushed to the closer's dialer within minutes of opt-in.
-    Requires X-Api-Key header (set in HubSpot Workflow HTTP request config).
+    Accepts X-Api-Key header or ?api_key= query param (HubSpot workflow limitation:
+    custom headers cannot be set via API, only query params work programmatically).
     """
-    if not DEBUG_API_KEY or x_api_key != DEBUG_API_KEY:
+    provided_key = x_api_key or api_key
+    if not DEBUG_API_KEY or provided_key != DEBUG_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key header")
     email = payload.email.strip().lower()
     if not email:
@@ -918,6 +921,7 @@ async def whatsapp_event_webhook(
 async def hubspot_call_webhook(
     payload: HubSpotCallPayload,
     x_api_key: str | None = Header(default=None),
+    api_key: str | None = Query(default=None),
 ):
     """
     Receive a HubSpot Call activity webhook.
@@ -926,9 +930,11 @@ async def hubspot_call_webhook(
     When contact_id is provided, fetches live call details from HubSpot via the
     associations API (the workflow can only pass contact properties, not call properties).
     Also writes lead_last_call_date + lead_last_call_outcome back to the contact.
-    Requires X-Api-Key header (set in HubSpot Workflow HTTP request config).
+    Accepts X-Api-Key header or ?api_key= query param (HubSpot workflow limitation:
+    custom headers cannot be set via API, only query params work programmatically).
     """
-    if not DEBUG_API_KEY or x_api_key != DEBUG_API_KEY:
+    provided_key = x_api_key or api_key
+    if not DEBUG_API_KEY or provided_key != DEBUG_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key header")
     contact_name = f"{payload.contact_firstname} {payload.contact_lastname}".strip() or "Unknown"
 
