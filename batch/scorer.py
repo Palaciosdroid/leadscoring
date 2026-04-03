@@ -1041,8 +1041,12 @@ async def run_batch_scoring() -> None:
                     "firstname": props.get("firstname", ""),
                     "lastname": props.get("lastname", ""),
                     "score": score,
+                    "engagement_score": scoring.engagement_score,
                     "tier": scoring.lead_tier,
                     "interest": funnel or "",
+                    "contact_id": contact_id,
+                    "funnel_source": props.get("lead_funnel_source", ""),
+                    "is_fresh": is_fresh,
                 })
 
         except Exception as e:

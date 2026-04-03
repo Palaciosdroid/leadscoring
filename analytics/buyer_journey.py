@@ -803,18 +803,244 @@ async def post_buyer_journey_to_slack(
 
 
 # ---------------------------------------------------------------------------
+# S1 Self-Learning: Call-Outcome vs Tier Calibration
+# ---------------------------------------------------------------------------
+
+_TIER_LABELS = {
+    "1_hot": "Hot",
+    "2_warm": "Warm",
+    "3_cold": "Cold",
+    "4_disqualified": "Disqualified",
+}
+
+_CALL_OUTCOME_POSITIVE = {"Kontakt aufgenommen", "Termin vereinbart", "Angebot gemacht"}
+
+
+async def _fetch_contacts_with_call_outcomes(limit: int = 500) -> list[dict]:
+    """
+    Fetch HubSpot contacts that have had at least one call, with their tier and score.
+    Returns list of dicts with: tier, score, call_outcome, call_date
+    """
+    if not HUBSPOT_ACCESS_TOKEN:
+        return []
+
+    headers = {
+        "Authorization": f"Bearer {HUBSPOT_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    properties = [
+        "lead_tier",
+        "lead_combined_score",
+        "lead_last_call_outcome",
+        "lead_last_call_date",
+        "lead_call_booked",
+        "email",
+    ]
+    contacts: list[dict] = []
+    after = None
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        while len(contacts) < limit:
+            body: dict[str, Any] = {
+                "filterGroups": [{
+                    "filters": [{
+                        "propertyName": "lead_last_call_outcome",
+                        "operator": "HAS_PROPERTY",
+                    }]
+                }],
+                "properties": properties,
+                "limit": 100,
+            }
+            if after:
+                body["after"] = after
+
+            resp = await client.post(
+                f"{HUBSPOT_BASE}/crm/v3/objects/contacts/search",
+                headers=headers,
+                json=body,
+            )
+            if resp.status_code != 200:
+                logger.error("HubSpot call-outcome fetch failed: %s", resp.status_code)
+                break
+
+            data = resp.json()
+            for r in data.get("results", []):
+                props = r.get("properties", {})
+                contacts.append({
+                    "tier": props.get("lead_tier", "unknown"),
+                    "score": float(props.get("lead_combined_score") or 0),
+                    "outcome": props.get("lead_last_call_outcome", ""),
+                    "call_date": props.get("lead_last_call_date", ""),
+                    "booked": props.get("lead_call_booked") == "true",
+                })
+
+            paging = data.get("paging", {})
+            after = paging.get("next", {}).get("after")
+            if not after:
+                break
+
+    logger.info("S1: fetched %d contacts with call outcomes", len(contacts))
+    return contacts
+
+
+def _analyze_call_calibration(contacts: list[dict]) -> dict[str, Any]:
+    """
+    For each tier: connection rate, booking rate, avg score.
+    Generates calibration recommendations.
+    """
+    by_tier: dict[str, list[dict]] = defaultdict(list)
+    for c in contacts:
+        by_tier[c["tier"]].append(c)
+
+    tier_stats: list[dict] = []
+    for tier, rows in sorted(by_tier.items()):
+        total = len(rows)
+        connected = sum(1 for r in rows if r["outcome"] in _CALL_OUTCOME_POSITIVE)
+        booked = sum(1 for r in rows if r["booked"])
+        avg_score = sum(r["score"] for r in rows) / total if total else 0
+        tier_stats.append({
+            "tier": tier,
+            "label": _TIER_LABELS.get(tier, tier),
+            "total_calls": total,
+            "connection_rate": round(connected / total * 100, 1) if total else 0,
+            "booking_rate": round(booked / total * 100, 1) if total else 0,
+            "avg_score": round(avg_score, 1),
+        })
+
+    # Generate calibration recommendations
+    recommendations: list[str] = []
+    for s in tier_stats:
+        if s["tier"] == "1_hot" and s["connection_rate"] < 40:
+            recommendations.append(
+                f"Hot-Schwelle zu niedrig: {s['connection_rate']}% Verbindungsrate bei Hot-Leads "
+                f"(avg Score {s['avg_score']}) — Schwelle auf ≥70 erhöhen?"
+            )
+        if s["tier"] == "2_warm" and s["connection_rate"] > 70:
+            recommendations.append(
+                f"Warm-Leads performen wie Hot: {s['connection_rate']}% Verbindungsrate "
+                f"(avg Score {s['avg_score']}) — Warm-Schwelle nach unten anpassen?"
+            )
+        if s["tier"] == "1_hot" and s["booking_rate"] > 30:
+            recommendations.append(
+                f"Hot-Leads konvertieren stark: {s['booking_rate']}% Buchungsrate "
+                f"— Score-Kalibrierung funktioniert."
+            )
+        if s["tier"] == "3_cold" and s["connection_rate"] > 30:
+            recommendations.append(
+                f"Cold-Leads mit {s['connection_rate']}% Verbindungsrate — "
+                f"Cold-Schwelle prüfen (avg Score {s['avg_score']})"
+            )
+
+    if not recommendations:
+        recommendations.append(
+            "Score-Kalibrierung im grünen Bereich — keine Anpassungen empfohlen."
+        )
+
+    return {
+        "total_contacts": len(contacts),
+        "tier_stats": tier_stats,
+        "recommendations": recommendations,
+    }
+
+
+def _build_calibration_slack_message(calibration: dict[str, Any]) -> dict[str, Any]:
+    """Build Slack Block Kit message for S1 calibration report."""
+    total = calibration["total_contacts"]
+    tier_stats = calibration["tier_stats"]
+    recommendations = calibration["recommendations"]
+
+    blocks: list[dict] = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": "Score-Kalibrierung (S1 Self-Learning)", "emoji": True},
+        },
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": f"Basis: *{total}* Kontakte mit Call-Outcomes — automatische Analyse"}],
+        },
+        {"type": "divider"},
+    ]
+
+    # Tier performance table
+    for s in tier_stats:
+        conn_emoji = "🟢" if s["connection_rate"] >= 50 else ("🟡" if s["connection_rate"] >= 30 else "🔴")
+        book_emoji = "🟢" if s["booking_rate"] >= 20 else ("🟡" if s["booking_rate"] >= 10 else "🔴")
+        blocks.append({
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*{s['label']} ({s['total_calls']} Calls)*"},
+                {"type": "mrkdwn", "text": f"Avg Score: *{s['avg_score']}*"},
+                {"type": "mrkdwn", "text": f"{conn_emoji} Verbindung: *{s['connection_rate']}%*"},
+                {"type": "mrkdwn", "text": f"{book_emoji} Buchungen: *{s['booking_rate']}%*"},
+            ],
+        })
+
+    blocks.append({"type": "divider"})
+
+    # Recommendations
+    rec_text = "\n".join(f"• {r}" for r in recommendations)
+    blocks.append({
+        "type": "section",
+        "text": {"type": "mrkdwn", "text": f"*Empfehlungen*\n{rec_text}"},
+    })
+
+    return {"blocks": blocks}
+
+
+async def run_call_calibration() -> None:
+    """S1 Self-Learning: analyze call outcomes vs tiers, post to Slack."""
+    logger.info("S1: Starting call calibration analysis...")
+    try:
+        contacts = await _fetch_contacts_with_call_outcomes()
+        if not contacts:
+            logger.warning("S1: No contacts with call outcomes found — skipping")
+            return
+
+        calibration = _analyze_call_calibration(contacts)
+        message = _build_calibration_slack_message(calibration)
+
+        webhook_url = (
+            os.environ.get("SLACK_CALLS_WEBHOOK_URL")
+            or os.environ.get("SLACK_WEBHOOK_URL", "")
+        )
+        if not webhook_url:
+            logger.warning("S1: No Slack webhook configured — skipping post")
+            return
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(webhook_url, json=message)
+
+        if resp.status_code != 200:
+            logger.error("S1: Slack post failed: %s %s", resp.status_code, resp.text)
+        else:
+            logger.info(
+                "S1: Calibration posted — %d tiers, %d recommendations",
+                len(calibration["tier_stats"]),
+                len(calibration["recommendations"]),
+            )
+    except Exception:
+        logger.exception("S1: Call calibration failed")
+
+
+# ---------------------------------------------------------------------------
 # Scheduled job entry point
 # ---------------------------------------------------------------------------
 
 async def run_weekly_buyer_journey() -> None:
     """
-    Weekly scheduled job: runs buyer journey analysis and posts to Slack.
-    Called by APScheduler every Sunday at 10:00 CET.
+    Scheduled job: runs buyer journey analysis + S1 call calibration, posts to Slack.
+    Called by APScheduler Mon/Wed/Fri at 10:00 CET.
     """
-    logger.info("Starting weekly buyer journey analysis...")
+    logger.info("Starting buyer journey + S1 calibration analysis...")
     try:
-        analysis = await analyze_buyer_journeys()
+        analysis, _ = await asyncio.gather(
+            analyze_buyer_journeys(),
+            run_call_calibration(),
+            return_exceptions=True,
+        )
+        if isinstance(analysis, Exception):
+            raise analysis
         await post_buyer_journey_to_slack(analysis)
-        logger.info("Weekly buyer journey analysis complete")
+        logger.info("Weekly buyer journey + S1 complete")
     except Exception:
         logger.exception("Weekly buyer journey analysis failed")

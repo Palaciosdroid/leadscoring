@@ -46,38 +46,70 @@ def _build_hot_lead_message(
     lead_tier: str,
     interest_category: str | None,
 ) -> dict[str, Any]:
-    name = f"{lead.get('firstname', '')} {lead.get('lastname', '')}".strip() or "Unknown"
-    email = lead.get("email", "N/A")
-    phone = lead.get("phone", "N/A")
+    name = f"{lead.get('firstname', '')} {lead.get('lastname', '')}".strip() or "Unbekannt"
+    email = lead.get("email", "–")
+    phone = lead.get("phone", "–")
     emoji = TIER_EMOJI.get(lead_tier, "❓")
-    category = CATEGORY_LABEL.get(interest_category or "", interest_category or "Unknown")
+    tier_label = {"1_hot": "Hot", "2_warm": "Warm", "3_cold": "Cold", "4_disqualified": "Disqualifiziert"}.get(lead_tier, lead_tier)
+    category = CATEGORY_LABEL.get(interest_category or "", interest_category or "Unbekannt")
+    engagement = lead.get("engagement_score", 0)
+    wa_contribution = max(0, int(combined_score) - int(engagement))
+    contact_id = lead.get("contact_id", "")
+    funnel_source = lead.get("funnel_source", "")
+    is_fresh = lead.get("is_fresh", False)
+    fresh_badge = " ⚡ FRISCH" if is_fresh else ""
 
-    return {
-        "blocks": [
-            {
-                "type": "header",
-                "text": {"type": "plain_text", "text": f"{emoji} Hot Lead: {name}"},
+    # Score breakdown line
+    score_breakdown = f"Engagement: {engagement} | WA-Bonus: +{wa_contribution}"
+
+    blocks: list[dict] = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": f"{emoji} {tier_label} Lead: {name}{fresh_badge}"},
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Score:*\n{combined_score:.0f} / 100"},
+                {"type": "mrkdwn", "text": f"*Tier:*\n{emoji} {tier_label}"},
+                {"type": "mrkdwn", "text": f"*Interesse:*\n{category}"},
+                {"type": "mrkdwn", "text": f"*Quelle:*\n{funnel_source or 'unbekannt'}"},
+            ],
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*E-Mail:*\n{email}"},
+                {"type": "mrkdwn", "text": f"*Telefon:*\n{phone}"},
+            ],
+        },
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": f"📊 Score-Breakdown: {score_breakdown}"}],
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": "➡️ *Speed-to-Lead:* Lead wurde automatisch in den Aircall Power Dialer eingetragen.",
             },
-            {
-                "type": "section",
-                "fields": [
-                    {"type": "mrkdwn", "text": f"*Score:*\n{combined_score:.0f} / 100"},
-                    {"type": "mrkdwn", "text": f"*Tier:*\nHot 🔥"},
-                    {"type": "mrkdwn", "text": f"*Interesse:*\n{category}"},
-                    {"type": "mrkdwn", "text": f"*E-Mail:*\n{email}"},
-                    {"type": "mrkdwn", "text": f"*Telefon:*\n{phone}"},
-                ],
-            },
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": "➡️ *Speed-to-Lead:* Lead wurde automatisch in Aircall Power Dialer eingetragen.",
-                },
-            },
-            {"type": "divider"},
-        ]
-    }
+        },
+    ]
+
+    # HubSpot deep-link button
+    if contact_id and HUBSPOT_PORTAL_ID:
+        blocks.append({
+            "type": "actions",
+            "elements": [{
+                "type": "button",
+                "text": {"type": "plain_text", "text": "📋 In HubSpot öffnen"},
+                "url": f"https://app.hubspot.com/contacts/{HUBSPOT_PORTAL_ID}/contact/{contact_id}",
+                "action_id": "open_hubspot_hot_lead",
+            }],
+        })
+
+    blocks.append({"type": "divider"})
+    return {"blocks": blocks}
 
 
 def _build_call_message(
@@ -107,34 +139,36 @@ def _build_call_message(
         if meetings_total > 0 else "0"
     )
 
+    dir_label = "Ausgehend" if direction.lower() == "outbound" else "Eingehend"
+
     return {
         "blocks": [
             {
                 "type": "header",
-                "text": {"type": "plain_text", "text": f"{dir_emoji} Meeting — {contact_name}"},
+                "text": {"type": "plain_text", "text": f"{dir_emoji} Gespräch — {contact_name}"},
             },
             {
                 "type": "section",
                 "fields": [
-                    {"type": "mrkdwn", "text": f"*Outcome:*\n{outcome}"},
-                    {"type": "mrkdwn", "text": f"*Direction:*\n{direction.capitalize()}"},
-                    {"type": "mrkdwn", "text": f"*Duration:*\n{duration_str}"},
-                    {"type": "mrkdwn", "text": f"*Time:*\n{timestamp}"},
+                    {"type": "mrkdwn", "text": f"*Ergebnis:*\n{outcome}"},
+                    {"type": "mrkdwn", "text": f"*Richtung:*\n{dir_label}"},
+                    {"type": "mrkdwn", "text": f"*Dauer:*\n{duration_str}"},
+                    {"type": "mrkdwn", "text": f"*Uhrzeit:*\n{timestamp}"},
                 ],
             },
             {
                 "type": "section",
                 "fields": [
-                    {"type": "mrkdwn", "text": f"*Anschläge heute:*\n{outbound_total_today} Outbound"},
-                    {"type": "mrkdwn", "text": f"*Meetings heute:*\n{meetings_str}"},
+                    {"type": "mrkdwn", "text": f"*Anschläge heute:*\n{outbound_total_today} ausgehend"},
+                    {"type": "mrkdwn", "text": f"*Gespräche heute:*\n{meetings_str}"},
                 ],
             },
             {
                 "type": "section",
                 "fields": [
-                    {"type": "mrkdwn", "text": f"*Calls (7d):*\n{calls_7d}"},
-                    {"type": "mrkdwn", "text": f"*Calls (30d):*\n{calls_30d}"},
-                    {"type": "mrkdwn", "text": f"*Calls (365d):*\n{calls_365d}"},
+                    {"type": "mrkdwn", "text": f"*Anrufe (7d):*\n{calls_7d}"},
+                    {"type": "mrkdwn", "text": f"*Anrufe (30d):*\n{calls_30d}"},
+                    {"type": "mrkdwn", "text": f"*Anrufe (365d):*\n{calls_365d}"},
                 ],
             },
             # HubSpot deep-link button — only shown when portal ID + contact ID are known
@@ -173,25 +207,13 @@ def _build_daily_summary(
     conversion_pct = (outbound_connected / outbound_total * 100) if outbound_total else 0.0
     total_talk_min = inbound_duration_sec // 60
 
-    # SECTION 1: Past 7 days — completed calls
-    lines = [
-        "*LETZTE 7 TAGE — Abgeschlossene Anrufe:*",
-        f"  Outbound Anschläge: {outbound_total}",
-        f"  Outbound Meetings: {outbound_connected}  ({conversion_pct:.1f}% conversion)",
-        f"  Inbound Meetings: {inbound_connected}",
-    ]
-    if inbound_connected > 0 and total_talk_min > 0:
-        lines.append(f"  Gesamte Gesprächszeit (Inbound): {total_talk_min}m")
-
-    lines.append("─" * 50)
-
-    # SECTION 2: Next 7 days — scheduled calls by tier
-    lines.append("*NÄCHSTE 7 TAGE — Eingeplante Anrufe:*")
-    lines.append(f"  🔥 Hot Tier: {scheduled_hot}")
-    lines.append(f"  🟡 Warm Tier: {scheduled_warm}")
-    lines.append(f"  🔵 Cold Tier: {scheduled_cold}")
-    lines.append(f"  ─────────────")
-    lines.append(f"  Gesamt eingeplant: {scheduled_total}")
+    # Conversion quality indicator
+    if conversion_pct >= 20:
+        conv_badge = "🟢"
+    elif conversion_pct >= 10:
+        conv_badge = "🟡"
+    else:
+        conv_badge = "🔴"
 
     return {
         "blocks": [
@@ -201,7 +223,30 @@ def _build_daily_summary(
             },
             {
                 "type": "section",
-                "text": {"type": "mrkdwn", "text": "\n".join(lines)},
+                "text": {"type": "mrkdwn", "text": "*LETZTE 7 TAGE — Abgeschlossene Anrufe*"},
+            },
+            {
+                "type": "section",
+                "fields": [
+                    {"type": "mrkdwn", "text": f"*Anschläge (Outbound):*\n{outbound_total}"},
+                    {"type": "mrkdwn", "text": f"*Gespräche (Outbound):*\n{outbound_connected}"},
+                    {"type": "mrkdwn", "text": f"*Conversion-Rate:*\n{conv_badge} {conversion_pct:.1f}%"},
+                    {"type": "mrkdwn", "text": f"*Gespräche (Inbound):*\n{inbound_connected}" + (f"  ({total_talk_min}m)" if total_talk_min else "")},
+                ],
+            },
+            {"type": "divider"},
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": "*NÄCHSTE 7 TAGE — Eingeplante Anrufe*"},
+            },
+            {
+                "type": "section",
+                "fields": [
+                    {"type": "mrkdwn", "text": f"*🔥 Hot:*\n{scheduled_hot}"},
+                    {"type": "mrkdwn", "text": f"*🟡 Warm:*\n{scheduled_warm}"},
+                    {"type": "mrkdwn", "text": f"*🔵 Cold:*\n{scheduled_cold}"},
+                    {"type": "mrkdwn", "text": f"*Gesamt:*\n{scheduled_total}"},
+                ],
             },
             {"type": "divider"},
         ]
@@ -321,7 +366,7 @@ def _build_decay_message(
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": "⚠️ *Inactivity decay detected.* Lead has not engaged recently — consider a re-activation campaign or remove from calling queue.",
+                    "text": "⚠️ *Score-Rückgang durch Inaktivität.* Lead hat sich länger nicht mehr gemeldet — Re-Aktivierungskampagne prüfen oder aus der Calling-Queue entfernen.",
                 },
             },
             {"type": "divider"},
