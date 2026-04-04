@@ -99,60 +99,9 @@ def _classify_list(created_at: datetime | None) -> str:
     return "fresh" if _is_fresh(created_at) else "warm"
 
 
-# Priority tag definitions — Kevin calls highest priority first
-PRIORITY_TAGS: list[tuple[str, float]] = [
-    ("priority-1-hot",     80.0),   # Score >= 80: call first
-    ("priority-2-warm",    60.0),   # Score 60-79: call second
-    ("priority-3-nurture", 30.0),   # Score 30-59: call third
-    # Score < 30: don't push to Aircall at all (handled in _should_dial)
-]
-
-# All priority tag values for cleanup when updating contacts
-ALL_PRIORITY_TAG_VALUES: frozenset[str] = frozenset(
-    tag for tag, _ in PRIORITY_TAGS
-)
-
-
-def _determine_priority_tag(score: float) -> str | None:
-    """Return the priority tag for a given score, or None if below threshold."""
-    for tag, threshold in PRIORITY_TAGS:
-        if score >= threshold:
-            return tag
-    return None
-
-
-def _build_tags(score: float, created_at: datetime | None, interest_category: str | None, list_key: str = "") -> list[str]:
-    """Build Aircall contact tags for the Closer to see during calls.
-
-    Uses short funnel names: HC (Hypnose), MC (Meditation), GC (Gesprächscoach).
-    Combined tag format: 'hc-fresh', 'mc-warm', 'eignungscheck'.
-
-    TASK B: Adds priority tags so Kevin calls hottest leads first:
-      score >= 80: 'priority-1-hot'
-      score 60-79: 'priority-2-warm'
-      score 30-59: 'priority-3-nurture'
-      score < 30:  not pushed to Aircall at all
-    """
-    # Short funnel mapping
-    _SHORT = {"hypnose": "HC", "meditation": "MC", "lifecoach": "GC"}
-    funnel_short = _SHORT.get(interest_category or "", interest_category or "")
-
-    tags = [f"score-{int(score)}"]
-
-    # Priority tag — Kevin sorts his queue by these
-    priority_tag = _determine_priority_tag(score)
-    if priority_tag:
-        tags.insert(0, priority_tag)
-
-    # Primary list tag (e.g. 'hc-fresh', 'eignungscheck')
-    if list_key:
-        tags.insert(0, list_key)
-
-    # Funnel short name as separate tag
-    if funnel_short:
-        tags.append(funnel_short)
-
-    return tags
+# NOTE: Aircall API does NOT support tags on contacts (only on calls).
+# All routing info (score, tier, funnel, hook) is written to the 'information' field
+# which Kevin sees during calls in the Power Dialer.
 
 
 def _headers() -> dict[str, str]:
@@ -260,11 +209,6 @@ async def add_to_power_dialer(
         )
         return None
 
-    # Resolve aircall_tag from list_key (e.g. 'hypnose_fresh' -> 'hc-fresh')
-    from batch.scorer import LISTS
-    aircall_tag = LISTS.get(list_key, {}).get("aircall_tag", list_key)
-    tags = _build_tags(score, created_at, interest_category, list_key=aircall_tag)
-
     # Use pre-built card from scorer if provided (V1: includes Kauf, Naechstes Produkt, Hook).
     # Fall back to _build_call_info header if no card was passed.
     existing_notes = lead.get("notes", "")
@@ -285,9 +229,11 @@ async def add_to_power_dialer(
     lead_with_info = {**lead, "notes": call_info}
 
     # Use shared client for both calls (connection reuse + retry on 429)
+    # NOTE: Aircall API does NOT support tags on contacts — only on calls.
+    # All routing info (score, tier, funnel) lives in the 'information' field.
     async with httpx.AsyncClient(timeout=timeout) as client:
-        # Step 1: Create/update contact with tags + call info in information field
-        contact_id = await _upsert_contact(client, lead_with_info, tags=tags)
+        # Step 1: Create/update contact with call info in information field
+        contact_id = await _upsert_contact(client, lead_with_info)
 
         # Step 2: Write scorer card as a NOTE on the contact
         # Notes appear directly in the Aircall UI panel (visible during calls)
@@ -299,84 +245,17 @@ async def add_to_power_dialer(
         return await _push_to_dialer_campaign(client, lead)
 
 
-async def _apply_tags(
-    client: httpx.AsyncClient,
-    contact_id: str,
-    desired_tags: list[str],
-    email: str = "",
-) -> None:
-    """Set exact tags on an Aircall contact via dedicated tag endpoints.
-
-    Aircall ignores 'tags' in PUT /contacts payload — tags must be managed
-    via POST /contacts/{id}/tags (add) and DELETE /contacts/{id}/tags/{name} (remove).
-
-    This function:
-    1. Reads current tags
-    2. Removes stale priority-* and score-* tags
-    3. Adds missing desired tags
-    """
-    try:
-        resp = await _aircall_request(
-            client, "get", f"{AIRCALL_BASE}/contacts/{contact_id}",
-        )
-        if resp.status_code != 200:
-            return
-
-        existing_tags = resp.json().get("contact", {}).get("tags", [])
-        existing_names = {
-            (t.get("name", "") if isinstance(t, dict) else str(t))
-            for t in existing_tags
-        }
-        desired_set = set(desired_tags)
-
-        # Remove stale tags: old priority-*, old score-*, anything not in desired set
-        for tag_name in existing_names:
-            should_remove = (
-                (tag_name in ALL_PRIORITY_TAG_VALUES and tag_name not in desired_set)
-                or (tag_name.startswith("score-") and tag_name not in desired_set)
-            )
-            if should_remove:
-                del_resp = await _aircall_request(
-                    client, "delete",
-                    f"{AIRCALL_BASE}/contacts/{contact_id}/tags/{tag_name}",
-                )
-                if del_resp.status_code in (200, 204):
-                    logger.debug("Aircall: removed stale tag '%s' from %s", tag_name, email)
-
-        # Add missing tags
-        for tag_name in desired_tags:
-            if tag_name not in existing_names:
-                add_resp = await _aircall_request(
-                    client, "post",
-                    f"{AIRCALL_BASE}/contacts/{contact_id}/tags",
-                    json={"tag": tag_name},
-                )
-                if add_resp.status_code in (200, 201):
-                    logger.debug("Aircall: added tag '%s' to %s", tag_name, email)
-                else:
-                    logger.warning(
-                        "Aircall: failed to add tag '%s' to %s: %s",
-                        tag_name, email, add_resp.status_code,
-                    )
-
-        logger.info("Aircall: tags synced for %s (id=%s): %s", email, contact_id, desired_tags)
-
-    except Exception as e:
-        # Tag sync is best-effort — don't fail the entire push
-        logger.debug("Aircall: tag sync error for %s: %s", email, e)
-
-
 async def _upsert_contact(
     client: httpx.AsyncClient,
     lead: dict[str, Any],
-    *,
-    tags: list[str] | None = None,
 ) -> str:
     """Create or update an Aircall contact. Returns the Aircall contact ID.
 
     Search-first approach: looks up the contact by phone/email before creating.
-    If found → PATCH (update info, tags). If not found → POST (create new).
-    This prevents duplicate contacts that lose their tags.
+    If found → PUT (update info). If not found → POST (create new).
+
+    NOTE: Aircall API does NOT support tags on contacts (only on calls).
+    All routing info lives in the 'information' field (score, tier, funnel, hook).
     """
     phone = lead.get("phone", "")
     email = lead.get("email", "")
@@ -407,25 +286,19 @@ async def _upsert_contact(
         "last_name":     lead.get("lastname", ""),
         "information":   lead.get("notes", ""),
     }
-    if tags:
-        payload["tags"] = tags
 
     if existing_id:
-        # Step 2a: PATCH existing contact (update info — tags set separately below)
-        update_payload = {k: v for k, v in payload.items() if k != "tags"}
+        # Step 2a: PUT existing contact (update info)
         response = await _aircall_request(
             client, "put", f"{AIRCALL_BASE}/contacts/{existing_id}",
-            json=update_payload,
+            json=payload,
         )
         if response.status_code in (200, 201):
             logger.info("Aircall: updated contact %s → id=%s", email, existing_id)
-            # Tags via dedicated endpoint (PUT ignores tags in payload)
-            if tags:
-                await _apply_tags(client, existing_id, tags, email)
             return existing_id
         else:
             logger.warning(
-                "Aircall: PATCH failed for %s (id=%s): %s — falling through to POST",
+                "Aircall: PUT failed for %s (id=%s): %s — falling through to POST",
                 email, existing_id, response.status_code,
             )
 
@@ -446,10 +319,6 @@ async def _upsert_contact(
 
     contact_id = str(response.json().get("contact", {}).get("id", ""))
     logger.info("Aircall: created contact %s → id=%s", email, contact_id)
-
-    # Tags via dedicated endpoint (also for new contacts — POST may ignore tags too)
-    if contact_id and tags:
-        await _apply_tags(client, contact_id, tags, email)
 
     return contact_id
 

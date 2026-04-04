@@ -9,7 +9,6 @@ import httpx
 from integrations.aircall import (
     _is_fresh,
     _should_dial,
-    _build_tags,
     add_to_power_dialer,
 )
 
@@ -79,62 +78,6 @@ class TestShouldDial:
     def test_is_fresh_flag_blocked_for_booked(self):
         """is_fresh=True still cannot override booked tier."""
         assert _should_dial(15, None, lead_tier="0_booked", is_fresh=True) is False
-
-
-class TestBuildTags:
-    def test_fresh_lead_tags_with_list_key(self):
-        created = datetime.now(timezone.utc) - timedelta(hours=1)
-        tags = _build_tags(75, created, "hypnose", list_key="hc-fresh")
-        assert "score-75" in tags
-        assert "hc-fresh" in tags
-        assert "HC" in tags
-        assert "priority-2-warm" in tags  # 60 <= 75 < 80
-
-    def test_warm_lead_tags_with_list_key(self):
-        created = datetime.now(timezone.utc) - timedelta(days=5)
-        tags = _build_tags(60, created, "meditation", list_key="mc-warm")
-        assert "score-60" in tags
-        assert "mc-warm" in tags
-        assert "MC" in tags
-        assert "priority-2-warm" in tags  # 60 <= 60 < 80
-
-    def test_no_interest_category(self):
-        created = datetime.now(timezone.utc) - timedelta(days=5)
-        tags = _build_tags(55, created, None)
-        assert "score-55" in tags
-        assert "priority-3-nurture" in tags  # 30 <= 55 < 60
-
-    def test_no_interest_category_priority(self):
-        """Score 55 without interest -> has priority-3-nurture tag."""
-        created = datetime.now(timezone.utc) - timedelta(days=5)
-        tags = _build_tags(55, created, None)
-        assert "score-55" in tags
-        assert "priority-3-nurture" in tags  # 30 <= 55 < 60
-
-    def test_priority_1_hot_tag(self):
-        """Score >= 80 gets priority-1-hot tag."""
-        created = datetime.now(timezone.utc) - timedelta(days=5)
-        tags = _build_tags(85, created, "hypnose", list_key="hc-warm")
-        assert "priority-1-hot" in tags
-        assert "score-85" in tags
-
-    def test_priority_2_warm_tag(self):
-        """Score 60-79 gets priority-2-warm tag."""
-        created = datetime.now(timezone.utc) - timedelta(days=5)
-        tags = _build_tags(65, created, "meditation")
-        assert "priority-2-warm" in tags
-
-    def test_priority_3_nurture_tag(self):
-        """Score 30-59 gets priority-3-nurture tag."""
-        created = datetime.now(timezone.utc) - timedelta(days=5)
-        tags = _build_tags(45, created, "lifecoach")
-        assert "priority-3-nurture" in tags
-
-    def test_no_priority_tag_below_30(self):
-        """Score < 30 gets no priority tag."""
-        created = datetime.now(timezone.utc) - timedelta(days=5)
-        tags = _build_tags(15, created, None)
-        assert not any(t.startswith("priority-") for t in tags)
 
 
 class TestAddToPowerDialer:
@@ -241,8 +184,7 @@ class TestUpsertContact:
     @pytest.mark.asyncio
     @patch("integrations.aircall.AIRCALL_API_ID", "test-id")
     @patch("integrations.aircall.AIRCALL_API_TOKEN", "test-token")
-    @patch("integrations.aircall._apply_tags", new_callable=AsyncMock)
-    async def test_success_returns_contact_id(self, mock_apply_tags):
+    async def test_success_returns_contact_id(self):
         from integrations.aircall import _upsert_contact
 
         mock_response = MagicMock()
@@ -251,7 +193,7 @@ class TestUpsertContact:
 
         mock_client = AsyncMock()
         with patch("integrations.aircall._aircall_request", return_value=mock_response):
-            result = await _upsert_contact(mock_client, self.LEAD, tags=["score-75", "hc-fresh"])
+            result = await _upsert_contact(mock_client, self.LEAD)
             assert result == "12345"
 
     @pytest.mark.asyncio
@@ -263,7 +205,7 @@ class TestUpsertContact:
         lead_no_phone = {**self.LEAD, "phone": ""}
         mock_client = AsyncMock()
         with pytest.raises(ValueError, match="No phone number"):
-            await _upsert_contact(mock_client, lead_no_phone, tags=[])
+            await _upsert_contact(mock_client, lead_no_phone)
 
     @pytest.mark.asyncio
     @patch("integrations.aircall.AIRCALL_API_ID", "test-id")
@@ -281,21 +223,7 @@ class TestUpsertContact:
         mock_client = AsyncMock()
         with patch("integrations.aircall._aircall_request", return_value=mock_response):
             with pytest.raises(httpx.HTTPStatusError):
-                await _upsert_contact(mock_client, self.LEAD, tags=[])
-
-    @pytest.mark.asyncio
-    @patch("integrations.aircall.AIRCALL_API_ID", "test-id")
-    @patch("integrations.aircall.AIRCALL_API_TOKEN", "test-token")
-    async def test_no_tags_omits_tags_key(self):
-        from integrations.aircall import _upsert_contact
-
-        mock_response = MagicMock()
-        mock_response.status_code = 201
-        mock_response.json.return_value = {"contact": {"id": 999}}
-
-        mock_client = AsyncMock()
-        with patch("integrations.aircall._aircall_request", return_value=mock_response):
-            await _upsert_contact(mock_client, self.LEAD, tags=None)
+                await _upsert_contact(mock_client, self.LEAD)
 
 
 class TestPushToDialerCampaign:
