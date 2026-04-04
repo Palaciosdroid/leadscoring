@@ -299,17 +299,21 @@ async def add_to_power_dialer(
         return await _push_to_dialer_campaign(client, lead)
 
 
-async def _cleanup_stale_priority_tags(
+async def _apply_tags(
     client: httpx.AsyncClient,
     contact_id: str,
-    new_priority_tag: str | None,
+    desired_tags: list[str],
     email: str = "",
 ) -> None:
-    """Remove old priority tags from an Aircall contact before applying new ones.
+    """Set exact tags on an Aircall contact via dedicated tag endpoints.
 
-    Aircall tags accumulate — we need to explicitly remove stale priority-*
-    tags when a lead's score changes tier (e.g. priority-3-nurture -> priority-1-hot).
-    Also removes old 'score-NN' tags to keep things clean.
+    Aircall ignores 'tags' in PUT /contacts payload — tags must be managed
+    via POST /contacts/{id}/tags (add) and DELETE /contacts/{id}/tags/{name} (remove).
+
+    This function:
+    1. Reads current tags
+    2. Removes stale priority-* and score-* tags
+    3. Adds missing desired tags
     """
     try:
         resp = await _aircall_request(
@@ -319,32 +323,47 @@ async def _cleanup_stale_priority_tags(
             return
 
         existing_tags = resp.json().get("contact", {}).get("tags", [])
-        # Aircall returns tags as [{"id": ..., "name": "tag-name"}, ...]
-        tags_to_remove = []
-        for tag_obj in existing_tags:
-            tag_name = tag_obj.get("name", "") if isinstance(tag_obj, dict) else str(tag_obj)
-            # Remove all old priority tags except the current one
-            if tag_name in ALL_PRIORITY_TAG_VALUES and tag_name != new_priority_tag:
-                tags_to_remove.append(tag_name)
-            # Remove old score-NN tags (they get replaced with current score)
-            if tag_name.startswith("score-"):
-                tags_to_remove.append(tag_name)
+        existing_names = {
+            (t.get("name", "") if isinstance(t, dict) else str(t))
+            for t in existing_tags
+        }
+        desired_set = set(desired_tags)
 
-        if not tags_to_remove:
-            return
-
-        # Aircall API: DELETE /v1/contacts/{id}/tags/{tag_name}
-        for tag_name in tags_to_remove:
-            del_resp = await _aircall_request(
-                client, "delete",
-                f"{AIRCALL_BASE}/contacts/{contact_id}/tags/{tag_name}",
+        # Remove stale tags: old priority-*, old score-*, anything not in desired set
+        for tag_name in existing_names:
+            should_remove = (
+                (tag_name in ALL_PRIORITY_TAG_VALUES and tag_name not in desired_set)
+                or (tag_name.startswith("score-") and tag_name not in desired_set)
             )
-            if del_resp.status_code in (200, 204):
-                logger.debug("Aircall: removed stale tag '%s' from contact %s", tag_name, email)
+            if should_remove:
+                del_resp = await _aircall_request(
+                    client, "delete",
+                    f"{AIRCALL_BASE}/contacts/{contact_id}/tags/{tag_name}",
+                )
+                if del_resp.status_code in (200, 204):
+                    logger.debug("Aircall: removed stale tag '%s' from %s", tag_name, email)
+
+        # Add missing tags
+        for tag_name in desired_tags:
+            if tag_name not in existing_names:
+                add_resp = await _aircall_request(
+                    client, "post",
+                    f"{AIRCALL_BASE}/contacts/{contact_id}/tags",
+                    json={"tag": tag_name},
+                )
+                if add_resp.status_code in (200, 201):
+                    logger.debug("Aircall: added tag '%s' to %s", tag_name, email)
+                else:
+                    logger.warning(
+                        "Aircall: failed to add tag '%s' to %s: %s",
+                        tag_name, email, add_resp.status_code,
+                    )
+
+        logger.info("Aircall: tags synced for %s (id=%s): %s", email, contact_id, desired_tags)
 
     except Exception as e:
-        # Tag cleanup is best-effort — don't fail the entire push
-        logger.debug("Aircall: tag cleanup error for %s: %s", email, e)
+        # Tag sync is best-effort — don't fail the entire push
+        logger.debug("Aircall: tag sync error for %s: %s", email, e)
 
 
 async def _upsert_contact(
@@ -392,13 +411,17 @@ async def _upsert_contact(
         payload["tags"] = tags
 
     if existing_id:
-        # Step 2a: PATCH existing contact (update info + tags)
+        # Step 2a: PATCH existing contact (update info — tags set separately below)
+        update_payload = {k: v for k, v in payload.items() if k != "tags"}
         response = await _aircall_request(
             client, "put", f"{AIRCALL_BASE}/contacts/{existing_id}",
-            json=payload,
+            json=update_payload,
         )
         if response.status_code in (200, 201):
-            logger.info("Aircall: updated contact %s → id=%s tags=%s", email, existing_id, tags)
+            logger.info("Aircall: updated contact %s → id=%s", email, existing_id)
+            # Tags via dedicated endpoint (PUT ignores tags in payload)
+            if tags:
+                await _apply_tags(client, existing_id, tags, email)
             return existing_id
         else:
             logger.warning(
@@ -422,12 +445,11 @@ async def _upsert_contact(
         response.raise_for_status()
 
     contact_id = str(response.json().get("contact", {}).get("id", ""))
-    logger.info("Aircall: created contact %s → id=%s tags=%s", email, contact_id, tags)
+    logger.info("Aircall: created contact %s → id=%s", email, contact_id)
 
-    # Clean up stale priority/score tags from previous scoring runs
+    # Tags via dedicated endpoint (also for new contacts — POST may ignore tags too)
     if contact_id and tags:
-        new_priority = next((t for t in tags if t in ALL_PRIORITY_TAG_VALUES), None)
-        await _cleanup_stale_priority_tags(client, contact_id, new_priority, email)
+        await _apply_tags(client, contact_id, tags, email)
 
     return contact_id
 

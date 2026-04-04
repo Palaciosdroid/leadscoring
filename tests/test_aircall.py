@@ -241,8 +241,8 @@ class TestUpsertContact:
     @pytest.mark.asyncio
     @patch("integrations.aircall.AIRCALL_API_ID", "test-id")
     @patch("integrations.aircall.AIRCALL_API_TOKEN", "test-token")
-    @patch("integrations.aircall._cleanup_stale_priority_tags", new_callable=AsyncMock)
-    async def test_success_returns_contact_id(self, mock_cleanup):
+    @patch("integrations.aircall._apply_tags", new_callable=AsyncMock)
+    async def test_success_returns_contact_id(self, mock_apply_tags):
         from integrations.aircall import _upsert_contact
 
         mock_response = MagicMock()
