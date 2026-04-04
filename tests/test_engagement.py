@@ -12,8 +12,9 @@ from scoring.engagement import (
 
 class TestRecencyMultiplier:
     def test_within_7_days(self):
-        assert recency_multiplier(0) == 1.3   # <=3d boost
-        assert recency_multiplier(1) == 1.3
+        assert recency_multiplier(0) == 1.5   # <=1d same-day boost (C1 opt)
+        assert recency_multiplier(1) == 1.5
+        assert recency_multiplier(2) == 1.3   # <=3d very recent boost
         assert recency_multiplier(3) == 1.3
         assert recency_multiplier(5) == 1.0   # 4-7d normal
         assert recency_multiplier(7) == 1.0

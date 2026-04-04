@@ -40,7 +40,7 @@ HUBSPOT_BASE = "https://api.hubapi.com"
 HUBSPOT_TOKEN = os.environ.get("HUBSPOT_ACCESS_TOKEN", "")
 
 # Only re-score leads updated in the last N days to keep API calls low
-RESCORE_WINDOW_DAYS = int(os.environ.get("RESCORE_WINDOW_DAYS", "30"))
+RESCORE_WINDOW_DAYS = int(os.environ.get("RESCORE_WINDOW_DAYS", "14"))
 
 # Score thresholds (reverted to v1 — v2 thresholds were too aggressive,
 # caused 152 leads to drop from Warm to Cold and disappear from Aircall)
@@ -568,6 +568,7 @@ def _build_aircall_card(
     """
     funnel_label = (funnel or "unknown").title()
     lines = [
+        f"⭐ Priorität: {score:.0f}/100",
         f"WARM -- {funnel_label} | Score: {score:.0f}"
         if tier_label == "WARM" else
         f"{tier_label} -- {funnel_label} | Score: {score:.0f}",
@@ -716,11 +717,25 @@ async def run_batch_scoring() -> None:
             browser_scored = map_browser_events_batch(browser_events)
             scored_events.extend(browser_scored)
 
-            # Calculate engagement score
-            engagement_result = calculate_engagement_score(scored_events)
+            # Build flat product key list for scoring signals + interest fallback
+            # Include both product_key (e.g. "hc") and lowercased product_name
+            # (e.g. "inner journey") so both PURCHASE_BONUS and funnel fallback fire.
+            purchased_product_keys: list[str] = []
+            for p in purchases:
+                if pk := (p.get("product_key") or "").lower().strip():
+                    purchased_product_keys.append(pk)
+                if pn := (p.get("product_name") or "").lower().strip():
+                    purchased_product_keys.append(pn)
 
-            # Detect interest category
-            interest_result = detect_interest_category(scored_events)
+            # Calculate engagement score (purchase bonus applied inside)
+            engagement_result = calculate_engagement_score(
+                scored_events, purchased_products=purchased_product_keys,
+            )
+
+            # Detect interest category (purchased_products fallback for no-URL leads)
+            interest_result = detect_interest_category(
+                scored_events, purchased_products=purchased_product_keys,
+            )
 
             # Combine scores
             scoring = combine_scores(engagement_result, interest_result)
@@ -978,7 +993,7 @@ async def run_batch_scoring() -> None:
                     "score": score,
                     "eignungscheck": qualifies_eignungscheck,
                     "call_booked": call_booked,
-                    "purchased_products": purchased_funnels,
+                    "purchased_products": purchased_product_keys,  # raw keys + names for hook rules
                     "visited_offer_page": offer_signals.get("visited_offer"),
                     "visited_checkout": offer_signals.get("visited_checkout"),
                     "watched_video_on_offer": offer_signals.get("video_on_offer"),

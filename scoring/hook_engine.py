@@ -60,12 +60,36 @@ def _rule_video_watched(ctx: dict) -> str | None:
 
 
 def _rule_checkout_abandoned(ctx: dict) -> str | None:
-    """Checkout visited but no purchase — classic cart abandonment."""
+    """Checkout visited but no full Ausbildung yet — cart abandonment or upsell."""
     visited_checkout = ctx.get("checkout_visited") or ctx.get("visited_checkout")
-    if visited_checkout and not ctx.get("purchased_products"):
+    # Only suppress for leads who already own a full Ausbildung (hc/mc/gc)
+    has_ausbildung = any(
+        p.lower() in ("hc", "mc", "gc") for p in (ctx.get("purchased_products") or [])
+    )
+    if visited_checkout and not has_ausbildung:
         return (
             "Du warst schon fast dabei "
             "— was hat dich noch zurückgehalten?"
+        )
+    return None
+
+
+def _rule_inner_journey_buyer(ctx: dict) -> str | None:
+    """Has Inner Journey bundle but no full Ausbildung — upsell opener."""
+    purchased = ctx.get("purchased_products") or []
+    has_inner_journey = any(
+        "inner_journey" in p.lower() or "inner journey" in p.lower()
+        for p in purchased
+    )
+    # Only fire if no full Ausbildung purchased yet
+    has_ausbildung = any(
+        p.lower() in ("hc", "mc", "gc")
+        for p in purchased
+    )
+    if has_inner_journey and not has_ausbildung:
+        return (
+            "Du kennst schon das Inner Journey Paket "
+            "— was hat dir daran am besten gefallen?"
         )
     return None
 
@@ -172,6 +196,7 @@ def _rule_fallback(ctx: dict) -> str | None:
 _RULES: list = [
     _rule_video_watched,          # Watched VSL video (highest intent)
     _rule_checkout_abandoned,     # Was on checkout but didn't buy
+    _rule_inner_journey_buyer,    # Has Inner Journey but no Ausbildung (upsell)
     _rule_offer_video_watched,    # Watched video on offer page
     _rule_eignungscheck_no_call,  # Did qualification check
     _rule_pricing_viewed,         # Looked at pricing/costs

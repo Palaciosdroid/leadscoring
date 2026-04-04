@@ -11,6 +11,35 @@ from collections import defaultdict
 from typing import Any
 
 # ---------------------------------------------------------------------------
+# Purchased-products fallback mapping
+# ---------------------------------------------------------------------------
+_PURCHASE_CATEGORY_MAP: dict[str, str] = {
+    "hc":         "hypnose",
+    "hypnose":    "hypnose",
+    "mc":         "meditation",
+    "meditation": "meditation",
+    "gc":         "lifecoach",
+    "lifecoach":  "lifecoach",
+    "life-coach": "lifecoach",
+    "life_coach": "lifecoach",
+}
+
+
+def _infer_from_purchased(purchased_products: list[str]) -> str | None:
+    """
+    Infer interest category from purchased product keys when URL analysis yields nothing.
+
+    Checks each product string against known category keywords.
+    First match wins (order: hypnose > meditation > lifecoach).
+    """
+    for product in purchased_products:
+        product_lower = product.lower()
+        for key, category in _PURCHASE_CATEGORY_MAP.items():
+            if key in product_lower:
+                return category
+    return None
+
+# ---------------------------------------------------------------------------
 # URL / event keyword mapping per product category
 # ---------------------------------------------------------------------------
 CATEGORY_SIGNALS: dict[str, list[str]] = {
@@ -68,7 +97,10 @@ def _extract_category_from_url(url: str) -> str | None:
     return None
 
 
-def detect_interest_category(events: list[dict[str, Any]]) -> dict[str, Any]:
+def detect_interest_category(
+    events: list[dict[str, Any]],
+    purchased_products: list[str] | None = None,
+) -> dict[str, Any]:
     """
     Analyse events and return the most likely product interest.
 
@@ -77,10 +109,14 @@ def detect_interest_category(events: list[dict[str, Any]]) -> dict[str, Any]:
       - url: str (optional, for page events)
       - metadata: dict (optional, e.g. video_title, resource_name)
 
+    If URL/event analysis yields no category, falls back to inferring
+    from purchased_products (e.g. "hc" → "hypnose").
+
     Returns:
       - category: str | None  ('hypnose' | 'lifecoach' | 'meditation' | None)
       - confidence: float      (0.0 - 1.0)
       - category_scores: dict  (raw scores per category)
+      - inferred_from_purchase: bool  (True if fallback was used)
     """
     category_scores: dict[str, float] = defaultdict(float)
 
@@ -106,7 +142,17 @@ def detect_interest_category(events: list[dict[str, Any]]) -> dict[str, Any]:
                     category_scores[cat] += weight * 0.5  # metadata = half weight
 
     if not category_scores:
-        return {"category": None, "confidence": 0.0, "category_scores": {}}
+        # Fallback: infer from purchased products if URL analysis found nothing
+        if purchased_products:
+            inferred = _infer_from_purchased(purchased_products)
+            if inferred:
+                return {
+                    "category": inferred,
+                    "confidence": 0.5,  # moderate confidence — purchase signal, not behavioral
+                    "category_scores": {},
+                    "inferred_from_purchase": True,
+                }
+        return {"category": None, "confidence": 0.0, "category_scores": {}, "inferred_from_purchase": False}
 
     top_category = max(category_scores, key=lambda c: category_scores[c])
     total = sum(category_scores.values())
@@ -116,4 +162,5 @@ def detect_interest_category(events: list[dict[str, Any]]) -> dict[str, Any]:
         "category": top_category,
         "confidence": confidence,
         "category_scores": dict(category_scores),
+        "inferred_from_purchase": False,
     }
