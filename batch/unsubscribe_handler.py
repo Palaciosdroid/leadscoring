@@ -12,6 +12,7 @@ from typing import Any
 
 from integrations.aircall import remove_from_power_dialer
 from integrations.hubspot import remove_from_lists
+from batch.scorer import LISTS
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +41,8 @@ async def handle_unsubscribe(
 
     # Step 1: Remove from HubSpot lists
     try:
-        removed = await remove_from_lists(contact_id)
+        scoring_list_ids = [v["hubspot_list_id"] for v in LISTS.values()]
+        removed = await remove_from_lists(contact_id, list_ids=scoring_list_ids)
         results["removed_from_lists"] = removed
         if removed:
             logger.info("unsubscribe_handler: removed %s from HubSpot lists", email)

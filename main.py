@@ -253,21 +253,28 @@ app = FastAPI(
 WEBHOOK_SECRET = os.environ.get("CIO_WEBHOOK_SECRET", "")
 DEBUG_API_KEY = os.environ.get("DEBUG_API_KEY", "")
 
-# Startup validation — warn about missing critical secrets
-_REQUIRED_ENV_VARS = [
+# Startup validation — fail-fast for critical secrets, warn for optional ones
+_CRITICAL_ENV_VARS = [
     "HUBSPOT_ACCESS_TOKEN",
     "SUPABASE_URL",
     "SUPABASE_SERVICE_KEY",
+]
+_OPTIONAL_ENV_VARS = [
     "AIRCALL_API_ID",
     "AIRCALL_API_TOKEN",
     "DEBUG_API_KEY",
-    "CIO_WEBHOOK_SECRET",   # Required — skip-when-empty silently opens CIO endpoint to anyone
+    "CIO_WEBHOOK_SECRET",   # When missing, CIO webhook endpoint accepts unsigned requests
 ]
-_missing = [v for v in _REQUIRED_ENV_VARS if not os.environ.get(v)]
-if _missing:
-    import logging as _startup_log
-    _startup_log.getLogger(__name__).warning(
-        "⚠️  Missing required environment variables: %s  — some features will fail.", _missing
+_missing_critical = [v for v in _CRITICAL_ENV_VARS if not os.environ.get(v)]
+if _missing_critical:
+    raise EnvironmentError(
+        f"Missing CRITICAL environment variables: {_missing_critical} — refusing to start. "
+        "Set these in Railway or .env before deploying."
+    )
+_missing_optional = [v for v in _OPTIONAL_ENV_VARS if not os.environ.get(v)]
+if _missing_optional:
+    logging.getLogger(__name__).warning(
+        "Missing optional environment variables: %s — some features will be degraded.", _missing_optional
     )
 
 

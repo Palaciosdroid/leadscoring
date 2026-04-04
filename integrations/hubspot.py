@@ -591,6 +591,7 @@ async def get_contact_events(contact_id: str) -> list[dict[str, Any]]:
 async def remove_from_lists(
     contact_id: str,
     *,
+    list_ids: list[int] | None = None,
     timeout: float = 10.0,
 ) -> bool:
     """
@@ -601,14 +602,20 @@ async def remove_from_lists(
     Returns True if no unexpected errors occurred.
 
     Accepts either a numeric HubSpot ID or email — resolves email automatically.
+
+    Args:
+        list_ids: Override which list IDs to clear. When omitted, falls back to the
+                  hardcoded default set (stays in sync with batch/scorer.py LISTS).
+                  Pass `[v["hubspot_list_id"] for v in LISTS.values()]` from scorer.py
+                  to keep it fully dynamic without circular imports.
     """
     if not ACCESS_TOKEN or not contact_id:
         logger.warning("remove_from_lists: missing token or contact_id")
         return False
 
-    # All scoring list IDs defined in batch/scorer.py LISTS dict.
-    # We try each; HubSpot returns 204 on success, 404 if contact not a member.
-    _SCORING_LIST_IDS = [352, 362, 363, 364, 365, 366, 367, 368, 369, 370]
+    # Fallback: hardcoded IDs matching batch/scorer.py LISTS dict.
+    # Override via list_ids parameter to stay in sync automatically.
+    _SCORING_LIST_IDS = list_ids or [352, 362, 363, 364, 365, 366, 367, 368, 369, 370]
 
     removed_count = 0
     error_count = 0
