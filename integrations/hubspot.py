@@ -6,7 +6,7 @@ Uses HubSpot Private App token (HUBSPOT_ACCESS_TOKEN env var).
 
 import os
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
 import httpx
@@ -595,64 +595,54 @@ async def remove_from_lists(
     timeout: float = 10.0,
 ) -> bool:
     """
-    Remove a contact from all active HubSpot lists (triggered on unsubscribe).
+    Remove a contact from all known HubSpot scoring lists (triggered on unsubscribe).
 
-    Queries list memberships, then removes the contact from each list.
-    Returns True if successful, False otherwise.
+    Attempts removal from each scoring list via HubSpot Lists API v3.
+    Returns 404 (contact not in that list) is treated as success — not an error.
+    Returns True if no unexpected errors occurred.
 
-    Used in unsubscribe automation workflow.
+    Note: contact_id must be a numeric HubSpot record ID (not email).
     """
     if not ACCESS_TOKEN or not contact_id:
         logger.warning("remove_from_lists: missing token or contact_id")
         return False
 
+    # All scoring list IDs defined in batch/scorer.py LISTS dict.
+    # We try each; HubSpot returns 204 on success, 404 if contact not a member.
+    _SCORING_LIST_IDS = [352, 362, 363, 364, 365, 366, 367, 368, 369, 370]
+
+    removed_count = 0
+    error_count = 0
+
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            # Step 1: Get all list memberships for this contact
-            list_response = await client.get(
-                f"{HUBSPOT_BASE}/crm/v3/objects/contacts/{contact_id}/associations/lists",
-                headers=_headers(),
-            )
-
-            if list_response.status_code != 200:
-                logger.warning(
-                    "remove_from_lists: failed to fetch list memberships for %s: %s",
-                    contact_id, list_response.status_code,
-                )
-                return False
-
-            associations = list_response.json().get("results", [])
-            list_ids = [a.get("id") for a in associations if a.get("id")]
-
-            if not list_ids:
-                logger.info("remove_from_lists: %s not in any lists", contact_id)
-                return True  # Not in any lists, so mission accomplished
-
-            # Step 2: Remove contact from each list
-            removed_count = 0
-            for list_id in list_ids:
-                remove_response = await client.delete(
-                    f"{HUBSPOT_BASE}/crm/v3/objects/lists/{list_id}/memberships",
-                    headers=_headers(),
-                    json={"inputs": [{"id": contact_id}]},
-                )
-
-                if remove_response.status_code in (200, 204):
-                    removed_count += 1
-                    logger.debug("remove_from_lists: removed %s from list %s", contact_id, list_id)
-                else:
-                    logger.warning(
-                        "remove_from_lists: failed to remove %s from list %s: %s",
-                        contact_id, list_id, remove_response.status_code,
+            for list_id in _SCORING_LIST_IDS:
+                try:
+                    resp = await client.put(
+                        f"{HUBSPOT_BASE}/crm/v3/lists/{list_id}/memberships/remove",
+                        headers=_headers(),
+                        json={"recordIds": [contact_id]},
                     )
+                    if resp.status_code in (200, 204):
+                        removed_count += 1
+                        logger.debug("remove_from_lists: removed %s from list %s", contact_id, list_id)
+                    elif resp.status_code == 404:
+                        pass  # Contact not in this list — expected
+                    else:
+                        error_count += 1
+                        logger.warning(
+                            "remove_from_lists: list %s returned %s for %s",
+                            list_id, resp.status_code, contact_id,
+                        )
+                except Exception as e:
+                    error_count += 1
+                    logger.warning("remove_from_lists: error for list %s, contact %s: %s", list_id, contact_id, e)
 
-            success = removed_count == len(list_ids)
-            if success:
-                logger.info("remove_from_lists: successfully removed %s from %d list(s)", contact_id, removed_count)
-            else:
-                logger.warning("remove_from_lists: removed from %d/%d lists for %s", removed_count, len(list_ids), contact_id)
-
-            return success
+        logger.info(
+            "remove_from_lists: %s removed from %d lists (errors: %d)",
+            contact_id, removed_count, error_count,
+        )
+        return error_count == 0
 
     except Exception as e:
         logger.error("remove_from_lists: exception for %s: %s", contact_id, e)
