@@ -332,7 +332,6 @@ async def get_latest_call_for_contact(
     created_str = props.get("hs_createdate") or props.get("hs_timestamp")
     if created_str:
         try:
-            from datetime import timedelta
             created_dt = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
             if datetime.now(tz=timezone.utc) - created_dt > timedelta(minutes=max_age_minutes):
                 logger.info("Latest call for contact %s is older than %dm — skipping", contact_id, max_age_minutes)
@@ -598,10 +597,10 @@ async def remove_from_lists(
     Remove a contact from all known HubSpot scoring lists (triggered on unsubscribe).
 
     Attempts removal from each scoring list via HubSpot Lists API v3.
-    Returns 404 (contact not in that list) is treated as success — not an error.
+    404 (contact not in that list) is treated as success — not an error.
     Returns True if no unexpected errors occurred.
 
-    Note: contact_id must be a numeric HubSpot record ID (not email).
+    Accepts either a numeric HubSpot ID or email — resolves email automatically.
     """
     if not ACCESS_TOKEN or not contact_id:
         logger.warning("remove_from_lists: missing token or contact_id")
@@ -616,27 +615,36 @@ async def remove_from_lists(
 
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
+            # Resolve email → numeric HubSpot ID (Lists API requires numeric IDs)
+            hs_id = contact_id
+            if _is_email(contact_id):
+                resolved = await _resolve_hubspot_id(contact_id, client)
+                if not resolved:
+                    logger.warning("remove_from_lists: contact not found in HubSpot: %s", contact_id)
+                    return False
+                hs_id = resolved
+
             for list_id in _SCORING_LIST_IDS:
                 try:
                     resp = await client.put(
                         f"{HUBSPOT_BASE}/crm/v3/lists/{list_id}/memberships/remove",
                         headers=_headers(),
-                        json={"recordIds": [contact_id]},
+                        json={"recordIds": [hs_id]},
                     )
                     if resp.status_code in (200, 204):
                         removed_count += 1
-                        logger.debug("remove_from_lists: removed %s from list %s", contact_id, list_id)
+                        logger.debug("remove_from_lists: removed %s from list %s", hs_id, list_id)
                     elif resp.status_code == 404:
                         pass  # Contact not in this list — expected
                     else:
                         error_count += 1
                         logger.warning(
                             "remove_from_lists: list %s returned %s for %s",
-                            list_id, resp.status_code, contact_id,
+                            list_id, resp.status_code, hs_id,
                         )
                 except Exception as e:
                     error_count += 1
-                    logger.warning("remove_from_lists: error for list %s, contact %s: %s", list_id, contact_id, e)
+                    logger.warning("remove_from_lists: error for list %s, contact %s: %s", list_id, hs_id, e)
 
         logger.info(
             "remove_from_lists: %s removed from %d lists (errors: %d)",
