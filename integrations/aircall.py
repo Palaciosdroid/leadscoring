@@ -6,11 +6,14 @@ Pushes scored leads into Kevin's Power Dialer campaign as two virtual lists:
   🟡 Warm  — Hot + Warm tier (score ≥ 40) → follow-up queue
 
 Cold + Disqualified leads stay in CIO nurturing only — no Aircall push.
-Both lists feed the same Power Dialer queue.  Kevin sees the tag
-("fresh" vs "warm") during the call so he knows the context.
+Both lists feed the same Power Dialer queue.  Kevin sees the score card
+in the contact's 'information' field during the call.
+
+NOTE: Aircall API does NOT support tags on contacts (only on calls).
+All routing info (score, tier, funnel, hook) lives in the 'information' field.
 
 Flow:
-  1. Create/update Aircall contact with tags (list, score-XX, Interest Category)
+  1. Create/update Aircall contact with score card in 'information' field
   2. Push phone number into the Closer's Dialer Campaign
 
 Docs: https://developer.aircall.io/api-references/
