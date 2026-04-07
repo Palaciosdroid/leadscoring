@@ -1085,9 +1085,10 @@ async def run_batch_scoring() -> None:
                     purchases=purchases,
                 )
 
-            # Store card in HubSpot as lead_call_card property (visible in contact record)
-            if aircall_card:
-                hs_properties["lead_call_card"] = aircall_card
+            # NOTE: lead_call_card property does NOT exist in HubSpot schema.
+            # Card content is written as a timeline note via Step 4c instead.
+            # Do NOT add lead_call_card to hs_properties — it causes 400 errors
+            # on the batch update endpoint and silently kills all property updates.
 
             # Queue for HubSpot NOTE creation (separate from properties)
             if aircall_card:
