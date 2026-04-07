@@ -49,6 +49,9 @@ SCORE_HOT = 65       # >= 65 -> same list as warm, tagged hot
 FRESH_WINDOW = timedelta(days=7)  # Wave 4: was 72h, now 7d
 FRESH_MIN_SCORE = 10  # fresh leads need at least this to enter Aircall (avoids single page_visited)
 
+# Human-readable tier labels for dormant leads (use stored old_tier value)
+_OLD_TIER_LABELS: dict[str, str] = {"1_hot": "HOT", "2_warm": "WARM"}
+
 # Cooldown after call — prevent Kevin from calling the same person repeatedly
 COOLDOWN_ANSWERED_HOURS = 7 * 24      # 7 days after answered call
 COOLDOWN_NO_ANSWER_HOURS = 3 * 24     # 3 days after no-answer
@@ -987,6 +990,12 @@ async def run_batch_scoring() -> None:
                 purchases=purchases,
             )
 
+            # For dormant Hot/Warm leads: preserve stored tier in HubSpot.
+            # Without this, the batch would write lead_tier="3_cold" (score=0)
+            # and on the next run is_dormant_warm=False → lead vanishes from Aircall.
+            if is_dormant_warm:
+                hs_properties["lead_tier"] = old_tier
+
             # Collect for batch HubSpot update (instead of per-lead PATCH)
             hubspot_updates.append({"id": contact_id, "properties": hs_properties})
 
@@ -1008,7 +1017,6 @@ async def run_batch_scoring() -> None:
             ):
                 # For dormant leads: use stored HubSpot score + tier for the card
                 # (current score=0 because no recent events, but last engagement was real)
-                _OLD_TIER_LABELS = {"1_hot": "HOT", "2_warm": "WARM"}
                 card_score = old_score_val if is_dormant_warm and score < SCORE_WARM else score
                 card_tier_label = _OLD_TIER_LABELS.get(old_tier, tier_label) if is_dormant_warm and score < SCORE_WARM else tier_label
                 offer_signals = _extract_offer_signals(browser_events)
