@@ -17,7 +17,6 @@ from typing import Any
 import httpx
 
 from batch.do_not_call import check_do_not_call
-from integrations.customerio import is_unsubscribed
 from integrations.supabase import (
     fetch_touchpoints_for_emails,
     fetch_all_lead_data,
@@ -144,6 +143,7 @@ async def _fetch_active_hubspot_leads() -> list[dict[str, Any]]:
         "properties": [
             "email", "firstname", "lastname", "phone", "mobilephone",
             "lead_engagement_score", "lead_tier",
+            "lead_interest_category",   # stored funnel — fallback for dormant leads
             "lead_last_call_date", "lead_last_call_outcome",
             "lead_call_attempts", "lead_not_interested", "lead_call_booked",
             "hs_email_open_count", "hs_email_click_count",
@@ -305,6 +305,34 @@ async def _write_hubspot_note(contact_id: str, body: str) -> None:
                 "HubSpot note create failed for contact %s: %s %s",
                 contact_id, resp.status_code, resp.text[:300],
             )
+
+
+# ---------------------------------------------------------------------------
+# Phone normalization
+# ---------------------------------------------------------------------------
+
+def _normalize_phone(phone: str) -> str:
+    """
+    Normalize a phone number to E.164 format (+prefix) for Aircall.
+
+    Handles common European formats stored in HubSpot without '+':
+      0041791234567  → +41791234567   (Swiss international prefix)
+      0049151234567  → +49151234567   (German international prefix)
+      00491234567    → +491234567     (any 00XX international prefix)
+      +41791234567   → +41791234567   (already correct, unchanged)
+      763263775      → unchanged      (no recognizable prefix, can't safely convert)
+
+    Aircall's _validate_phone() requires '+' prefix + 7 digits.
+    """
+    if not phone:
+        return phone
+    if phone.startswith("+"):
+        return phone  # already E.164
+    if phone.startswith("00") and len(phone) >= 11:
+        # International prefix 00XX → +XX (covers +41, +49, +43, +33, etc.)
+        return "+" + phone[2:]
+    # Cannot safely determine country code — return as-is (will fail _validate_phone)
+    return phone
 
 
 # ---------------------------------------------------------------------------
@@ -745,6 +773,15 @@ async def run_batch_scoring() -> None:
             score = scoring.combined_score
             funnel = scoring.interest_category
 
+            # Funnel fallback: if Supabase scoring returned no category,
+            # use the stored HubSpot value (set in a previous batch run).
+            # Critical for dormant leads whose events are older than RESCORE_WINDOW_DAYS.
+            if not funnel:
+                hs_stored_funnel = (props.get("lead_interest_category") or "").strip()
+                if hs_stored_funnel in VALID_FUNNELS:
+                    funnel = hs_stored_funnel
+                    scoring.interest_category = funnel
+
             # Determine freshness
             is_fresh, fresh_hours = _determine_freshness(touchpoints)
             tier_label = _determine_tier_label(score, is_fresh)
@@ -796,13 +833,12 @@ async def run_batch_scoring() -> None:
             multi_funnels = [f for f in VALID_FUNNELS if cat_scores.get(f, 0) > 0]
             multi_funnel_info = ", ".join(multi_funnels) if len(multi_funnels) > 1 else ""
 
-            # Unsubscribed check via Customer.io (uses pre-fetched cio_id)
-            unsubscribed = False
-            if cio_id:
-                try:
-                    unsubscribed = await is_unsubscribed(cio_id)
-                except Exception as e:
-                    logger.warning("Batch: CIO unsubscribed check failed for %s: %s", email, e)
+            # Unsubscribed check — use event data already fetched from Supabase.
+            # Avoids 1 CIO API call per lead (was: 8,582 calls × 200ms = 28 min).
+            # email_unsubscribed events land in Supabase via CIO webhook → same source.
+            unsubscribed = any(
+                e.get("event_type") == "email_unsubscribed" for e in scored_events
+            )
 
             last_call_date = props.get("lead_last_call_date")
             # Check call_booked: only future/recent scheduled meetings count
@@ -819,13 +855,11 @@ async def run_batch_scoring() -> None:
                 except (ValueError, AttributeError):
                     continue
 
-            # Check HubSpot meetings (next 14 days) — booked leads skip Aircall
-            has_hs_meeting = False
-            try:
-                from integrations.hubspot import has_upcoming_hubspot_meeting
-                has_hs_meeting = await has_upcoming_hubspot_meeting(contact_id)
-            except Exception as e:
-                logger.debug("Batch: HubSpot meeting check failed for %s: %s", email, e)
+            # HubSpot meeting check — rely on lead_call_booked property (updated by call_poller)
+            # and Supabase meetings (already fetched above).
+            # Avoids 1 HubSpot API call per lead (was: 8,582 calls × 200ms = 28 min).
+            # The call_poller syncs booked/completed meetings back to lead_call_booked every 5 min.
+            has_hs_meeting = False  # covered by _truthy(props.get("lead_call_booked")) below
 
             # Check for calendar_link_sent in browser events / touchpoints
             # (WhatsApp INA bot sends Kevin's calendar link — lead may book soon)
@@ -848,7 +882,9 @@ async def run_batch_scoring() -> None:
                 or _truthy(props.get("lead_call_booked"))
             )
             not_interested = _truthy(props.get("lead_not_interested"))
-            _raw_phone = (props.get("phone") or props.get("mobilephone") or "").strip()
+            _raw_phone = _normalize_phone(
+                (props.get("phone") or props.get("mobilephone") or "").strip()
+            )
             has_phone = len(_raw_phone) > 6  # reject stubs like "+41", "+49", "+"
 
             # Read call outcome early — needed for both DNC and cooldown
