@@ -901,6 +901,22 @@ async def run_batch_scoring() -> None:
                 funnel, is_fresh, score, qualifies_eignungscheck, purchased_funnels
             )
 
+            # Dormant Hot/Warm: lead was previously scored Hot/Warm but has no recent events.
+            # These leads should still be called — their stored tier reflects real engagement
+            # that happened before the current RESCORE_WINDOW_DAYS cutoff.
+            # We use the stored HubSpot score/tier for display and use SCORE_WARM as floor
+            # for list assignment. The exclusion logic (cooldown, max attempts) still applies.
+            is_dormant_warm = (
+                old_tier in ("1_hot", "2_warm")
+                and score < SCORE_WARM
+                and not call_booked
+            )
+            if is_dormant_warm and list_key is None:
+                # Assign to the appropriate warm/hot list using stored score as floor
+                list_key = _determine_list_key(
+                    funnel, is_fresh, SCORE_WARM, qualifies_eignungscheck, purchased_funnels
+                )
+
             # Booked leads never go to Aircall — they already have a meeting
             if call_booked:
                 list_key = None
@@ -910,10 +926,12 @@ async def run_batch_scoring() -> None:
                 # no score threshold applies. Score is shown on the Aircall card for context only.
                 # Fresh/warm funnel lists require score >= 30 or freshness as a quality gate.
                 # FRESH_MIN_SCORE (10) prevents single page_visited leads (3 pts) from being dialled.
+                # Dormant Hot/Warm: previously scored leads with no recent events — still callable.
                 should_push = has_phone and (
                     list_key == "eignungscheck"
                     or (is_fresh and score >= FRESH_MIN_SCORE)
                     or score >= SCORE_WARM
+                    or is_dormant_warm
                 )
 
             # Exclusion check: cooldown, permanent remove, max attempts
@@ -980,9 +998,19 @@ async def run_batch_scoring() -> None:
             # Build the call card for ALL scored leads with phone that qualify for Aircall:
             # - Warm/Hot: score >= 30
             # - Fresh: is_fresh=True AND score >= FRESH_MIN_SCORE (10)
+            # - Dormant Hot/Warm: previously scored leads with no recent events
             # This card is used for both Aircall notes AND HubSpot notes
             aircall_card = ""
-            if has_phone and not call_booked and (score >= SCORE_WARM or (is_fresh and score >= FRESH_MIN_SCORE)):
+            if has_phone and not call_booked and (
+                score >= SCORE_WARM
+                or (is_fresh and score >= FRESH_MIN_SCORE)
+                or is_dormant_warm
+            ):
+                # For dormant leads: use stored HubSpot score + tier for the card
+                # (current score=0 because no recent events, but last engagement was real)
+                _OLD_TIER_LABELS = {"1_hot": "HOT", "2_warm": "WARM"}
+                card_score = old_score_val if is_dormant_warm and score < SCORE_WARM else score
+                card_tier_label = _OLD_TIER_LABELS.get(old_tier, tier_label) if is_dormant_warm and score < SCORE_WARM else tier_label
                 offer_signals = _extract_offer_signals(browser_events)
                 hook_context = {
                     "email_clicked": email_summary.get("clicks", 0) > 0,
@@ -990,7 +1018,7 @@ async def run_batch_scoring() -> None:
                     "is_fresh": is_fresh,
                     "fresh_hours": fresh_hours,
                     "funnel": funnel,
-                    "score": score,
+                    "score": card_score,
                     "eignungscheck": qualifies_eignungscheck,
                     "call_booked": call_booked,
                     "purchased_products": purchased_product_keys,  # raw keys + names for hook rules
@@ -1001,9 +1029,9 @@ async def run_batch_scoring() -> None:
                 }
                 hook = generate_hook(hook_context)
                 aircall_card = _build_aircall_card(
-                    tier_label=tier_label,
+                    tier_label=card_tier_label,
                     funnel=funnel,
-                    score=score,
+                    score=card_score,
                     last_call_date=last_call_date,
                     email_summary=email_summary,
                     first_touch=first_touch,
