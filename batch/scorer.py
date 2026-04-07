@@ -31,7 +31,7 @@ from scoring.touchpoint_mapper import (
     map_browser_events_batch,
     summarize_email_activity,
 )
-from integrations.slack import send_decay_alert
+from integrations.slack import send_decay_alert, send_batch_report, BatchRunStats
 
 logger = logging.getLogger(__name__)
 
@@ -187,21 +187,25 @@ _HUBSPOT_BATCH_SIZE = 100  # HubSpot batch API limit
 
 async def _batch_update_hubspot_contacts(
     updates: list[dict[str, Any]],
-) -> int:
+) -> tuple[int, int, list[str]]:
     """
     Batch-update HubSpot contacts via /crm/v3/objects/contacts/batch/update.
 
     Each item in updates: {"id": contact_id, "properties": {...}}.
-    Returns number of successfully updated contacts.
+    Returns (ok_count, chunk_error_count, error_sample_messages).
+    Callers should surface chunk_error_count > 0 as an alert — it means
+    some contacts were NOT updated even though the batch appeared to run.
     """
     if not updates:
-        return 0
+        return 0, 0, []
 
     headers = {
         "Authorization": f"Bearer {HUBSPOT_TOKEN}",
         "Content-Type": "application/json",
     }
     updated = 0
+    chunk_errors = 0
+    error_samples: list[str] = []
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         for i in range(0, len(updates), _HUBSPOT_BATCH_SIZE):
@@ -218,15 +222,19 @@ async def _batch_update_hubspot_contacts(
                 if i + _HUBSPOT_BATCH_SIZE < len(updates):
                     await asyncio.sleep(0.5)
             except httpx.HTTPStatusError as e:
-                logger.error(
-                    "HubSpot batch update failed (chunk %d-%d): %s %s",
-                    i, i + len(chunk), e.response.status_code,
-                    e.response.text[:500],
-                )
+                chunk_errors += 1
+                err_msg = f"HTTP {e.response.status_code} chunk {i}-{i+len(chunk)}: {e.response.text[:300]}"
+                logger.error("HubSpot batch update failed — %s", err_msg)
+                if len(error_samples) < 2:
+                    error_samples.append(err_msg)
             except Exception as e:
-                logger.error("HubSpot batch update error: %s", e)
+                chunk_errors += 1
+                err_msg = f"chunk {i}-{i+len(chunk)}: {e}"
+                logger.error("HubSpot batch update error — %s", err_msg)
+                if len(error_samples) < 2:
+                    error_samples.append(err_msg)
 
-    return updated
+    return updated, chunk_errors, error_samples
 
 
 _HUBSPOT_NOTE_MARKER = "── Lead Score Card ──"
@@ -660,6 +668,14 @@ async def run_batch_scoring() -> None:
     Main batch job: fetch leads from HubSpot, enrich with Supabase touchpoints
     and CIO segment data, score, filter, assign to lists, push qualified leads.
     """
+    import time as _time
+    _batch_start = _time.monotonic()
+    _stats = BatchRunStats()
+
+    async def _finish() -> None:
+        _stats.duration_seconds = _time.monotonic() - _batch_start
+        await send_batch_report(_stats)
+
     logger.info("Batch scoring: starting run")
 
     # Step 1: Fetch active HubSpot leads
@@ -667,12 +683,16 @@ async def run_batch_scoring() -> None:
         leads = await _fetch_active_hubspot_leads()
     except Exception as e:
         logger.error("Batch: failed to fetch HubSpot leads: %s", e)
+        _stats.fatal_error = f"Step 1 HubSpot fetch: {e}"
+        await _finish()
         return
 
     if not leads:
         logger.info("Batch scoring: no leads to process")
+        await _finish()
         return
 
+    _stats.leads_fetched = len(leads)
     logger.info("Batch: %d leads to re-score", len(leads))
 
     # Collect all emails for bulk operations
@@ -695,6 +715,8 @@ async def run_batch_scoring() -> None:
         )
     except Exception as e:
         logger.error("Batch: Supabase touchpoint fetch failed: %s", e)
+        _stats.fatal_error = f"Step 2 Supabase touchpoints: {e}"
+        await _finish()
         return
 
     # Fetch events + purchases + meetings in one consolidated call (single contacts query)
@@ -1147,7 +1169,13 @@ async def run_batch_scoring() -> None:
             logger.error("Batch: failed to score %s: %s", email, e)
 
     # Step 4: Batch-update HubSpot contact properties (100 per API call)
-    updated = await _batch_update_hubspot_contacts(hubspot_updates)
+    _stats.leads_processed = len(email_lead_map)
+    _stats.skipped_cold = skipped_cold
+    _stats.skipped_dnc = skipped_dnc
+    updated, _hs_errors, _hs_error_samples = await _batch_update_hubspot_contacts(hubspot_updates)
+    _stats.hs_updates_ok = updated
+    _stats.hs_chunk_errors = _hs_errors
+    _stats.hs_error_samples = _hs_error_samples
 
     # Step 4b: Sync HubSpot list memberships — add contacts to the right static lists
     from integrations.hubspot import batch_add_to_list
@@ -1234,6 +1262,7 @@ async def run_batch_scoring() -> None:
                         item["email"], item["list_key"], item["score"], item["tier_label"],
                     )
                 else:
+                    _stats.aircall_rejected += 1
                     logger.warning(
                         "Batch: Aircall rejected %s — score=%.0f tier=%s is_fresh=%s "
                         "(check _should_dial logic)",
@@ -1256,10 +1285,16 @@ async def run_batch_scoring() -> None:
             except Exception as e:
                 logger.warning("Batch: decay alert failed for %s: %s", da["email"], e)
 
+    _stats.aircall_pushed = pushed
+    _stats.notes_written = hs_notes_written
+
     logger.info(
         "Batch scoring: done — %d/%d updated, %d listed, %d pushed, %d DNC-skipped, %d cold-skipped, %d decayed",
         updated, len(email_lead_map), total_listed, pushed, skipped_dnc, skipped_cold, len(decay_alerts),
     )
+
+    # Step 7: Send batch health report to Slack (always — success AND errors)
+    await _finish()
 
 
 # ---------------------------------------------------------------------------
