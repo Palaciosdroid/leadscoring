@@ -1068,13 +1068,19 @@ async def run_batch_scoring() -> None:
                 if funnel:
                     priority_tag += f"-{funnel[:3]}"
 
+                # For dormant leads: pass at least SCORE_WARM (30) so _should_dial
+                # doesn't reject them on the score<30 gate (current batch score=0).
+                # Use the stored HubSpot score when available, otherwise floor at SCORE_WARM.
+                aircall_score = max(card_score, SCORE_WARM) if is_dormant_warm else score
+                aircall_tier = old_tier if is_dormant_warm else scoring.lead_tier
+
                 aircall_queue.append({
                     "email": email,
                     "list_key": list_key,
-                    "score": score,
+                    "score": aircall_score,
                     "tier_label": tier_label,
                     "funnel": funnel,
-                    "lead_tier": scoring.lead_tier,
+                    "lead_tier": aircall_tier,
                     "phone": _raw_phone,
                     "firstname": props.get("firstname", ""),
                     "lastname": props.get("lastname", ""),
