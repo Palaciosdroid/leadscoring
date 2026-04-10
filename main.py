@@ -1171,6 +1171,74 @@ async def debug_daily_summary(x_api_key: str | None = Header(default=None)):
     return {"status": "ok", "message": "Daily summary sent to Slack"}
 
 
+@app.get("/debug/aircall-status")
+async def debug_aircall_status(x_api_key: str | None = Header(default=None)):
+    """
+    Check Aircall credentials and Power Dialer campaign status.
+    Returns env var presence, user info, and current campaign size.
+    """
+    if not DEBUG_API_KEY or x_api_key != DEBUG_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key header")
+
+    from integrations.aircall import AIRCALL_API_ID, AIRCALL_API_TOKEN, AIRCALL_CLOSER_USER_ID, AIRCALL_BASE, _headers
+    import httpx as _httpx
+
+    result: dict = {
+        "env_vars": {
+            "AIRCALL_API_ID": bool(AIRCALL_API_ID),
+            "AIRCALL_API_TOKEN": bool(AIRCALL_API_TOKEN),
+            "AIRCALL_CLOSER_USER_ID": AIRCALL_CLOSER_USER_ID or "NOT SET",
+        },
+        "user_info": None,
+        "dialer_campaign": None,
+        "error": None,
+    }
+
+    if not AIRCALL_API_ID or not AIRCALL_API_TOKEN or not AIRCALL_CLOSER_USER_ID:
+        result["error"] = "Missing Aircall env vars — cannot test API"
+        return result
+
+    try:
+        async with _httpx.AsyncClient(timeout=10.0) as client:
+            # Check user exists
+            r = await client.get(
+                f"{AIRCALL_BASE}/users/{AIRCALL_CLOSER_USER_ID}",
+                headers=_headers(),
+            )
+            if r.status_code == 200:
+                u = r.json().get("user", {})
+                result["user_info"] = {
+                    "id": u.get("id"),
+                    "name": u.get("name"),
+                    "email": u.get("email"),
+                    "available": u.get("availability"),
+                }
+            else:
+                result["error"] = f"User lookup failed: {r.status_code} {r.text[:200]}"
+                return result
+
+            # Check dialer campaign
+            r2 = await client.get(
+                f"{AIRCALL_BASE}/users/{AIRCALL_CLOSER_USER_ID}/dialer_campaign",
+                headers=_headers(),
+            )
+            if r2.status_code == 200:
+                dc = r2.json()
+                result["dialer_campaign"] = {
+                    "status": dc.get("status"),
+                    "contacts_count": len(dc.get("phone_numbers", [])),
+                    "raw_keys": list(dc.keys()),
+                }
+            else:
+                result["dialer_campaign"] = {
+                    "error": f"{r2.status_code} {r2.text[:200]}"
+                }
+    except Exception as e:
+        result["error"] = str(e)
+
+    return result
+
+
 @app.post("/debug/realtime-score")
 async def debug_realtime_score(
     email: str,

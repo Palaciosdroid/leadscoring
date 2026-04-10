@@ -323,24 +323,52 @@ def _normalize_phone(phone: str) -> str:
     """
     Normalize a phone number to E.164 format (+prefix) for Aircall.
 
-    Handles common European formats stored in HubSpot without '+':
-      0041791234567  → +41791234567   (Swiss international prefix)
-      0049151234567  → +49151234567   (German international prefix)
-      00491234567    → +491234567     (any 00XX international prefix)
-      +41791234567   → +41791234567   (already correct, unchanged)
-      763263775      → unchanged      (no recognizable prefix, can't safely convert)
-
-    Aircall's _validate_phone() requires '+' prefix + 7 digits.
+    Handles common European formats stored in HubSpot:
+      +41791234567   → +41791234567   (already correct)
+      0041791234567  → +41791234567   (00XX international prefix)
+      41791234567    → +41791234567   (Swiss CC without +, 11 digits)
+      4917612345678  → +4917612345678 (German CC without +, 13 digits)
+      '+49 170 7094840 → +491707094840 (apostrophe + spaces, Excel artefact)
+      017612345678   → +4917612345678 (German mobile local, 01[5-7]x)
+      0791234567     → +410791234567  (Swiss mobile local, 07x)
+      763263775      → unchanged      (no recognizable prefix)
     """
+    import re as _re
     if not phone:
         return phone
-    if phone.startswith("+"):
-        return phone  # already E.164
-    if phone.startswith("00") and len(phone) >= 11:
-        # International prefix 00XX → +XX (covers +41, +49, +43, +33, etc.)
-        return "+" + phone[2:]
-    # Cannot safely determine country code — return as-is (will fail _validate_phone)
-    return phone
+
+    # Strip leading apostrophe (Excel CSV artefact: '+49... stored as text)
+    phone = phone.lstrip("'")
+    # Strip all spaces and dashes for normalization
+    digits_only = _re.sub(r"[\s\-\(\)\/\.]", "", phone)
+
+    if digits_only.startswith("+"):
+        return digits_only  # already E.164
+
+    if digits_only.startswith("00") and len(digits_only) >= 11:
+        # 00XX international prefix → +XX
+        return "+" + digits_only[2:]
+
+    # Known DACH country codes present without '+': 41 (CH), 49 (DE), 43 (AT)
+    # Require full international length to avoid misidentifying local prefixes
+    for cc, min_len, max_len in [("41", 11, 12), ("49", 12, 14), ("43", 11, 13)]:
+        if digits_only.startswith(cc) and min_len <= len(digits_only) <= max_len:
+            return "+" + digits_only
+
+    # German local mobile: 015x / 016x / 017x — strip trunk 0, add +49
+    if _re.match(r"^01[5-7]\d{7,9}$", digits_only):
+        return "+49" + digits_only[1:]  # 0151... → +4915...
+
+    # Swiss local mobile: 07x — strip trunk 0, add +41
+    if _re.match(r"^07[5-9]\d{6,7}$", digits_only):
+        return "+41" + digits_only[1:]  # 079... → +4179...
+
+    # Austrian local mobile: 06x — strip trunk 0, add +43
+    if _re.match(r"^06[5-9]\d{7,9}$", digits_only):
+        return "+43" + digits_only[1:]  # 0699... → +4369...
+
+    # Cannot safely determine country code — return cleaned but unchanged
+    return digits_only
 
 
 # ---------------------------------------------------------------------------
