@@ -179,8 +179,9 @@ CALL_POLL_WINDOW_MINUTES   = int(os.environ.get("CALL_POLL_WINDOW_MINUTES",    "
 async def lifespan(app: FastAPI):
     scheduler.add_job(
         run_batch_scoring,
-        "interval",
-        minutes=BATCH_INTERVAL_MINUTES,
+        "cron",
+        minute=0,
+        timezone=ZoneInfo("Europe/Berlin"),
         id="batch_scoring",
         replace_existing=True,
     )
