@@ -1328,7 +1328,7 @@ async def run_batch_scoring() -> None:
                 )
                 if _r.status_code == 200:
                     _dc = _r.json()
-                    _stats.dialer_verified_count = len(_dc.get("phone_numbers", []))
+                    _stats.dialer_verified_count = len(_dc.get("numbers", _dc.get("phone_numbers", [])))
                     logger.info(
                         "Batch: Aircall dialer verified — %d contacts in campaign (pushed %d this run)",
                         _stats.dialer_verified_count, pushed,

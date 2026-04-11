@@ -1211,36 +1211,40 @@ async def debug_e2e_test(x_api_key: str | None = Header(default=None)):
                 results["steps"]["1_before_count"] = f"FAIL {r.status_code}: {r.text[:200]}"
                 results["verdict"] = "FAIL"
                 return results
-            count_before = len(r.json().get("phone_numbers", [])) if r.status_code == 200 else 0
+            r_json = r.json() if r.status_code == 200 else {}
+            # Aircall GET response uses key "numbers" (not "phone_numbers")
+            count_before = len(r_json.get("numbers", r_json.get("phone_numbers", [])))
             results["steps"]["1_before_count"] = f"OK — {count_before} contacts (HTTP {r.status_code})"
-            results["steps"]["1_before_raw_keys"] = list(r.json().keys()) if r.status_code == 200 else "404"
+            results["steps"]["1_before_raw_keys"] = list(r_json.keys()) if r_json else "404"
 
             # Step 2: Push test number
             r2 = await client.post(PHONES_URL, headers=_headers(), json={"phone_numbers": [TEST_PHONE]})
-            if r2.status_code not in (200, 201, 422):
-                results["steps"]["2_push"] = f"FAIL {r2.status_code}: {r2.text[:200]}"
-                results["verdict"] = "FAIL"
-                return results
-            results["steps"]["2_push"] = f"OK — {r2.status_code} body={r2.text[:100]}"
+            results["steps"]["2_push"] = f"{'OK' if r2.status_code in (200, 201) else 'WARN'} — {r2.status_code} body={r2.text[:100]}"
+            push_ok = r2.status_code in (200, 201)
+            if not push_ok:
+                results["steps"]["2_push_note"] = "Push failed — gap check will show 0 delta (expected if 422)"
 
             # Step 3: Verify count increased
             r3 = await client.get(PHONES_URL, headers=_headers())
-            count_after = len(r3.json().get("phone_numbers", [])) if r3.status_code == 200 else -1
-            gap_detected = count_after <= count_before
+            r3_json = r3.json() if r3.status_code == 200 else {}
+            count_after = len(r3_json.get("numbers", r3_json.get("phone_numbers", []))) if r3.status_code == 200 else -1
+            gap_detected = push_ok and count_after <= count_before
             results["steps"]["3_verify_count"] = (
                 f"{'FAIL — GAP DETECTED' if gap_detected else 'OK'} — "
                 f"before={count_before} after={count_after}"
             )
 
             # Step 4: Cleanup — remove test number
-            r4 = await client.delete(
+            # httpx.AsyncClient.delete() doesn't accept json= kwarg; use request() instead
+            r4 = await client.request(
+                "DELETE",
                 f"{AIRCALL_BASE}/users/{AIRCALL_CLOSER_USER_ID}/dialer_campaign/phone_numbers",
                 headers=_headers(),
                 json={"phone_numbers": [TEST_PHONE]},
             )
             results["steps"]["4_cleanup"] = f"{'OK' if r4.status_code in (200,204,404) else 'WARN'} — {r4.status_code}"
 
-            results["verdict"] = "FAIL — GAP DETECTED" if gap_detected else "PASS"
+            results["verdict"] = "FAIL — GAP DETECTED" if gap_detected else ("PASS" if push_ok else "PUSH_FAILED")
 
     except Exception as _ex:
         import traceback as _tb
