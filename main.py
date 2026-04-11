@@ -1094,27 +1094,11 @@ async def batch_run(x_api_key: str | None = Header(default=None)):
 
 @app.post("/debug/batch")
 async def debug_batch(x_api_key: str | None = Header(default=None)):
-    """Run batch scoring synchronously — returns result or error. Requires DEBUG_API_KEY."""
+    """Trigger batch scoring async — returns 202 immediately, Slack report follows. Requires DEBUG_API_KEY."""
     if not DEBUG_API_KEY or x_api_key != DEBUG_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key header")
-    import io, logging as _log
-    buf = io.StringIO()
-    handler = _log.StreamHandler(buf)
-    handler.setLevel(_log.DEBUG)
-    handler.setFormatter(_log.Formatter("%(name)s %(levelname)s %(message)s"))
-    for name in ("batch.scorer", "integrations.supabase", "root", ""):
-        lg = _log.getLogger(name)
-        lg.addHandler(handler)
-        lg.setLevel(_log.DEBUG)
-    try:
-        await run_batch_scoring()
-        return {"status": "completed", "logs": buf.getvalue()[-5000:]}
-    except Exception as exc:
-        import traceback
-        return {"status": "error", "error": str(exc), "traceback": traceback.format_exc(), "logs": buf.getvalue()[-5000:]}
-    finally:
-        for name in ("batch.scorer", "integrations.supabase", "root", ""):
-            _log.getLogger(name).removeHandler(handler)
+    asyncio.create_task(run_batch_scoring())
+    return {"status": "triggered", "message": "Batch running in background — Slack report incoming"}
 
 
 @app.post("/debug/poll")
