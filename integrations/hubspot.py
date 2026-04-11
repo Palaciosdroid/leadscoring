@@ -664,6 +664,49 @@ async def remove_from_lists(
         return False
 
 
+async def batch_add_to_list(
+    list_id: int,
+    contact_ids: list[str],
+    *,
+    chunk_size: int = 100,
+    timeout: float = 15.0,
+) -> int:
+    """
+    Add a batch of HubSpot contact IDs to a static list via Lists API v3.
+
+    Chunks large lists to stay within API limits.
+    Returns number of contacts successfully added.
+    """
+    if not ACCESS_TOKEN or not contact_ids or not list_id:
+        return 0
+
+    added = 0
+    url = f"{HUBSPOT_BASE}/crm/v3/lists/{list_id}/memberships/add"
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for i in range(0, len(contact_ids), chunk_size):
+            chunk = contact_ids[i:i + chunk_size]
+            try:
+                resp = await client.put(
+                    url,
+                    headers=_headers(),
+                    json={"recordIds": chunk},
+                )
+                if resp.status_code in (200, 204):
+                    added += len(chunk)
+                    logger.debug("batch_add_to_list: +%d to list %s", len(chunk), list_id)
+                else:
+                    logger.warning(
+                        "batch_add_to_list: list %s chunk %d returned %s: %s",
+                        list_id, i // chunk_size, resp.status_code, resp.text[:200],
+                    )
+            except Exception as e:
+                logger.warning("batch_add_to_list: list %s chunk %d error: %s", list_id, i // chunk_size, e)
+
+    logger.info("batch_add_to_list: %d/%d contacts added to list %s", added, len(contact_ids), list_id)
+    return added
+
+
 async def find_contact_by_zoom_meeting(zoom_meeting_id: str) -> str | None:
     """
     Find a HubSpot contact associated with a Zoom meeting.
