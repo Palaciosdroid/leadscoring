@@ -53,7 +53,9 @@ _PURCHASE_FIELDS = (
 
 
 # PostgREST URL length limit: chunk large IN queries
-_CHUNK_SIZE = 200  # max emails per IN clause to stay within URL limits
+_CHUNK_SIZE = 200       # max emails per IN clause (emails ~20 chars each)
+_CHUNK_SIZE_UUID = 50   # max UUIDs per IN clause (UUIDs = 36 chars + risk of Supabase stmt timeout)
+_TOUCHPOINTS_LIMIT = 300  # max touchpoints per chunk response to avoid huge payloads
 
 
 class SupabaseClient:
@@ -66,7 +68,7 @@ class SupabaseClient:
             )
         self._base = f"{SUPABASE_URL}/rest/v1"
         self._client = httpx.AsyncClient(
-            timeout=15.0,
+            timeout=30.0,
             headers={
                 "apikey": SUPABASE_SERVICE_KEY,
                 "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
@@ -79,17 +81,37 @@ class SupabaseClient:
         """Close the underlying HTTP client."""
         await self._client.aclose()
 
-    async def _get(self, table: str, params: dict | None = None) -> list[dict]:
-        """Generic GET against PostgREST. Returns parsed JSON list."""
+    async def _get(self, table: str, params: dict | None = None, _retries: int = 3) -> list[dict]:
+        """Generic GET against PostgREST. Returns parsed JSON list.
+
+        Retries up to _retries times on 5xx errors with exponential backoff.
+        """
         url = f"{self._base}/{table}"
-        response = await self._client.get(url, params=params or {})
-        if response.status_code != 200:
-            logger.error(
-                "Supabase GET %s failed: %s %s",
-                table, response.status_code, response.text[:500],
-            )
-            response.raise_for_status()
-        return response.json()
+        last_exc: Exception | None = None
+        for attempt in range(_retries):
+            try:
+                response = await self._client.get(url, params=params or {})
+                if response.status_code == 200:
+                    return response.json()
+                if response.status_code >= 500:
+                    logger.warning(
+                        "Supabase GET %s attempt %d/%d: %s %s",
+                        table, attempt + 1, _retries, response.status_code, response.text[:200],
+                    )
+                    if attempt < _retries - 1:
+                        await asyncio.sleep(2 ** attempt)  # 1s, 2s, 4s
+                        continue
+                logger.error(
+                    "Supabase GET %s failed: %s %s",
+                    table, response.status_code, response.text[:500],
+                )
+                response.raise_for_status()
+            except httpx.TimeoutException as exc:
+                logger.warning("Supabase GET %s timeout (attempt %d/%d)", table, attempt + 1, _retries)
+                last_exc = exc
+                if attempt < _retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+        raise last_exc or RuntimeError(f"Supabase GET {table} failed after {_retries} attempts")
 
     async def _post(self, table: str, data: dict) -> dict | None:
         """Generic POST (insert) against PostgREST. Returns inserted row."""
@@ -221,15 +243,17 @@ async def fetch_touchpoints_for_emails(
         email_by_id[cid] = c["email"]
 
     # Step 2: Bulk fetch touchpoints (chunked by contact_ids)
+    # Use _CHUNK_SIZE_UUID (50) — UUIDs are 36 chars, large IN clauses cause Supabase 500s
     all_touchpoints: list[dict] = []
-    for i in range(0, len(contact_ids), _CHUNK_SIZE):
-        chunk_ids = contact_ids[i:i + _CHUNK_SIZE]
+    for i in range(0, len(contact_ids), _CHUNK_SIZE_UUID):
+        chunk_ids = contact_ids[i:i + _CHUNK_SIZE_UUID]
         ids_csv = ",".join(chunk_ids)
         tps = await client._get("touchpoints", {
             "select": _TOUCHPOINT_FIELDS,
             "contact_id": f"in.({ids_csv})",
             "created_at": f"gte.{cutoff}",
             "order": "created_at.desc",
+            "limit": str(_TOUCHPOINTS_LIMIT),
         })
         all_touchpoints.extend(tps)
 
