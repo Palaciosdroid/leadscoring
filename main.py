@@ -1304,16 +1304,15 @@ async def debug_aircall_status(x_api_key: str | None = Header(default=None)):
                 result["error"] = f"User lookup failed: {r.status_code} {r.text[:200]}"
                 return result
 
-            # Check dialer campaign
+            # Check dialer campaign phone count
             r2 = await client.get(
-                f"{AIRCALL_BASE}/users/{AIRCALL_CLOSER_USER_ID}/dialer_campaign",
+                f"{AIRCALL_BASE}/users/{AIRCALL_CLOSER_USER_ID}/dialer_campaign/phone_numbers",
                 headers=_headers(),
             )
             if r2.status_code == 200:
                 dc = r2.json()
                 result["dialer_campaign"] = {
-                    "status": dc.get("status"),
-                    "contacts_count": len(dc.get("phone_numbers", [])),
+                    "contacts_count": len(dc.get("numbers", dc.get("phone_numbers", []))),
                     "raw_keys": list(dc.keys()),
                 }
             else:
