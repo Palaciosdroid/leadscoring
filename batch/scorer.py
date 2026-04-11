@@ -1316,6 +1316,34 @@ async def run_batch_scoring() -> None:
     _stats.aircall_pushed = pushed
     _stats.notes_written = hs_notes_written
 
+    # Step 6b: Verify actual Aircall dialer count — don't trust API response codes alone.
+    # This catches the gap between "API returned 200" and "lead actually appears in dialer".
+    if pushed > 0:
+        try:
+            from integrations.aircall import AIRCALL_BASE, AIRCALL_CLOSER_USER_ID, _headers
+            async with httpx.AsyncClient(timeout=8.0) as _ac:
+                _r = await _ac.get(
+                    f"{AIRCALL_BASE}/users/{AIRCALL_CLOSER_USER_ID}/dialer_campaign",
+                    headers=_headers(),
+                )
+                if _r.status_code == 200:
+                    _dc = _r.json()
+                    _stats.dialer_verified_count = len(_dc.get("phone_numbers", []))
+                    logger.info(
+                        "Batch: Aircall dialer verified — %d contacts in campaign (pushed %d this run)",
+                        _stats.dialer_verified_count, pushed,
+                    )
+                    if _stats.dialer_verified_count == 0:
+                        logger.error(
+                            "Batch: AIRCALL GAP — pushed %d leads but dialer campaign is EMPTY. "
+                            "Leads are being lost silently.",
+                            pushed,
+                        )
+                else:
+                    logger.warning("Batch: Aircall dialer verify failed: %s", _r.status_code)
+        except Exception as _e:
+            logger.warning("Batch: Aircall dialer verify exception (non-fatal): %s", _e)
+
     logger.info(
         "Batch scoring: done — %d/%d updated, %d listed, %d pushed, %d DNC-skipped, %d cold-skipped, %d decayed",
         updated, len(email_lead_map), total_listed, pushed, skipped_dnc, skipped_cold, len(decay_alerts),

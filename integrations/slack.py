@@ -232,6 +232,9 @@ class BatchRunStats:
     aircall_pushed: int = 0
     aircall_rejected: int = 0
     notes_written: int = 0
+    # Post-batch verification: actual dialer count from Aircall API
+    # -1 = not checked, 0+ = real count. Gap detected when pushed>0 but count==0.
+    dialer_verified_count: int = -1
     skipped_cold: int = 0
     skipped_dnc: int = 0
     duration_seconds: float = 0.0
@@ -249,12 +252,25 @@ def _build_batch_report_message(stats: BatchRunStats) -> dict[str, Any]:
 
     header = f"{status_emoji} Batch Run — {status_text} ({duration_str})"
 
+    # Aircall dialer verification status
+    if stats.dialer_verified_count >= 0:
+        dialer_str = f"{stats.dialer_verified_count} im Dialer (verifiziert)"
+    else:
+        dialer_str = "nicht verifiziert"
+
     lines = [
         f"*Leads:* {stats.leads_fetched} fetched → {stats.leads_processed} processed",
         f"*HubSpot:* {stats.hs_updates_ok} updated",
-        f"*Aircall:* {stats.aircall_pushed} pushed, {stats.aircall_rejected} rejected",
+        f"*Aircall:* {stats.aircall_pushed} pushed, {stats.aircall_rejected} rejected → {dialer_str}",
         f"*Skipped:* {stats.skipped_cold} cold, {stats.skipped_dnc} DNC",
     ]
+
+    # Gap alert: we pushed leads but dialer is empty — silent failure
+    if stats.aircall_pushed > 0 and stats.dialer_verified_count == 0:
+        lines.append(
+            ":rotating_light: *AIRCALL GAP DETECTED* — pushed >0 leads aber Dialer leer! "
+            "Leads gehen verloren. Check: Aircall Kampagne, Credentials, Phone-Format."
+        )
 
     if stats.hs_chunk_errors:
         lines.append(

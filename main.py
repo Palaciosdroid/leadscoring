@@ -1172,6 +1172,85 @@ async def debug_daily_summary(x_api_key: str | None = Header(default=None)):
     return {"status": "ok", "message": "Daily summary sent to Slack"}
 
 
+@app.post("/debug/e2e-test")
+async def debug_e2e_test(x_api_key: str | None = Header(default=None)):
+    """
+    End-to-end test: push a synthetic test lead to Aircall, verify it appears
+    in the dialer campaign, then remove it. Reports each step explicitly.
+
+    This catches the gap between 'API returned 200' and 'lead actually in dialer'.
+    """
+    if not DEBUG_API_KEY or x_api_key != DEBUG_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key header")
+
+    from integrations.aircall import (
+        AIRCALL_BASE, AIRCALL_CLOSER_USER_ID, AIRCALL_API_ID, AIRCALL_API_TOKEN,
+        _headers, _validate_phone,
+    )
+    import httpx as _httpx
+
+    TEST_PHONE = "+41000000001"   # synthetic number — won't match real contacts
+    results: dict = {
+        "steps": {},
+        "verdict": None,
+        "error": None,
+    }
+
+    if not AIRCALL_API_ID or not AIRCALL_API_TOKEN or not AIRCALL_CLOSER_USER_ID:
+        results["verdict"] = "FAIL"
+        results["error"] = "Aircall env vars missing"
+        return results
+
+    async with _httpx.AsyncClient(timeout=10.0) as client:
+        # Step 1: Get dialer count BEFORE push
+        r = await client.get(
+            f"{AIRCALL_BASE}/users/{AIRCALL_CLOSER_USER_ID}/dialer_campaign",
+            headers=_headers(),
+        )
+        if r.status_code != 200:
+            results["steps"]["1_before_count"] = f"FAIL {r.status_code}: {r.text[:200]}"
+            results["verdict"] = "FAIL"
+            return results
+        count_before = len(r.json().get("phone_numbers", []))
+        results["steps"]["1_before_count"] = f"OK — {count_before} contacts"
+
+        # Step 2: Push test number
+        r2 = await client.post(
+            f"{AIRCALL_BASE}/users/{AIRCALL_CLOSER_USER_ID}/dialer_campaign/phone_numbers",
+            headers=_headers(),
+            json={"phone_numbers": [TEST_PHONE]},
+        )
+        if r2.status_code not in (200, 201, 422):
+            results["steps"]["2_push"] = f"FAIL {r2.status_code}: {r2.text[:200]}"
+            results["verdict"] = "FAIL"
+            return results
+        results["steps"]["2_push"] = f"OK — {r2.status_code}"
+
+        # Step 3: Verify count increased
+        r3 = await client.get(
+            f"{AIRCALL_BASE}/users/{AIRCALL_CLOSER_USER_ID}/dialer_campaign",
+            headers=_headers(),
+        )
+        count_after = len(r3.json().get("phone_numbers", [])) if r3.status_code == 200 else -1
+        gap_detected = count_after <= count_before
+        results["steps"]["3_verify_count"] = (
+            f"{'FAIL — GAP DETECTED' if gap_detected else 'OK'} — "
+            f"before={count_before} after={count_after}"
+        )
+
+        # Step 4: Cleanup — remove test number
+        r4 = await client.delete(
+            f"{AIRCALL_BASE}/users/{AIRCALL_CLOSER_USER_ID}/dialer_campaign/phone_numbers",
+            headers=_headers(),
+            json={"phone_numbers": [TEST_PHONE]},
+        )
+        results["steps"]["4_cleanup"] = f"{'OK' if r4.status_code in (200,204,404) else 'WARN'} — {r4.status_code}"
+
+        results["verdict"] = "FAIL — GAP DETECTED" if gap_detected else "PASS"
+
+    return results
+
+
 @app.get("/debug/aircall-status")
 async def debug_aircall_status(x_api_key: str | None = Header(default=None)):
     """
