@@ -159,11 +159,23 @@ async def _fetch_active_hubspot_leads() -> list[dict[str, Any]]:
             if after:
                 payload["after"] = after
 
-            resp = await client.post(
-                f"{HUBSPOT_BASE}/crm/v3/objects/contacts/search",
-                headers=headers,
-                json=payload,
-            )
+            # Retry up to 4 times on transient HubSpot 5xx errors
+            resp = None
+            for attempt in range(4):
+                resp = await client.post(
+                    f"{HUBSPOT_BASE}/crm/v3/objects/contacts/search",
+                    headers=headers,
+                    json=payload,
+                )
+                if resp.status_code < 500:
+                    break
+                wait = 2 ** attempt  # 1s, 2s, 4s, 8s
+                logger.warning(
+                    "HubSpot search page %s: %s — retry %d/4 in %ds",
+                    after or "first", resp.status_code, attempt + 1, wait,
+                )
+                await asyncio.sleep(wait)
+
             resp.raise_for_status()
             data = resp.json()
             results.extend(data.get("results", []))
