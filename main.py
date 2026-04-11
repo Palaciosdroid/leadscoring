@@ -1201,36 +1201,29 @@ async def debug_e2e_test(x_api_key: str | None = Header(default=None)):
         results["error"] = "Aircall env vars missing"
         return results
 
+    PHONES_URL = f"{AIRCALL_BASE}/users/{AIRCALL_CLOSER_USER_ID}/dialer_campaign/phone_numbers"
+
     async with _httpx.AsyncClient(timeout=10.0) as client:
-        # Step 1: Get dialer count BEFORE push
-        r = await client.get(
-            f"{AIRCALL_BASE}/users/{AIRCALL_CLOSER_USER_ID}/dialer_campaign",
-            headers=_headers(),
-        )
-        if r.status_code != 200:
+        # Step 1: Get dialer phone count BEFORE push
+        r = await client.get(PHONES_URL, headers=_headers())
+        if r.status_code not in (200, 404):
             results["steps"]["1_before_count"] = f"FAIL {r.status_code}: {r.text[:200]}"
             results["verdict"] = "FAIL"
             return results
-        count_before = len(r.json().get("phone_numbers", []))
-        results["steps"]["1_before_count"] = f"OK — {count_before} contacts"
+        count_before = len(r.json().get("phone_numbers", [])) if r.status_code == 200 else 0
+        results["steps"]["1_before_count"] = f"OK — {count_before} contacts (HTTP {r.status_code})"
+        results["steps"]["1_before_raw_keys"] = list(r.json().keys()) if r.status_code == 200 else "404"
 
         # Step 2: Push test number
-        r2 = await client.post(
-            f"{AIRCALL_BASE}/users/{AIRCALL_CLOSER_USER_ID}/dialer_campaign/phone_numbers",
-            headers=_headers(),
-            json={"phone_numbers": [TEST_PHONE]},
-        )
+        r2 = await client.post(PHONES_URL, headers=_headers(), json={"phone_numbers": [TEST_PHONE]})
         if r2.status_code not in (200, 201, 422):
             results["steps"]["2_push"] = f"FAIL {r2.status_code}: {r2.text[:200]}"
             results["verdict"] = "FAIL"
             return results
-        results["steps"]["2_push"] = f"OK — {r2.status_code}"
+        results["steps"]["2_push"] = f"OK — {r2.status_code} body={r2.text[:100]}"
 
         # Step 3: Verify count increased
-        r3 = await client.get(
-            f"{AIRCALL_BASE}/users/{AIRCALL_CLOSER_USER_ID}/dialer_campaign",
-            headers=_headers(),
-        )
+        r3 = await client.get(PHONES_URL, headers=_headers())
         count_after = len(r3.json().get("phone_numbers", [])) if r3.status_code == 200 else -1
         gap_detected = count_after <= count_before
         results["steps"]["3_verify_count"] = (

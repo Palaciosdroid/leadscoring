@@ -1323,7 +1323,7 @@ async def run_batch_scoring() -> None:
             from integrations.aircall import AIRCALL_BASE, AIRCALL_CLOSER_USER_ID, _headers
             async with httpx.AsyncClient(timeout=8.0) as _ac:
                 _r = await _ac.get(
-                    f"{AIRCALL_BASE}/users/{AIRCALL_CLOSER_USER_ID}/dialer_campaign",
+                    f"{AIRCALL_BASE}/users/{AIRCALL_CLOSER_USER_ID}/dialer_campaign/phone_numbers",
                     headers=_headers(),
                 )
                 if _r.status_code == 200:
