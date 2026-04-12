@@ -148,7 +148,11 @@ def _build_decay_message(
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": "⚠️ *Score-Rückgang durch Inaktivität.* Lead hat sich länger nicht mehr gemeldet — Re-Aktivierungskampagne prüfen oder aus der Calling-Queue entfernen.",
+                    "text": (
+                        "⏳ *Frische-Fenster abgelaufen.* Lead ist nicht mehr frisch — Score unverändert, aber Tier-Downgrade wegen abgelaufenem Fresh-Bonus."
+                        if abs(new_score - old_score) < 1
+                        else "⚠️ *Score-Rückgang durch Inaktivität.* Lead hat sich länger nicht mehr gemeldet — Re-Aktivierungskampagne prüfen oder aus der Calling-Queue entfernen."
+                    ),
                 },
             },
             {"type": "divider"},
