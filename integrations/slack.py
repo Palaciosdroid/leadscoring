@@ -241,6 +241,7 @@ class BatchRunStats:
     dialer_verified_count: int = -1
     skipped_cold: int = 0
     skipped_dnc: int = 0
+    decay_count: int = 0              # tier downgrades this run (summary only, no individual alerts)
     duration_seconds: float = 0.0
     fatal_error: str | None = None    # set if batch crashed before completing
 
@@ -267,6 +268,7 @@ def _build_batch_report_message(stats: BatchRunStats) -> dict[str, Any]:
         f"*HubSpot:* {stats.hs_updates_ok} updated",
         f"*Aircall:* {stats.aircall_pushed} pushed, {stats.aircall_rejected} rejected → {dialer_str}",
         f"*Skipped:* {stats.skipped_cold} cold, {stats.skipped_dnc} DNC",
+        f"*Decays:* {stats.decay_count} Tier-Downgrades",
     ]
 
     # Gap alert: we pushed leads but dialer is empty — silent failure

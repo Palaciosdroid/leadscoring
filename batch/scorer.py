@@ -31,7 +31,7 @@ from scoring.touchpoint_mapper import (
     map_browser_events_batch,
     summarize_email_activity,
 )
-from integrations.slack import send_decay_alert, send_batch_report, BatchRunStats
+from integrations.slack import send_batch_report, BatchRunStats
 
 logger = logging.getLogger(__name__)
 
@@ -1311,19 +1311,10 @@ async def run_batch_scoring() -> None:
         except Exception as e:
             logger.error("Batch: Aircall push failed for %s: %s", item["email"], e)
 
-    # Step 6: Send decay alerts to Slack (tier downgrades)
+    # Step 6: Count decays — no individual Slack alerts, summary goes into batch report
+    _stats.decay_count = len(decay_alerts)
     if decay_alerts:
-        logger.info("Batch: %d tier decay(s) detected — sending Slack alerts", len(decay_alerts))
-        for da in decay_alerts[:10]:  # cap at 10 per batch to avoid Slack spam
-            try:
-                await send_decay_alert(
-                    name=da["name"], email=da["email"],
-                    old_tier=da["old_tier"], new_tier=da["new_tier"],
-                    old_score=da["old_score"], new_score=da["new_score"],
-                    interest_category=da["interest_category"],
-                )
-            except Exception as e:
-                logger.warning("Batch: decay alert failed for %s: %s", da["email"], e)
+        logger.info("Batch: %d tier decay(s) — included in batch report summary", len(decay_alerts))
 
     _stats.aircall_pushed = pushed
     _stats.notes_written = hs_notes_written
