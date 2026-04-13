@@ -177,9 +177,11 @@ CALL_POLL_WINDOW_MINUTES   = int(os.environ.get("CALL_POLL_WINDOW_MINUTES",    "
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Batch scoring 3x daily: 08:00, 12:00, 16:00 CET
     scheduler.add_job(
         run_batch_scoring,
         "cron",
+        hour="8,12,16",
         minute=0,
         timezone=ZoneInfo("Europe/Berlin"),
         id="batch_scoring",
@@ -192,19 +194,6 @@ async def lifespan(app: FastAPI):
         minutes=CALL_POLL_INTERVAL_MINUTES,
         kwargs={"since_minutes": CALL_POLL_WINDOW_MINUTES},
         id="call_polling",
-        replace_existing=True,
-    )
-    # Daily decay sweep — 17:00 CET, one hour before EOD summary.
-    # run_batch_scoring() already contains decay detection + Slack alerts.
-    # Running it at a fixed time means decay alerts land predictably instead of
-    # randomly during the 30-min interval job.
-    scheduler.add_job(
-        run_batch_scoring,
-        "cron",
-        hour=17,
-        minute=0,
-        timezone=ZoneInfo("Europe/Berlin"),
-        id="daily_decay_check",
         replace_existing=True,
     )
     # Scheduled calls summarizer — 18:00 CET daily
