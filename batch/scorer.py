@@ -1251,20 +1251,7 @@ async def run_batch_scoring() -> None:
                 )
         logger.info("Batch: wrote %d/%d HubSpot notes", hs_notes_written, len(hubspot_notes_queue))
 
-    # Step 4d: Send Slack Hot Lead alerts for NEW hot leads
-    if new_hot_leads:
-        from integrations.slack import send_hot_lead_alert
-        logger.info("Batch: %d NEW hot leads — sending Slack alerts", len(new_hot_leads))
-        for hl in new_hot_leads[:10]:  # cap at 10 per batch
-            try:
-                await send_hot_lead_alert(
-                    lead=hl,
-                    combined_score=hl["score"],
-                    lead_tier=hl["tier"],
-                    interest_category=hl.get("interest"),
-                )
-            except Exception as e:
-                logger.warning("Batch: Hot Lead Slack alert failed for %s: %s", hl["email"], e)
+    # Hot Lead individual Slack alerts removed — batch report summary only
 
     # Step 5: Push qualified leads to Aircall — sorted by REVERSE priority
     # Aircall Power Dialer shows the LAST-added contact on TOP.
