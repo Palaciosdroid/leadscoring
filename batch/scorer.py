@@ -1094,6 +1094,15 @@ async def run_batch_scoring() -> None:
             if is_dormant_warm:
                 hs_properties["lead_tier"] = old_tier
 
+            # For booked leads: "0_booked" is internal only — not a valid HubSpot enum.
+            # Preserve old tier in HubSpot so the contact stays visible in pipelines.
+            if call_booked:
+                _VALID_HS_TIERS = {"1_hot", "2_warm", "3_cold", "4_disqualified"}
+                if old_tier in _VALID_HS_TIERS:
+                    hs_properties["lead_tier"] = old_tier
+                else:
+                    hs_properties.pop("lead_tier", None)
+
             # Collect for batch HubSpot update (instead of per-lead PATCH)
             hubspot_updates.append({"id": contact_id, "properties": hs_properties})
 
