@@ -53,7 +53,7 @@ _PURCHASE_FIELDS = (
 
 
 # PostgREST URL length limit: chunk large IN queries
-_CHUNK_SIZE = 200       # max emails per IN clause (emails ~20 chars each)
+_CHUNK_SIZE = 100       # max emails per IN clause — reduced from 200 to avoid Supabase 522 timeouts
 _CHUNK_SIZE_UUID = 50   # max UUIDs per IN clause (UUIDs = 36 chars + risk of Supabase stmt timeout)
 _TOUCHPOINTS_LIMIT = 300  # max touchpoints per chunk response to avoid huge payloads
 
@@ -68,7 +68,7 @@ class SupabaseClient:
             )
         self._base = f"{SUPABASE_URL}/rest/v1"
         self._client = httpx.AsyncClient(
-            timeout=30.0,
+            timeout=60.0,
             headers={
                 "apikey": SUPABASE_SERVICE_KEY,
                 "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
@@ -81,10 +81,11 @@ class SupabaseClient:
         """Close the underlying HTTP client."""
         await self._client.aclose()
 
-    async def _get(self, table: str, params: dict | None = None, _retries: int = 3) -> list[dict]:
+    async def _get(self, table: str, params: dict | None = None, _retries: int = 5) -> list[dict]:
         """Generic GET against PostgREST. Returns parsed JSON list.
 
-        Retries up to _retries times on 5xx errors with exponential backoff.
+        Retries up to _retries times on 5xx/timeout with exponential backoff.
+        522 = Cloudflare TCP timeout (Supabase overloaded) — always retried with longer delays.
         """
         url = f"{self._base}/{table}"
         last_exc: Exception | None = None
@@ -94,23 +95,28 @@ class SupabaseClient:
                 if response.status_code == 200:
                     return response.json()
                 if response.status_code >= 500:
+                    backoff = min(2 ** attempt * 2, 60)  # 2s, 4s, 8s, 16s, 32s
                     logger.warning(
-                        "Supabase GET %s attempt %d/%d: %s %s",
-                        table, attempt + 1, _retries, response.status_code, response.text[:200],
+                        "Supabase GET %s attempt %d/%d: HTTP %s — retrying in %ds",
+                        table, attempt + 1, _retries, response.status_code, backoff,
                     )
                     if attempt < _retries - 1:
-                        await asyncio.sleep(2 ** attempt)  # 1s, 2s, 4s
+                        await asyncio.sleep(backoff)
                         continue
                 logger.error(
-                    "Supabase GET %s failed: %s %s",
-                    table, response.status_code, response.text[:500],
+                    "Supabase GET %s failed after %d attempts: %s %s",
+                    table, _retries, response.status_code, response.text[:500],
                 )
                 response.raise_for_status()
             except httpx.TimeoutException as exc:
-                logger.warning("Supabase GET %s timeout (attempt %d/%d)", table, attempt + 1, _retries)
+                backoff = min(2 ** attempt * 2, 60)
+                logger.warning(
+                    "Supabase GET %s timeout (attempt %d/%d) — retrying in %ds",
+                    table, attempt + 1, _retries, backoff,
+                )
                 last_exc = exc
                 if attempt < _retries - 1:
-                    await asyncio.sleep(2 ** attempt)
+                    await asyncio.sleep(backoff)
         raise last_exc or RuntimeError(f"Supabase GET {table} failed after {_retries} attempts")
 
     async def _post(self, table: str, data: dict) -> dict | None:
@@ -220,6 +226,7 @@ async def fetch_touchpoints_for_emails(
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
     # Step 1: Resolve emails to contacts (chunked)
+    # Small sleep between chunks to avoid overwhelming Supabase connection pool
     all_contacts: list[dict] = []
     for i in range(0, len(emails), _CHUNK_SIZE):
         chunk = emails[i:i + _CHUNK_SIZE]
@@ -229,6 +236,8 @@ async def fetch_touchpoints_for_emails(
             "email": f"in.({emails_csv})",
         })
         all_contacts.extend(contacts)
+        if i + _CHUNK_SIZE < len(emails):
+            await asyncio.sleep(0.2)
 
     if not all_contacts:
         logger.info("fetch_touchpoints_for_emails: no contacts found for %d emails", len(emails))
