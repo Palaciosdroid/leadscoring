@@ -40,8 +40,10 @@ Zeitraum 2025-12-30 bis 2026-06-20 (~6 Mte). 52.828 contacts, 1.636.520 touchpoi
   1,54% → **März 0,30% (25.317 Kontakte = 48% der DB)** → Apr 0,15% → Mai 0,04% → Jun 0,05%.
   Die gepoolte „1,77%" mischt eine reife Mini-Kohorte mit einem riesigen kalten März-Import.
   → NIE gepoolt arbeiten; per Kohorte + reifezeit-bereinigt.
-- 🔶 Was war der März-Import (25k Kontakte, 0,3%)? Vermutlich kalter Listen-Import, kein
-  Funnel-Lead — erklärt niedrige Conversion + niedrige Phone-Coverage. Provenienz klären (W1).
+- ✅ März-Import = **Customer.io-Subscriber-Sync** (13.461 `source=customerio` + 11.856 null,
+  beide ~82–91% mit cio_id), nur **6,3% Phone**, nur **25% mit Website-Events** aber 99% mit
+  (Email-)Touchpoints → echte, aber niedrig-intente Email-Subscriber, kein kalter Junk.
+  Bestätigt: per Kohorte + per Engagement arbeiten; für den Dialer nur das engagierte Sub-Set (~6k).
 
 ### Reichweite (Phone)
 - ✅ Phone gesamt 8,4% (4.440). Phone-Inhaber kaufen zu **19%**, Phonelose zu **0,19%** (100×).
@@ -69,7 +71,8 @@ Zeitraum 2025-12-30 bis 2026-06-20 (~6 Mte). 52.828 contacts, 1.636.520 touchpoi
   Massenware ⌀363; `gc` ⌀2.458.
 - ✅ `al` „92% Refund" = **Daten-Artefakt** (21/22 am 2026-05-27, refunded binnen ~0,4 Tagen =
   Test-Batch/Bulk-Reversal) — NICHT als Produktkrise werten; ausschließen.
-- 🔶 EUR→`amount_chf` wirkt unterkonvertiert (674k EUR → 299k CHF) — prüfen (W1).
+- ✅ EUR→`amount_chf` korrekt (per-Row-Ratio 0,945); vermeintliche „0,44" war Aggregat-Artefakt
+  einzelner Zeilen — kein systemischer Bug.
 - ✅ 35 Käufe ohne `product_key`.
 
 ### Kanäle
@@ -88,9 +91,13 @@ Zeitraum 2025-12-30 bis 2026-06-20 (~6 Mte). 52.828 contacts, 1.636.520 touchpoi
 
 ### W2 — Deterministischer Score (Quick-Win, datengetrieben ohne ML)  *(braucht W1)*
 - Problem: heute scort nichts (lead_score=0); Hand-Gewichte zielen auf „Engagement".
-- Änderung: einfache, erklärbare Regel auf den überlebenden Signalen:
-  **identifiziert (form_submit) UND (video_complete ODER ≥2 Optins ODER Preis-Seite ODER Phone)**.
-  Dieses Segment konvertiert mit 8–33% vs. 0,19% Basis. Tiers daran kalibrieren.
+- Änderung: einfache, erklärbare Regel. **Score = reines Verhalten** (video_complete ODER ≥2
+  Optins ODER Preis-Seite); **Phone = separater Dialer-Gate**, NICHT als Score-Signal (Phone ist
+  Outcome → sonst Leakage). Tiers an echte Close-Rate kalibrieren.
+- ✅ Validiert gegen echtes Label (completed∪closed_won): identifiziert+qualifiziert **3,29%**
+  (7.816 Kontakte / 257 echte Käufer) vs. identifiziert-aber-unqualifiziert **0,00%** (8.527 / 0)
+  vs. anonym 0,00%. Die Regel fängt praktisch ALLE echten Käufer und schließt die 8.527
+  Null-Käufer-Identifizierten sauber aus.
 - Erfolg: Kevins Queue priorisiert nachweislich höher-konvertierende Segmente; robust, kein Overfit.
 
 ### W3 — Gezielte Reichweite: die ~3.600 warmen Phone-Inhaber  *(braucht W1)*
@@ -138,5 +145,7 @@ bestätigt; URL-Signale nicht reproduzierbar → 🔶). Überlebende Kritiken, a
    deterministischer Score schlägt ML bei dieser Close-Zahl. → Priorität W2/W3 getauscht, W5 vertagt.
 
 ## Offene 🔶 (in den Workstreams zu klären)
-- März-Dump-Provenienz (W1) · URL-Taxonomie an echte Pfade (W1) · EUR→CHF (W1) ·
-  HubSpot-Tier-Verteilung vs. echte Conversion (W4) · Phone-am-Optin Friction-Impact (W3, A/B).
+- URL-Taxonomie an echte Pfade pinnen (W1) · HubSpot-Tier-Verteilung vs. echte Conversion
+  (W4 — braucht HubSpot-API) · Phone-am-Optin Friction-Impact (W3, A/B-Test).
+- Geklärt: März-Dump (CIO-Subscriber-Import, niedrig-intent) · EUR-Konversion (korrekt) ·
+  Deterministik-Regel (gegen echtes Label validiert, 3,29% vs 0,00%).
