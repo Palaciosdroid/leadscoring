@@ -59,6 +59,10 @@ Zeitraum 2025-12-30 bis 2026-06-20 (~6 Mte). 52.828 contacts, 1.636.520 touchpoi
 - ✅ Echtes separierendes Signal *unter* den Identifizierten (Basis 4,67%): `video_complete`
   7,72% (~1,8×), **≥2 Optins 10,21%**, Preis-Seite-Besuch ~33%, Phone-Präsenz. Diese tragen.
 - ✅ `contacts.lead_score` = 100% Null (greenfield — es wird heute faktisch nichts gescort).
+- ✅ **Replay/Webinar-Aufzeichnung geschaut** → 3,49% echte Käufer vs. 0,45% ohne (~7,8×, 1.231
+  Kontakte) — prädiktiv. Quelle = **Whyros** (on-site Video). **CIO trackt das NICHT** (nur Events
+  `form_submit` + `purchase_completed`; CIO-Attribute = Funnel-Optin-Daten, UTM/Ad-Attribution,
+  Tags, `unsubscribed`, Retargeting-Flags). CIOs einziger Proxy = Replay-Link-Klick (Email-Engagement).
 - 🔶 High-Intent-URL-Counts (checkout/price/salespage) sind **taxonomie-abhängig** und
   reproduzierten zwischen den Analysen NICHT sauber (echte Pfade nutzen z.B. `/offer#pricetable`).
   URL-Taxonomie an echte Pfade pinnen, bevor darauf gewichtet wird (W1).
@@ -91,9 +95,10 @@ Zeitraum 2025-12-30 bis 2026-06-20 (~6 Mte). 52.828 contacts, 1.636.520 touchpoi
 
 ### W2 — Deterministischer Score (Quick-Win, datengetrieben ohne ML)  *(braucht W1)*
 - Problem: heute scort nichts (lead_score=0); Hand-Gewichte zielen auf „Engagement".
-- Änderung: einfache, erklärbare Regel. **Score = reines Verhalten** (video_complete ODER ≥2
-  Optins ODER Preis-Seite); **Phone = separater Dialer-Gate**, NICHT als Score-Signal (Phone ist
-  Outcome → sonst Leakage). Tiers an echte Close-Rate kalibrieren.
+- Änderung: einfache, erklärbare Regel. **Score = reines Verhalten** (video_complete ODER
+  **Replay/Webinar-Aufzeichnung geschaut** [3,49%] ODER ≥2 Optins ODER Preis-Seite); **Phone =
+  separater Dialer-Gate**, NICHT als Score-Signal (Phone ist Outcome → sonst Leakage). Tiers an
+  echte Close-Rate kalibrieren. Replay-Signal-Quelle = Whyros, nicht CIO.
 - ✅ Validiert gegen echtes Label (completed∪closed_won): identifiziert+qualifiziert **3,29%**
   (7.816 Kontakte / 257 echte Käufer) vs. identifiziert-aber-unqualifiziert **0,00%** (8.527 / 0)
   vs. anonym 0,00%. Die Regel fängt praktisch ALLE echten Käufer und schließt die 8.527
@@ -115,6 +120,21 @@ Zeitraum 2025-12-30 bis 2026-06-20 (~6 Mte). 52.828 contacts, 1.636.520 touchpoi
 ### W5 — Gefittetes Modell  *(SPÄTER; braucht mehr completed-Labels)*
 - Heute nur ~105–124 Closes / 216 completed → ML würde overfitten. Erst aktivieren, wenn
   W4-Daten + Label-Volumen tragen. Bis dahin schlägt die Heuristik (W2) jedes Modell.
+
+### W6 — CIO→HubSpot Enrichment-Sync (Cron, Email-Match)  *(Enrichment, mittel-Prio, parallel)*
+- Idee (Sandro): Cron, der HubSpot-Kontakte per Email-Match mit CIO abgleicht + fehlende Daten
+  auffüllt, damit HubSpot immer alle CIO-Daten hat.
+- Was CIO liefern kann (verifiziert): Funnel-Optin-Daten pro Funnel (`hc/mc/gc_launch_optin_date`),
+  Offer/Launch-States, UTM/Ad-Attribution (`fbclid`, `hsa_*`), `unsubscribed`, Tags,
+  Retargeting-Audience-Flags. (KEIN „Aufzeichnung geschaut" — das ist Whyros.)
+- Änderung: Cron CIO App-API (`/customers/{email}/attributes?id_type=email`) → HubSpot batch-update,
+  nur LEERE HubSpot-Felder füllen (nie blind überschreiben).
+- Adversarial-Caution: VOR Bau verifizieren, welche Felder HubSpot wirklich fehlen (vs. Whyros-
+  Duplikat — der Scorer liest UTM/Channel schon aus Whyros); Email-Match-Zuverlässigkeit;
+  Volumen/Rate-Limits (52k Kontakte, CIO-Pagination); bewegt den Nordstern nur indirekt (Kontext/
+  Segmentierung), kein Kern-Hebel.
+- Erfolg: HubSpot-Kontakte vollständiger für Segmentierung + Kevins Kontext; messbar via
+  Feld-Coverage vorher/nachher.
 
 ### Parallel — Lecks  *(diagnostisch, leicht)*
 - 97 No-Shows (15%) → Reminder (ggf. MC-Setter-Territorium); product_key-Backfill.
