@@ -149,6 +149,7 @@ async def _fetch_active_hubspot_leads() -> list[dict[str, Any]]:
             "hs_email_open_count", "hs_email_click_count",
             "lead_pause_until", "lead_no_answer_streak",
             "lead_no_answer_cycles", "lead_dialer_removed",
+            "lead_phone_dnc",
         ],
         "limit": 100,
     }
@@ -963,6 +964,7 @@ async def run_batch_scoring() -> None:
                 call_booked=call_booked,
                 not_interested=not_interested,
                 unsubscribed=unsubscribed,
+                phone_dnc=_truthy(props.get("lead_phone_dnc")),
                 purchased_funnels=purchased_funnels,
                 call_outcome=call_outcome,
             )

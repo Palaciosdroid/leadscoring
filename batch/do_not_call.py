@@ -35,6 +35,7 @@ async def check_do_not_call(
     call_booked: bool = False,
     not_interested: bool = False,
     unsubscribed: bool = False,
+    phone_dnc: bool = False,
     purchased_funnels: list[str] | None = None,
     call_outcome: str | None = None,
     **kwargs: Any,
@@ -49,6 +50,11 @@ async def check_do_not_call(
     4. Already purchased same funnel (CIO)       -> skip
     5. Marked as "not interested" (Aircall)      -> skip
     """
+
+    # 0. Telephone do-not-call — permanent, independent of email opt-out
+    if phone_dnc:
+        logger.info("DNC skip [phone_dnc]: %s", email)
+        return DoNotCallResult(should_skip=True, reason="phone_dnc")
 
     # 1. Unsubscribed (from CIO attributes or explicit parameter)
     if unsubscribed:
