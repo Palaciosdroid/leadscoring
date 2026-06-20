@@ -241,6 +241,7 @@ class BatchRunStats:
     dialer_verified_count: int = -1
     skipped_cold: int = 0
     skipped_dnc: int = 0
+    phone_invalid: int = 0            # leads with an unfixable phone number this run
     decay_count: int = 0              # tier downgrades this run (summary only, no individual alerts)
     duration_seconds: float = 0.0
     fatal_error: str | None = None    # set if batch crashed before completing
@@ -286,6 +287,11 @@ def _build_batch_report_message(stats: BatchRunStats) -> dict[str, Any]:
             # Truncate long error bodies — just show the key message
             truncated = sample[:200] + "…" if len(sample) > 200 else sample
             lines.append(f"  › `{truncated}`")
+
+    if stats.phone_invalid:
+        lines.append(
+            f":telephone_receiver: *{stats.phone_invalid} ungültige Nummer(n)* — manuell prüfen"
+        )
 
     if stats.fatal_error:
         lines.append(f":skull: *Fatal:* `{stats.fatal_error[:300]}`")
