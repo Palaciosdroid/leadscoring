@@ -147,6 +147,8 @@ async def _fetch_active_hubspot_leads() -> list[dict[str, Any]]:
             "lead_last_call_date", "lead_last_call_outcome",
             "lead_call_attempts", "lead_not_interested", "lead_call_booked",
             "hs_email_open_count", "hs_email_click_count",
+            "lead_pause_until", "lead_no_answer_streak",
+            "lead_no_answer_cycles", "lead_dialer_removed",
         ],
         "limit": 100,
     }
@@ -1035,23 +1037,15 @@ async def run_batch_scoring() -> None:
                     or is_dormant_warm
                 )
 
-            # Exclusion check: cooldown, permanent remove, max attempts
-            # (call_outcome already read above for DNC check)
-            try:
-                call_attempts = int(props.get("lead_call_attempts") or 0)
-            except (ValueError, TypeError):
-                call_attempts = 0
-
-            if should_push:
-                excluded, exclude_reason = _should_exclude_from_queue(
-                    last_call_date, call_outcome, call_attempts,
+            # Exclusion: lifecycle pause / removed (replaces the old day-cooldowns).
+            # Intent reactivation lifts an active pause when a high-intent event
+            # arrived after the last call.
+            if should_push and _is_paused_or_removed(props, now_utc, scored_events):
+                logger.debug(
+                    "Batch: dialer-pause exclude %s (pause_until=%s removed=%s)",
+                    email, props.get("lead_pause_until"), props.get("lead_dialer_removed"),
                 )
-                if excluded:
-                    logger.debug(
-                        "Batch: queue exclude %s — %s (last call %s, attempts=%d)",
-                        email, exclude_reason, last_call_date, call_attempts,
-                    )
-                    should_push = False
+                should_push = False
 
             # Käufer-Listen: buyers with phone go into observation lists.
             # Only contacts WITH phone are added — phone-less buyers are tracked in HubSpot only.
@@ -1510,3 +1504,59 @@ def _truthy(value: Any) -> bool:
     if isinstance(value, str):
         return value.lower() in ("true", "1", "yes")
     return bool(value)
+
+
+# High-intent events that lift a pause early (intent reactivation).
+HIGH_INTENT_EVENTS: frozenset[str] = frozenset({
+    "checkout_visited",
+    "price_info_viewed",
+    "cta_clicked",
+    "email_link_clicked",
+})
+
+
+def _is_intent_reactivated(
+    scored_events: list[dict], last_call_date: str | None,
+) -> bool:
+    """True if a high-intent event occurred AFTER the last call (the pause anchor)."""
+    if not last_call_date:
+        return False
+    try:
+        anchor = datetime.fromisoformat(last_call_date.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return False
+    for ev in scored_events:
+        if ev.get("event_type") not in HIGH_INTENT_EVENTS:
+            continue
+        ts_raw = ev.get("timestamp", "")
+        try:
+            ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            continue
+        if ts > anchor:
+            return True
+    return False
+
+
+def _is_paused_or_removed(
+    props: dict, now: datetime, scored_events: list[dict],
+) -> bool:
+    """Decide if a lead is currently excluded from the Aircall dialer.
+
+    Excluded when removed (cycle cap / wrong number) or inside an active pause
+    window — unless a high-intent event arrived after the last call.
+    """
+    if _truthy(props.get("lead_dialer_removed")):
+        return True
+    pause_raw = (props.get("lead_pause_until") or "").strip()
+    if not pause_raw:
+        return False
+    try:
+        pause_until = datetime.fromisoformat(pause_raw.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return False
+    if now >= pause_until:
+        return False  # pause expired -> re-enter
+    if _is_intent_reactivated(scored_events, props.get("lead_last_call_date")):
+        return False  # high-intent signal lifts the pause
+    return True
