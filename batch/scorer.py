@@ -1405,6 +1405,26 @@ _PRODUCT_KEY_DISPLAY: dict[str, str] = {
     "med":  "Medizinische Grundlagen",
 }
 
+# Sentinel for purchases with NULL/empty/unknown product_key. We never guess a
+# funnel for these — they are surfaced as 'unclassified' and logged so the
+# taxonomy (~35 known NULLs) can be cleaned up at the source, not in code.
+UNCLASSIFIED_PRODUCT_KEY = "unclassified"
+
+
+def classify_product_key(product_key: str | None) -> str:
+    """
+    Normalize a Supabase ``product_key`` for classification.
+
+    Returns the lowercased key if it is a known product, otherwise
+    ``UNCLASSIFIED_PRODUCT_KEY`` (for NULL/empty/unknown keys). Logs the
+    unclassified case at debug level — never raises, never guesses a funnel.
+    """
+    pk = (product_key or "").lower().strip()
+    if pk and pk in _PRODUCT_KEY_DISPLAY:
+        return pk
+    logger.debug("product_key %r is unclassified — not mapped to a funnel", product_key)
+    return UNCLASSIFIED_PRODUCT_KEY
+
 
 def _format_purchases_display(purchases: list[dict]) -> str:
     """
@@ -1485,7 +1505,8 @@ def _extract_purchased_funnels(purchases: list[dict]) -> list[str]:
     """
     funnels: set[str] = set()
     for p in purchases:
-        pk = (p.get("product_key") or "").lower()
+        # Normalize + log NULL/unknown keys as 'unclassified' (never guessed).
+        pk = classify_product_key(p.get("product_key"))
         pname = (p.get("product_name") or "").lower()
         # Skip bundle/entry products — not a full Ausbildung purchase
         if any(pat in pname for pat in _BUNDLE_PRODUCT_PATTERNS):
