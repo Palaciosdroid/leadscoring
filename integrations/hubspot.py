@@ -687,10 +687,13 @@ async def batch_add_to_list(
         for i in range(0, len(contact_ids), chunk_size):
             chunk = contact_ids[i:i + chunk_size]
             try:
+                # HubSpot Lists v3 memberships/add expects a BARE JSON array of
+                # record IDs (["123","456"]), NOT an object — wrapping it caused a
+                # 400 "Cannot deserialize ArrayList from Object" (pre-existing bug).
                 resp = await client.put(
                     url,
                     headers=_headers(),
-                    json={"recordIds": chunk},
+                    json=chunk,
                 )
                 if resp.status_code in (200, 204):
                     added += len(chunk)
