@@ -53,8 +53,12 @@ Signal-Quellen: Whyros(Verhalten+Ad-Attr) · CIO(Engage) · Tally(Antworten) · 
         └─ Feedback B (W9): Deal Won → Meta/Google via CAPIG (value-based) ────┘
 ```
 Zwei Loops: (A) Outcome kalibriert/trainiert den Score; (B) **W9** spielt echte Abschlüsse +
-Wert an die Ad-Plattformen zurück → Algorithmen optimieren auf Käufer statt Leads. Beide nutzen
-**bestehende** Infra (Stape sGTM `GTM-PN6X3W6Z` + CAPIG `sptpwfrm`, Meta-Pixel 314804183334525).
+Wert an die Ad-Plattformen zurück → Algorithmen optimieren auf Käufer statt Leads.
+**Wichtig (Tracking-Crew):** sGTM `GTM-PN6X3W6Z` v20 ist **geparkt** (alle CAPI-Tags paused, bewusst
+kein 2. Meta-Pfad); aktiver Server-Leg = **CAPIG** `sptpwfrm` (Pixel 314). gclid/fbclid in Whyros sind
+**client-side** (Collector), unabhängig vom sGTM. **W9 ist KEIN Neubau** — die Tracking-Crew sendet
+Conversions bereits (Bexio/Ablefy → Meta-CAPI; geplanter Railway-Service `palacios-tracking`) →
+**koordinieren, nicht doppeln** (Obsidian [[Lead-Scoring-Tracking-Synergien-2026-06-20]]).
 
 - **Engine** liest Whyros (Verhalten) + HubSpot (CRM/Phone/Tier) + CIO (Segmente) [+ künftig Tally-Antworten], rechnet Score→Tier, schreibt HubSpot, füttert Aircall.
 - **Label/Feedback** = HubSpot Deal Won (Vertrieb) → kalibriert + trainiert den Score (Loop = W4).
@@ -102,10 +106,13 @@ ersetzt das kaputte `total_revenue` als Wert-Label; ermöglicht ROAS/CAC korrekt
 - Befund: 7.485 Kontakte sind ad-attribuiert (gclid 73k / fbclid 270k / meta_ad_id 273k Events).
   Ad-Param als **direktes** Score-Signal schwach (0,72% vs 0,48%) — Wert liegt im Loop.
 - Lücke: Klick-IDs gehen rein, aber **echte Abschlüsse gehen nicht zurück**.
-- Änderung: HubSpot **Deal Won + Deal-Wert** via vorhandene Stape-CAPIG (`sptpwfrm`, Pixel 314)
-  serverseitig an Meta/Google zurückspielen → Optimierung auf Käufer statt Leads.
-- Plus: CAC/Qualität pro Kampagne aus `ad_spend` (15.967) + Attribution.
-- Risiko: Pixel-Sync war 2026-05-26 pending — vor Aktivierung CAPIG-Status verifizieren.
+- ⚠️ **Koordination PFLICHT (kein Parallel-Sender):** die Tracking-Crew (Multi-CC-Board) sendet
+  Conversions bereits (`bexio_meta_offline.py` Diplome → Meta-CAPI, `ablefy/kajabi`-Sender; geplanter
+  Service `palacios-tracking`). W9 NICHT parallel bauen — abstimmen, ob HubSpot `Deal Won` etwas VOR
+  der Bexio-Zahlung beiträgt (CRM-Stage vs. bezahlt). AW-8-Dedup-Disziplin (1 event_id/Sale) respektieren.
+- sGTM v20 geparkt (CAPI-Tags paused) → Server-Leg via CAPIG; gclid/fbclid client-side in Whyros.
+- Plus (falls additiv): CAC/Qualität pro Kampagne aus `ad_spend` (15.967) + Attribution.
+- Risiko: Doppel-Sender / Pixel-314-Mehrfachzählung — daher Tracking-Crew-PM-Abstimmung vor jeder Aktivierung.
 
 ## Offene Verifikation 🔶
 - HubSpot lead_*-Props enthalten bereits die Lifecycle-/Phone-Felder (`lead_pause_until`,
