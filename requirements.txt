@@ -4,4 +4,5 @@ httpx==0.28.1
 apscheduler==3.10.4
 pydantic==2.9.2
 python-dotenv==1.0.1
+phonenumbers~=8.13
 # openai SDK not needed — Whisper called directly via httpx
