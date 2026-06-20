@@ -9,15 +9,18 @@ class TestMapCioEvent:
     # --- Page events resolved by URL ---
 
     def test_page_checkout(self):
-        raw = {"event": "page", "data": {"page": {"url": "https://sbc.de/checkout/step1"}}}
+        # Canonical funnel taxonomy: payment path → checkout
+        raw = {"event": "page", "data": {"page": {"url": "https://sbc.de/grundausbildung/payment"}}}
         assert _map_cio_event(raw) == "checkout_visited"
 
     def test_page_sales(self):
-        raw = {"event": "page", "data": {"page": {"url": "https://sbc.de/hypnose-ausbildung"}}}
+        # Canonical funnel taxonomy: /offer path → sales page
+        raw = {"event": "page", "data": {"page": {"url": "https://sbc.de/grundausbildung/offer"}}}
         assert _map_cio_event(raw) == "sales_page_visited"
 
     def test_page_price(self):
-        raw = {"event": "page", "data": {"page": {"url": "https://sbc.de/preise-und-kosten"}}}
+        # Canonical funnel taxonomy: kosten-termine → price
+        raw = {"event": "page", "data": {"page": {"url": "https://sbc.de/kosten-termine"}}}
         assert _map_cio_event(raw) == "price_info_viewed"
 
     def test_page_generic(self):
@@ -45,11 +48,13 @@ class TestMapCioEvent:
     # --- Click events resolved by URL ---
 
     def test_click_checkout(self):
-        raw = {"event": "click", "data": {"page": {"url": "https://sbc.de/buy-now"}}}
+        # Canonical funnel taxonomy: payment path → checkout
+        raw = {"event": "click", "data": {"page": {"url": "https://sbc.de/grundausbildung/payment"}}}
         assert _map_cio_event(raw) == "checkout_visited"
 
     def test_click_sales_cta(self):
-        raw = {"event": "click", "data": {"page": {"url": "https://sbc.de/coaching-programm"}}}
+        # Canonical funnel taxonomy: CTA on /offer page → cta_clicked
+        raw = {"event": "click", "data": {"page": {"url": "https://sbc.de/grundausbildung/offer"}}}
         assert _map_cio_event(raw) == "cta_clicked"
 
     def test_click_generic_ignored(self):

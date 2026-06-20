@@ -121,9 +121,43 @@ CIO_METRIC_MAP: dict[str, str | None] = {
     "drafted":       None,
 }
 
-CHECKOUT_URL_PATTERNS  = ("checkout", "warenkorb", "order", "buy")
-SALES_PAGE_PATTERNS    = ("ausbildung", "coaching", "kurs", "programm", "product")
-PRICE_INFO_PATTERNS    = ("preis", "price", "invest", "kosten", "cost")
+# ---------------------------------------------------------------------------
+# Canonical funnel URL taxonomy (Tracking-Crew-Kanon, GA4-verified).
+# Real funnel paths — NOT guessed keywords. See docs/DATA_DICTIONARY.md.
+# Precedence (most specific intent first): checkout > price > eignungscheck
+# > replay > sales/offer > optin. Order matters because some paths overlap
+# (e.g. masterclass is both replay and offer; kosten-termine is both price
+# and offer) — the higher-intent classification wins.
+# ---------------------------------------------------------------------------
+CHECKOUT_URL_PATTERNS    = ("/payment", "inner-journey-payment", "bookinea.app")
+SALES_PAGE_PATTERNS      = ("/offer", "/masterclass", "/grundausbildung/", "kosten-termine")
+PRICE_INFO_PATTERNS      = ("kosten-termine",)
+EIGNUNGSCHECK_PATTERNS   = ("/eignungscheck", "/onsite/eignungscheck/")
+REPLAY_URL_PATTERNS      = ("basisseminar", "masterclass", "live-workshop",
+                            "day-1", "day-2", "day-3", "day-4")
+OPTIN_URL_PATTERNS       = ("/optin", "/optin-thx")
+
+
+def _classify_funnel_url(url: str) -> str | None:
+    """
+    Classify a funnel URL into its internal event_type using the canonical
+    Tracking-Crew taxonomy. Returns None when the URL matches no funnel path.
+
+    Precedence is intentional — see the pattern-constant block above.
+    """
+    if any(p in url for p in CHECKOUT_URL_PATTERNS):
+        return "checkout_visited"
+    if any(p in url for p in PRICE_INFO_PATTERNS):
+        return "price_info_viewed"
+    if any(p in url for p in EIGNUNGSCHECK_PATTERNS):
+        return "application_submitted"   # Eignungscheck quiz = application step
+    if any(p in url for p in REPLAY_URL_PATTERNS):
+        return "video_watched_50"        # replay/webinar page = video-watch intent
+    if any(p in url for p in SALES_PAGE_PATTERNS):
+        return "sales_page_visited"
+    if any(p in url for p in OPTIN_URL_PATTERNS):
+        return "page_visited"            # optin/thank-you = tracked, low-intent
+    return None
 
 
 def _map_cio_event(raw_event: dict[str, Any]) -> str | None:
@@ -131,15 +165,9 @@ def _map_cio_event(raw_event: dict[str, Any]) -> str | None:
     event_name = raw_event.get("event", "")
     url = (raw_event.get("data", {}) or {}).get("page", {}).get("url", "").lower()
 
-    # Page events — resolve by URL
+    # Page events — resolve by canonical funnel URL, default page_visited
     if event_name == "page":
-        if any(p in url for p in CHECKOUT_URL_PATTERNS):
-            return "checkout_visited"
-        if any(p in url for p in PRICE_INFO_PATTERNS):
-            return "price_info_viewed"
-        if any(p in url for p in SALES_PAGE_PATTERNS):
-            return "sales_page_visited"
-        return "page_visited"
+        return _classify_funnel_url(url) or "page_visited"
 
     # Video progress — resolve by threshold
     if event_name == "video_progress":
@@ -150,15 +178,14 @@ def _map_cio_event(raw_event: dict[str, Any]) -> str | None:
             return "video_watched_50"
         return None  # below 50% — ignore
 
-    # Click events — resolve by URL (CTA-level detail)
+    # Click events — resolve by canonical funnel URL (CTA-level detail)
     if event_name == "click":
-        if any(p in url for p in CHECKOUT_URL_PATTERNS):
-            return "checkout_visited"     # clicking into checkout = strong signal
-        if any(p in url for p in PRICE_INFO_PATTERNS):
-            return "price_info_viewed"
-        if any(p in url for p in SALES_PAGE_PATTERNS):
+        classified = _classify_funnel_url(url)
+        if classified == "sales_page_visited":
             return "cta_clicked"          # CTA on sales page
-        return None                       # generic click — not worth scoring
+        if classified == "page_visited":
+            return None                   # optin click — not worth scoring
+        return classified                 # checkout/price/eignungscheck/replay, or None
 
     return CIO_EVENT_MAP.get(event_name)
 
@@ -514,15 +541,13 @@ async def _handle_cio_reporting_webhook(body: dict[str, Any]) -> ScoreResponse:
         "metadata": data,
     }]
 
-    # For click events, refine by URL pattern
+    # For click events, refine by canonical funnel URL pattern
     if metric == "clicked" and url:
-        url_lower = url.lower()
-        if any(p in url_lower for p in CHECKOUT_URL_PATTERNS):
-            mapped_events[0]["event_type"] = "checkout_visited"
-        elif any(p in url_lower for p in PRICE_INFO_PATTERNS):
-            mapped_events[0]["event_type"] = "price_info_viewed"
-        elif any(p in url_lower for p in SALES_PAGE_PATTERNS):
-            mapped_events[0]["event_type"] = "cta_clicked"
+        classified = _classify_funnel_url(url.lower())
+        if classified == "sales_page_visited":
+            mapped_events[0]["event_type"] = "cta_clicked"   # CTA on sales page
+        elif classified and classified != "page_visited":
+            mapped_events[0]["event_type"] = classified      # checkout/price/eignungscheck/replay
 
     logger.info("CIO webhook: metric=%s → event_type=%s for %s",
                 metric, mapped_events[0]["event_type"], contact_id)

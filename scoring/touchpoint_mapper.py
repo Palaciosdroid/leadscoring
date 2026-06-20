@@ -98,26 +98,37 @@ def map_touchpoints_batch(touchpoints: list[dict]) -> list[dict]:
 # Browser event mapping (Supabase events table)
 # ---------------------------------------------------------------------------
 
-# URL patterns that indicate high-intent pages
-_OFFER_URL_PATTERNS = ("/offer", "/angebot")
-_CHECKOUT_URL_PATTERNS = ("/checkout", "/bezahlen", "/payment", "/order")
-_PRICE_URL_PATTERNS = ("/kosten", "/preise", "/pricing", "/kosten-termine")
+# Canonical funnel URL taxonomy (Tracking-Crew-Kanon, GA4-verified).
+# Mirrors the patterns in main.py — real funnel paths, not guessed keywords.
+# Precedence (most specific intent first): checkout > price > eignungscheck
+# > replay > offer > optin. Order matters because some paths overlap
+# (masterclass = replay+offer; kosten-termine = price+offer) — highest intent wins.
+_CHECKOUT_URL_PATTERNS = ("/payment", "inner-journey-payment", "bookinea.app")
+_PRICE_URL_PATTERNS = ("kosten-termine",)
+_EIGNUNGSCHECK_URL_PATTERNS = ("/eignungscheck", "/onsite/eignungscheck/")
+_REPLAY_URL_PATTERNS = ("basisseminar", "masterclass", "live-workshop",
+                        "day-1", "day-2", "day-3", "day-4")
+_OFFER_URL_PATTERNS = ("/offer", "/masterclass", "/grundausbildung/", "kosten-termine")
+_OPTIN_URL_PATTERNS = ("/optin", "/optin-thx")
 
 
 def _classify_page_url(url: str | None) -> str | None:
-    """Classify a page URL into an intent category."""
+    """Classify a page URL into an intent category (canonical funnel taxonomy)."""
     if not url:
         return None
     url_lower = url.lower()
-    for pattern in _CHECKOUT_URL_PATTERNS:
-        if pattern in url_lower:
-            return "checkout"
-    for pattern in _OFFER_URL_PATTERNS:
-        if pattern in url_lower:
-            return "offer"
-    for pattern in _PRICE_URL_PATTERNS:
-        if pattern in url_lower:
-            return "price"
+    if any(p in url_lower for p in _CHECKOUT_URL_PATTERNS):
+        return "checkout"
+    if any(p in url_lower for p in _PRICE_URL_PATTERNS):
+        return "price"
+    if any(p in url_lower for p in _EIGNUNGSCHECK_URL_PATTERNS):
+        return "eignungscheck"
+    if any(p in url_lower for p in _REPLAY_URL_PATTERNS):
+        return "replay"
+    if any(p in url_lower for p in _OFFER_URL_PATTERNS):
+        return "offer"
+    if any(p in url_lower for p in _OPTIN_URL_PATTERNS):
+        return "optin"
     return None
 
 
@@ -140,15 +151,19 @@ def map_browser_event(event: dict) -> dict | None:
     if event_type == "pageview":
         if page_class == "checkout":
             scored_type = "checkout_visited"
-        elif page_class == "offer":
-            scored_type = "sales_page_visited"
         elif page_class == "price":
             scored_type = "price_info_viewed"
+        elif page_class == "eignungscheck":
+            scored_type = "application_submitted"   # Eignungscheck quiz = application step
+        elif page_class == "replay":
+            scored_type = "video_watched_50"         # replay/webinar page = video-watch intent
+        elif page_class == "offer":
+            scored_type = "sales_page_visited"
         else:
-            scored_type = "page_visited"
+            scored_type = "page_visited"             # incl. optin/thank-you — low-intent
 
     elif event_type == "click":
-        if page_class in ("offer", "checkout"):
+        if page_class in ("offer", "checkout", "eignungscheck"):
             scored_type = "cta_clicked"
 
     elif event_type == "video_complete":
