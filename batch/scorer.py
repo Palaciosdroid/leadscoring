@@ -17,6 +17,8 @@ from typing import Any
 import httpx
 
 from batch.do_not_call import check_do_not_call
+from batch.call_window import is_within_call_window
+from integrations.phone import validate_and_normalize, region_for
 from integrations.supabase import (
     fetch_touchpoints_for_emails,
     fetch_all_lead_data,
@@ -147,6 +149,9 @@ async def _fetch_active_hubspot_leads() -> list[dict[str, Any]]:
             "lead_last_call_date", "lead_last_call_outcome",
             "lead_call_attempts", "lead_not_interested", "lead_call_booked",
             "hs_email_open_count", "hs_email_click_count",
+            "lead_pause_until", "lead_no_answer_streak",
+            "lead_no_answer_cycles", "lead_dialer_removed",
+            "lead_phone_dnc",
         ],
         "limit": 100,
     }
@@ -776,6 +781,7 @@ async def run_batch_scoring() -> None:
     list_memberships: dict[str, list[str]] = {k: [] for k in LISTS}
     skipped_dnc = 0
     skipped_cold = 0
+    invalid_phones: list[dict[str, Any]] = []
 
     now_utc = datetime.now(timezone.utc)
 
@@ -944,10 +950,15 @@ async def run_batch_scoring() -> None:
                 or _truthy(props.get("lead_call_booked"))
             )
             not_interested = _truthy(props.get("lead_not_interested"))
-            _raw_phone = _normalize_phone(
-                (props.get("phone") or props.get("mobilephone") or "").strip()
-            )
-            has_phone = len(_raw_phone) > 6  # reject stubs like "+41", "+49", "+"
+            _raw_value = (props.get("phone") or props.get("mobilephone") or "").strip()
+            if _raw_value:
+                _raw_phone, _phone_status = validate_and_normalize(_raw_value)
+                _raw_phone = _raw_phone or ""
+                if _phone_status == "invalid":
+                    invalid_phones.append({"email": email, "raw": _raw_value})
+            else:
+                _raw_phone, _phone_status = "", ""
+            has_phone = bool(_raw_phone)  # only valid E.164 numbers are dialable
 
             # Read call outcome early — needed for both DNC and cooldown
             call_outcome = props.get("lead_last_call_outcome")
@@ -961,6 +972,7 @@ async def run_batch_scoring() -> None:
                 call_booked=call_booked,
                 not_interested=not_interested,
                 unsubscribed=unsubscribed,
+                phone_dnc=_truthy(props.get("lead_phone_dnc")),
                 purchased_funnels=purchased_funnels,
                 call_outcome=call_outcome,
             )
@@ -1035,23 +1047,15 @@ async def run_batch_scoring() -> None:
                     or is_dormant_warm
                 )
 
-            # Exclusion check: cooldown, permanent remove, max attempts
-            # (call_outcome already read above for DNC check)
-            try:
-                call_attempts = int(props.get("lead_call_attempts") or 0)
-            except (ValueError, TypeError):
-                call_attempts = 0
-
-            if should_push:
-                excluded, exclude_reason = _should_exclude_from_queue(
-                    last_call_date, call_outcome, call_attempts,
+            # Exclusion: lifecycle pause / removed (replaces the old day-cooldowns).
+            # Intent reactivation lifts an active pause when a high-intent event
+            # arrived after the last call.
+            if should_push and _is_paused_or_removed(props, now_utc, scored_events):
+                logger.debug(
+                    "Batch: dialer-pause exclude %s (pause_until=%s removed=%s)",
+                    email, props.get("lead_pause_until"), props.get("lead_dialer_removed"),
                 )
-                if excluded:
-                    logger.debug(
-                        "Batch: queue exclude %s — %s (last call %s, attempts=%d)",
-                        email, exclude_reason, last_call_date, call_attempts,
-                    )
-                    should_push = False
+                should_push = False
 
             # Käufer-Listen: buyers with phone go into observation lists.
             # Only contacts WITH phone are added — phone-less buyers are tracked in HubSpot only.
@@ -1087,6 +1091,8 @@ async def run_batch_scoring() -> None:
                 is_fresh=is_fresh,
                 purchases=purchases,
             )
+            if _phone_status:
+                hs_properties["lead_phone_status"] = _phone_status
 
             # For dormant Hot/Warm leads: preserve stored tier in HubSpot.
             # Without this, the batch would write lead_tier="3_cold" (score=0)
@@ -1221,6 +1227,7 @@ async def run_batch_scoring() -> None:
     _stats.leads_processed = len(email_lead_map)
     _stats.skipped_cold = skipped_cold
     _stats.skipped_dnc = skipped_dnc
+    _stats.phone_invalid = len(invalid_phones)
     updated, _hs_errors, _hs_error_samples = await _batch_update_hubspot_contacts(hubspot_updates)
     _stats.hs_updates_ok = updated
     _stats.hs_chunk_errors = _hs_errors
@@ -1266,6 +1273,20 @@ async def run_batch_scoring() -> None:
     # Aircall Power Dialer shows the LAST-added contact on TOP.
     # So we push lowest priority FIRST, highest priority LAST:
     # Warm (lowest score) → Hot → Fresh → EC (pushed last = shown first)
+    # Dedupe by phone — same person under multiple emails => one queue entry.
+    # Keep the highest-priority item per number (lowest _aircall_priority_key).
+    _by_phone: dict[str, dict[str, Any]] = {}
+    for _item in aircall_queue:
+        _ph = _item["phone"]
+        _existing = _by_phone.get(_ph)
+        if _existing is None or _aircall_priority_key(_item) < _aircall_priority_key(_existing):
+            _by_phone[_ph] = _item
+    if len(_by_phone) < len(aircall_queue):
+        logger.info(
+            "Batch: deduped Aircall queue %d → %d by phone",
+            len(aircall_queue), len(_by_phone),
+        )
+    aircall_queue = list(_by_phone.values())
     aircall_queue.sort(key=_aircall_priority_key, reverse=True)
     logger.info(
         "Batch: Aircall queue has %d leads (sorted: EC→Fresh→Hot→Warm)",
@@ -1276,6 +1297,12 @@ async def run_batch_scoring() -> None:
         try:
             from integrations.aircall import add_to_power_dialer
             if item["phone"]:
+                if not is_within_call_window(region_for(item["phone"]), now_utc):
+                    logger.debug(
+                        "Batch: outside call window for %s — skip push this run",
+                        item["email"],
+                    )
+                    continue
                 lead_dict = {
                     "phone": item["phone"],
                     "firstname": item["firstname"],
@@ -1510,3 +1537,59 @@ def _truthy(value: Any) -> bool:
     if isinstance(value, str):
         return value.lower() in ("true", "1", "yes")
     return bool(value)
+
+
+# High-intent events that lift a pause early (intent reactivation).
+HIGH_INTENT_EVENTS: frozenset[str] = frozenset({
+    "checkout_visited",
+    "price_info_viewed",
+    "cta_clicked",
+    "email_link_clicked",
+})
+
+
+def _is_intent_reactivated(
+    scored_events: list[dict], last_call_date: str | None,
+) -> bool:
+    """True if a high-intent event occurred AFTER the last call (the pause anchor)."""
+    if not last_call_date:
+        return False
+    try:
+        anchor = datetime.fromisoformat(last_call_date.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return False
+    for ev in scored_events:
+        if ev.get("event_type") not in HIGH_INTENT_EVENTS:
+            continue
+        ts_raw = ev.get("timestamp", "")
+        try:
+            ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            continue
+        if ts > anchor:
+            return True
+    return False
+
+
+def _is_paused_or_removed(
+    props: dict, now: datetime, scored_events: list[dict],
+) -> bool:
+    """Decide if a lead is currently excluded from the Aircall dialer.
+
+    Excluded when removed (cycle cap / wrong number) or inside an active pause
+    window — unless a high-intent event arrived after the last call.
+    """
+    if _truthy(props.get("lead_dialer_removed")):
+        return True
+    pause_raw = (props.get("lead_pause_until") or "").strip()
+    if not pause_raw:
+        return False
+    try:
+        pause_until = datetime.fromisoformat(pause_raw.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return False
+    if now >= pause_until:
+        return False  # pause expired -> re-enter
+    if _is_intent_reactivated(scored_events, props.get("lead_last_call_date")):
+        return False  # high-intent signal lifts the pause
+    return True
