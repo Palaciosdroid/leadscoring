@@ -42,14 +42,19 @@ Quellen: Whyros (Supabase `kugjoikxhdsueddbbeyu`, RO), CIO App-API (EU), HubSpot
 ## Architektur (siehe Diagramm im Chat)
 
 ```
-Signale-IN                     ENGINE                 OUTPUT            WAHRHEIT/LABEL
-Whyros (Verhalten)  ┐
-Customer.io (Engage)├─► SBC Scoring-Engine ─► HubSpot Tier ─► Aircall ─► HubSpot Deals (747 Won)
-Tally (Antworten)   │   (Railway)              + Lists        Dialer      + Bexio (Umsatz)
-HubSpot CRM         ┘                                         (Kevin)         │
+Meta/Google Ads ─► Stape sGTM+CAPIG (Klick-IDs) ─► Whyros
+                                                      │
+Signal-Quellen: Whyros(Verhalten+Ad-Attr) · CIO(Engage) · Tally(Antworten) · HubSpot(CRM)
+        │                                                                     ▲
+        ▼                                                                     │
+   SBC Scoring-Engine ─► HubSpot Tier+Lists ─► Aircall Dialer(Kevin) ─► HubSpot Deals(747)+Bexio
         ▲                                                                     │
-        └──────────────── Feedback: Outcome → Re-Kalibrierung ────────────────┘
+        ├──────── Feedback A: Outcome → Re-Kalibrierung ──────────────────────┤
+        └─ Feedback B (W9): Deal Won → Meta/Google via CAPIG (value-based) ────┘
 ```
+Zwei Loops: (A) Outcome kalibriert/trainiert den Score; (B) **W9** spielt echte Abschlüsse +
+Wert an die Ad-Plattformen zurück → Algorithmen optimieren auf Käufer statt Leads. Beide nutzen
+**bestehende** Infra (Stape sGTM `GTM-PN6X3W6Z` + CAPIG `sptpwfrm`, Meta-Pixel 314804183334525).
 
 - **Engine** liest Whyros (Verhalten) + HubSpot (CRM/Phone/Tier) + CIO (Segmente) [+ künftig Tally-Antworten], rechnet Score→Tier, schreibt HubSpot, füttert Aircall.
 - **Label/Feedback** = HubSpot Deal Won (Vertrieb) → kalibriert + trainiert den Score (Loop = W4).
@@ -73,7 +78,34 @@ HubSpot CRM         ┘                                         (Kevin)         
 | W6 CIO-Sync | Engagement/Segmente/Unsub → HubSpot (KEIN Phone-Recovery) | Phone-Begründung gestrichen |
 | **W7 (neu)** Tally-Antworten | Eignungscheck-Antworten als Qualifikations-Signal + Kevins Card | NEU — hohes Potenzial |
 | **W8 (neu)** Bexio-Umsatz | Geld-Wahrheit für Label-Wert/ROAS | NEU |
+| **W9 (neu)** Server-Side Conversion-Feedback | Deal Won → Meta/Google via Stape CAPIG (value-based bidding) | NEU — nutzt bestehende Tracking-Infra |
 | Lecks | No-Show; `al`=Artefakt | unverändert |
+
+## Workstream-Details: W7 / W8 / W9
+
+### W7 — Tally-Eignungscheck-Antworten *(größter ungenutzter Signal-Hebel)*
+Form `nPJzEe` „Hypnose-Eignungscheck": 2.533 completed (von 6.912). Pro Lead bisher ungenutzt:
+- **Budget** (✅ verteilt): Unter 2000 **57%** · 2000–4000 26% · 4000–6000 5% · 6000–8000 0,7%
+  → echte Käufer-Range (4000+) = ~146 Leads. Killer-Qualifier (Ausbildung ~CHF 4–9k).
+- **Beratung gewünscht:** „Ja, gerne!" **745** → sofort in Dialer.
+- **Interesse:** „richtiger nächster Schritt" 450 (heiß) vs. „grundsätzlich" 1.877 vs. „gar nicht" 154.
+- **Ziel:** Pers. Weiterentwicklung 1.273 · Beruflicher Wechsel/2. Standbein 953 · Methodik 255.
+- 9-Fragen-Self-Assessment mit **berechnetem Score** (Calculated Fields) + UTM-Hidden-Fields.
+- Nutzung: Budget/Interesse/Beratung → Score-Boost/-Gate; Ziel+Score → Kevins Card.
+- 🔶 Offen: Conversion-Join (Budget → echte Close-Rate) als finaler Beweis; Tally-API write-fähig.
+
+### W8 — Bexio-Umsatz-Wahrheit
+Bexio = Accounting-SSOT (Memory). Liefert den echten bezahlten Umsatz pro Kontakt/Produkt →
+ersetzt das kaputte `total_revenue` als Wert-Label; ermöglicht ROAS/CAC korrekt zu rechnen.
+
+### W9 — Server-Side Conversion-Feedback (value-based bidding) *(nutzt bestehende Infra)*
+- Befund: 7.485 Kontakte sind ad-attribuiert (gclid 73k / fbclid 270k / meta_ad_id 273k Events).
+  Ad-Param als **direktes** Score-Signal schwach (0,72% vs 0,48%) — Wert liegt im Loop.
+- Lücke: Klick-IDs gehen rein, aber **echte Abschlüsse gehen nicht zurück**.
+- Änderung: HubSpot **Deal Won + Deal-Wert** via vorhandene Stape-CAPIG (`sptpwfrm`, Pixel 314)
+  serverseitig an Meta/Google zurückspielen → Optimierung auf Käufer statt Leads.
+- Plus: CAC/Qualität pro Kampagne aus `ad_spend` (15.967) + Attribution.
+- Risiko: Pixel-Sync war 2026-05-26 pending — vor Aktivierung CAPIG-Status verifizieren.
 
 ## Offene Verifikation 🔶
 - HubSpot lead_*-Props enthalten bereits die Lifecycle-/Phone-Felder (`lead_pause_until`,
