@@ -6,11 +6,41 @@ valid / corrected numbers are dialed; invalid ones are flagged for manual fix.
 """
 from __future__ import annotations
 
+import re
+
 import phonenumbers
 
 # Gabriel's primary market — used to interpret national-format numbers without
 # a country code (e.g. "044 668 18 00" -> "+41446681800").
 DEFAULT_REGION = "CH"
+
+_SEP_RE = re.compile(r"[\s\-()/.]")
+
+
+def _predial_dach(stripped: str) -> str:
+    """Normalize a DACH national-format number to +CC form when recognizable.
+
+    Ported from the original _normalize_phone heuristics so that leads stored
+    in national mobile format (without a country code) are not dropped:
+      015x/016x/017x -> +49   (German mobile)
+      07[5-9]x       -> +41   (Swiss mobile)
+      06[5-9]x       -> +43   (Austrian mobile)
+      00XX           -> +XX   (international prefix)
+    Returns a "+"-prefixed string when a rule matches, otherwise the cleaned
+    national digits (left for region-based parsing).
+    """
+    d = _SEP_RE.sub("", stripped)
+    if d.startswith("+"):
+        return d
+    if d.startswith("00") and len(d) >= 5:
+        return "+" + d[2:]
+    if re.match(r"^01[5-7]\d{7,9}$", d):
+        return "+49" + d[1:]
+    if re.match(r"^07[5-9]\d{6,7}$", d):
+        return "+41" + d[1:]
+    if re.match(r"^06[5-9]\d{7,9}$", d):
+        return "+43" + d[1:]
+    return d
 
 
 def validate_and_normalize(
@@ -30,10 +60,9 @@ def validate_and_normalize(
     stripped = raw.strip().lstrip("'")          # drop Excel CSV apostrophe artefact
     compare = stripped.replace(" ", "")          # original minus cosmetic spaces
 
-    # Convert a leading "00" international prefix to "+" ourselves — phonenumbers
-    # only resolves "00" when a region with that IDD is supplied; we normalize it
-    # up front so it parses without a region (standard IDD across DACH).
-    to_parse = "+" + stripped[2:] if stripped.startswith("00") else stripped
+    # Pre-normalize DACH national formats (incl. 00 prefix) to +CC so phonenumbers
+    # parses them without guessing the wrong region.
+    to_parse = _predial_dach(stripped)
     started_intl = to_parse.startswith("+")
 
     try:

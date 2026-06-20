@@ -13,6 +13,16 @@ def test_national_format_is_corrected_with_default_region():
     assert validate_and_normalize("044 668 18 00") == ("+41446681800", "corrected")
 
 
+def test_german_national_mobile_is_corrected():
+    # DACH heuristic: 015x national -> +49 (would be dropped without it)
+    assert validate_and_normalize("01512 3456789") == ("+4915123456789", "corrected")
+
+
+def test_austrian_national_mobile_is_corrected():
+    # DACH heuristic: 06x national -> +43 (would be dropped without it)
+    assert validate_and_normalize("0664 123456") == ("+43664123456", "corrected")
+
+
 def test_double_zero_prefix_is_corrected():
     assert validate_and_normalize("0041446681800") == ("+41446681800", "corrected")
 
