@@ -11,6 +11,7 @@ Dedup strategy: in-memory set of processed call_ids. Resets on app restart
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 
 from integrations.aircall import log_call_outcome as aircall_log_outcome
 from integrations.hubspot import (
@@ -18,12 +19,58 @@ from integrations.hubspot import (
     HS_DISPOSITION_MAP,
     poll_completed_calls,
     write_call_outcome,
+    get_contact_properties,
+    update_contact_properties,
 )
+from batch.lifecycle import (
+    classify_outcome,
+    apply_call_outcome,
+    state_from_props,
+    state_to_props,
+)
+
 logger = logging.getLogger(__name__)
 
 # In-memory dedup set — prevents duplicate processing of the same call
 # when the 10-min window overlaps two consecutive 5-min poll cycles.
 _processed_call_ids: set[str] = set()
+
+
+_LIFECYCLE_PROPS = [
+    "lead_no_answer_streak",
+    "lead_no_answer_cycles",
+    "lead_pause_until",
+    "lead_dialer_removed",
+]
+
+
+async def _persist_lifecycle(contact_id: str, outcome: str, now: datetime) -> None:
+    """Load the lead's lifecycle state, apply the call outcome, and write it
+    back to HubSpot together with last_call_date + last_call_outcome.
+
+    Runs for EVERY disposition (reached AND no-answer) so the state machine
+    sees no-answer streaks. Best-effort: logs and returns on any error.
+    """
+    if not contact_id:
+        return
+    outcome_class = classify_outcome(outcome)
+    try:
+        props = await get_contact_properties(contact_id, _LIFECYCLE_PROPS)
+        state = state_from_props(props)
+        new_state = apply_call_outcome(state, outcome_class, now)
+
+        update = state_to_props(new_state)
+        update["lead_last_call_date"] = now.isoformat()
+        update["lead_last_call_outcome"] = outcome
+        await update_contact_properties(contact_id, update)
+        logger.info(
+            "call_poller: lifecycle %s outcome=%s class=%s streak=%d cycles=%d removed=%s pause_until=%s",
+            contact_id, outcome, outcome_class,
+            new_state.no_answer_streak, new_state.no_answer_cycles,
+            new_state.removed, update["lead_pause_until"],
+        )
+    except Exception as e:
+        logger.error("call_poller: lifecycle persist failed for %s: %s", contact_id, e)
 
 
 async def run_call_polling(since_minutes: int = 10) -> None:
@@ -41,6 +88,13 @@ async def run_call_polling(since_minutes: int = 10) -> None:
     if not new_calls:
         logger.debug("call_poller: 0 new calls (all %d already processed)", len(calls))
         return
+
+    # Apply lifecycle state for EVERY new call (reached + no-answer + wrong number).
+    # This is the single writer of lead_last_call_* and lifecycle properties.
+    now = datetime.now(timezone.utc)
+    for c in new_calls:
+        outcome = HS_DISPOSITION_MAP.get(c.get("hs_call_disposition", ""), "Unknown")
+        await _persist_lifecycle(c.get("contact_id", ""), outcome, now)
 
     # Split: Anschläge (no Slack) vs Meetings (connected → send Slack)
     connected_calls = [c for c in new_calls if c.get("hs_call_disposition") in CONNECTED_DISPOSITIONS]
@@ -74,9 +128,6 @@ async def run_call_polling(since_minutes: int = 10) -> None:
         )
 
         phone = call.get("contact_phone", "")
-
-        # 1. Write outcome back to HubSpot contact
-        await write_call_outcome(contact_id, outcome)
 
         # 1b. Snapshot tier + score at first call (feedback loop for scoring calibration)
         try:
