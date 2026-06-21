@@ -124,16 +124,18 @@ def test_tier_cold_zero():
     assert compute_points({}).tier == "3_cold"
 
 
-def test_tier_warm_at_25():
-    # Exactly 25 -> Warm (>= boundary).
-    res = compute_points({"interest": "naechster_schritt"})
-    assert res.points == 25
+def test_tier_warm_at_35():
+    # Exactly 35 -> Warm (>= calibrated boundary; 25 alone is now Cold).
+    res = compute_points({"interest": "naechster_schritt", "form_submit": True})
+    assert res.points == 35
     assert res.tier == "2_warm"
+    assert compute_points({"interest": "naechster_schritt"}).tier == "3_cold"  # 25 -> Cold
 
 
-def test_tier_warm_below_50():
-    # 30 points -> Warm.
-    assert compute_points({"budget": "4000_6000"}).tier == "2_warm"
+def test_tier_warm_range_below_hot():
+    # 30 alone -> Cold; 40 -> Warm; (50+ -> Hot, see hot tests).
+    assert compute_points({"budget": "4000_6000"}).tier == "3_cold"                       # 30
+    assert compute_points({"budget": "4000_6000", "form_submit": True}).tier == "2_warm"  # 40
 
 
 def test_tier_hot_at_50():

@@ -50,6 +50,13 @@ PRICE_POINTS = 15            # price-page visit (W1-mapped)
 FORM_SUBMIT_POINTS = 10      # optin baseline — 4.3% (9x lift)
 HYPNOSE_CATEGORY_POINTS = 10  # product-fit bonus for hypnose interest
 
+# A SKIPPED Eignungscheck question is "unknown", NOT "low" — empirically it
+# converts near base-rate (missing-interest even higher). Give a neutral weight,
+# never 0-penalize. Gated on `eignungscheck`: only applies to leads who actually
+# took the quiz; non-takers (no Tally data) get 0 here and score on behavior only.
+MISSING_BUDGET_POINTS = 8     # skipped budget answer — neutral
+MISSING_INTEREST_POINTS = 10  # skipped interest answer (NOT the explicit "keines")
+
 DISQUALIFIED_TIER = "4_disqualified"
 
 # ---------------------------------------------------------------------------
@@ -58,9 +65,9 @@ DISQUALIFIED_TIER = "4_disqualified"
 # tunes them against the real Deal-Won rate before the flag-flip.
 # ---------------------------------------------------------------------------
 TIERS: list[tuple[str, int]] = [
-    ("1_hot",  50),
-    ("2_warm", 25),
-    ("3_cold",  0),
+    ("1_hot",  50),   # calibrated: 8.7% close-rate, 24% of cohort, 58% of all closes
+    ("2_warm", 35),   # 35-49 pts (~3%) — secondary calling tier
+    ("3_cold",  0),   # <35 pts (~1%) — deprioritize
 ]
 
 
@@ -92,6 +99,8 @@ def compute_points(signals: dict) -> PointsResult:
     points = 0
     reasons: list[str] = []
     disqualified = False
+    # Neutral-fill skipped answers ONLY for actual quiz-takers (non-takers have no Tally data).
+    took_eig = bool(signals.get("eignungscheck"))
 
     # --- Budget ------------------------------------------------------------
     budget = signals.get("budget")
@@ -100,6 +109,9 @@ def compute_points(signals: dict) -> PointsResult:
         if pts:
             points += pts
             reasons.append(f"Budget {budget} +{pts}")
+    elif took_eig:
+        points += MISSING_BUDGET_POINTS
+        reasons.append(f"Budget unbekannt +{MISSING_BUDGET_POINTS}")
 
     # --- Interest ----------------------------------------------------------
     interest = signals.get("interest")
@@ -111,6 +123,9 @@ def compute_points(signals: dict) -> PointsResult:
         if pts:
             points += pts
             reasons.append(f"Interesse {interest} +{pts}")
+    elif took_eig:
+        points += MISSING_INTEREST_POINTS
+        reasons.append(f"Interesse unbekannt +{MISSING_INTEREST_POINTS}")
 
     # --- Consult -----------------------------------------------------------
     if signals.get("consult"):

@@ -651,6 +651,12 @@ def _assemble_point_signals(
         "budget": (props.get("lead_eig_budget") or "") or None,
         "interest": (props.get("lead_eig_interest") or "") or None,
         "consult": _truthy(props.get("lead_eig_consult")),
+        # Did the lead take the Eignungscheck? Gates the missing-answer neutral fill
+        # (a SKIPPED question -> neutral; a non-taker -> no Tally points at all).
+        "eignungscheck": bool(
+            props.get("lead_eig_budget") or props.get("lead_eig_interest")
+            or props.get("lead_eig_score")
+        ),
         # W1-mapped behavior signals
         "form_submit": "application_submitted" in event_types,
         "video_complete": "video_watched_100" in event_types,
