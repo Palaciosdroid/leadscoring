@@ -27,6 +27,7 @@ from scoring.combined import ScoringResult, combine_scores
 from scoring.engagement import calculate_engagement_score
 from scoring.hook_engine import generate_hook
 from scoring.interest import detect_interest_category
+from scoring.points import compute_points, PointsResult
 from scoring.touchpoint_mapper import (
     extract_first_last_touch,
     map_touchpoints_batch,
@@ -42,6 +43,11 @@ HUBSPOT_TOKEN = os.environ.get("HUBSPOT_ACCESS_TOKEN", "")
 
 # Only re-score leads updated in the last N days to keep API calls low
 RESCORE_WINDOW_DAYS = int(os.environ.get("RESCORE_WINDOW_DAYS", "14"))
+
+# Scoring mode: 'engagement' (default/rollback — live tier UNCHANGED, point-system
+# runs shadow-only into lead_points) | 'points' (flip — point-system drives the tier).
+# See spec 2026-06-20-w2-w7-scoring-core-design.md (shadow-then-flip rollout).
+SCORING_MODE = os.environ.get("SCORING_MODE", "engagement").strip().lower()
 
 # Score thresholds (reverted to v1 — v2 thresholds were too aggressive,
 # caused 152 leads to drop from Warm to Cold and disappear from Aircall)
@@ -96,6 +102,13 @@ LISTS: dict[str, dict[str, Any]] = {
     "tfmw_kaeufer":      {"hubspot_list_id": 363, "aircall_tag": ""},
     "med_kaeufer":       {"hubspot_list_id": 364, "aircall_tag": ""},
 }
+
+# Static HubSpot lists the scorer is allowed to write to via batch_add_to_list.
+# The funnel warm/fresh lists (365-370) are DYNAMIC — HubSpot fills them from the
+# lead_interest_category / lead_is_fresh properties, so pushing members directly
+# is redundant and only generated 400-noise. Only EC + Käufer lists are static.
+# (TODO-A from deploy validation.)
+STATIC_LIST_IDS: frozenset[int] = frozenset({352, 362, 363, 364})
 
 # Valid funnels for category mapping
 VALID_FUNNELS = {"hypnose", "meditation", "lifecoach"}
@@ -257,18 +270,25 @@ async def _batch_update_hubspot_contacts(
 _HUBSPOT_NOTE_MARKER = "── Lead Score Card ──"
 
 
-async def _write_hubspot_note(contact_id: str, body: str) -> None:
+async def _write_hubspot_note(contact_id: str, body: str) -> bool:
     """
     Write a note on a HubSpot contact visible in the activity timeline.
 
     Uses the Engagements v3 API (POST /crm/v3/objects/notes).
     Deduplicates: searches for existing scorer notes and deletes them first.
+
+    TODO-B: skips the delete+create entirely when the existing scorer note is
+    byte-identical to the new card (hash compare) — cuts the ~7k-call note tail.
+
+    Returns True if a note was written, False if it was skipped (unchanged).
     """
     headers = {
         "Authorization": f"Bearer {HUBSPOT_TOKEN}",
         "Content-Type": "application/json",
     }
     timestamped_body = f"{_HUBSPOT_NOTE_MARKER}\n{body}"
+    new_hash = _card_hash(timestamped_body)
+    stale_note_ids: list[str] = []
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         # Search for existing scorer notes on this contact to dedup
@@ -295,13 +315,22 @@ async def _write_hubspot_note(contact_id: str, body: str) -> None:
                             .get("hs_note_body", "")
                         )
                         if _HUBSPOT_NOTE_MARKER in existing_body:
-                            # Delete old scorer note
-                            await client.delete(
-                                f"{HUBSPOT_BASE}/crm/v3/objects/notes/{note_id}",
-                                headers=headers,
-                            )
+                            # Unchanged card → nothing to do, leave the note in place.
+                            if _card_hash(existing_body) == new_hash:
+                                return False
+                            stale_note_ids.append(note_id)
         except Exception:
             pass  # Dedup is best-effort
+
+        # Content changed → delete the stale scorer note(s) before re-writing.
+        for note_id in stale_note_ids:
+            try:
+                await client.delete(
+                    f"{HUBSPOT_BASE}/crm/v3/objects/notes/{note_id}",
+                    headers=headers,
+                )
+            except Exception:
+                pass  # best-effort
 
         # Create new note
         resp = await client.post(
@@ -330,6 +359,9 @@ async def _write_hubspot_note(contact_id: str, body: str) -> None:
                 "HubSpot note create failed for contact %s: %s %s",
                 contact_id, resp.status_code, resp.text[:300],
             )
+            return False
+
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -592,6 +624,50 @@ def _format_touch_summary(tp: dict | None) -> str:
 
     label = tp_type or channel
     return f"{label} | {date_str}" if date_str else label
+
+
+# Event types (W1-mapped) that map to point-system behavior signals.
+# Replay pages map to video_watched_50; full watch -> video_watched_100.
+_REPLAY_EVENT_TYPES: frozenset[str] = frozenset({"video_watched_50", "video_watched_75"})
+
+
+def _assemble_point_signals(
+    scored_events: list[dict],
+    props: dict[str, Any],
+    funnel: str | None,
+    unsubscribed: bool,
+) -> dict[str, Any]:
+    """
+    Build the `compute_points()` signal dict from W1-mapped behavior, the
+    HubSpot Tally props (lead_eig_*) and the detected interest category.
+
+    Phone is INTENTIONALLY excluded — it is the dialer gate, not a score input.
+    Missing signals are simply absent (compute_points treats them as 0).
+    """
+    event_types = {(e.get("event_type") or "") for e in scored_events}
+
+    return {
+        # Tally Eignungscheck props (synced into HubSpot by W7)
+        "budget": (props.get("lead_eig_budget") or "") or None,
+        "interest": (props.get("lead_eig_interest") or "") or None,
+        "consult": _truthy(props.get("lead_eig_consult")),
+        # W1-mapped behavior signals
+        "form_submit": "application_submitted" in event_types,
+        "video_complete": "video_watched_100" in event_types,
+        "replay": bool(event_types & _REPLAY_EVENT_TYPES),
+        "checkout": "checkout_visited" in event_types,
+        "price": "price_info_viewed" in event_types,
+        # Interest category product-fit bonus
+        "interest_category": funnel,
+        # Hard disqualify
+        "unsubscribed": unsubscribed,
+    }
+
+
+def _card_hash(body: str) -> str:
+    """Stable hash of a note body for skip-unchanged comparison (TODO-B)."""
+    import hashlib
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
 def _build_hubspot_card_properties(
@@ -908,6 +984,23 @@ async def run_batch_scoring() -> None:
                 e.get("event_type") == "email_unsubscribed" for e in scored_events
             )
 
+            # --- Point-system (W2) — ALWAYS computed (shadow), flag-gated flip ---
+            # Signals: W1-mapped behavior + Tally lead_eig_* props + interest.
+            # Phone is NEVER a point signal (leakage protection).
+            point_signals = _assemble_point_signals(
+                scored_events, props, funnel, unsubscribed,
+            )
+            points_result: PointsResult = compute_points(point_signals)
+
+            # Flip ONLY when SCORING_MODE == 'points'. In 'engagement' (default)
+            # the point-system stays shadow-only and the live tier is UNCHANGED.
+            if SCORING_MODE == "points":
+                score = float(points_result.points)
+                scoring.combined_score = score
+                scoring.lead_tier = points_result.tier
+                new_tier = points_result.tier
+                tier_label = _determine_tier_label(score, is_fresh)
+
             last_call_date = props.get("lead_last_call_date")
             # Check call_booked: only future/recent scheduled meetings count
             has_scheduled_meeting = False
@@ -1091,6 +1184,10 @@ async def run_batch_scoring() -> None:
                 is_fresh=is_fresh,
                 purchases=purchases,
             )
+            # Shadow point-score — ALWAYS written so Sandro can compare before
+            # the flip. In 'points' mode _build_hubspot_card_properties already
+            # wrote the point-derived tier/combined_score via the flipped scoring.
+            hs_properties["lead_points"] = points_result.points
             if _phone_status:
                 hs_properties["lead_phone_status"] = _phone_status
 
@@ -1161,6 +1258,10 @@ async def run_batch_scoring() -> None:
                     purchased_funnels=purchased_funnels,
                     purchases=purchases,
                 )
+                # In 'points' mode, append the transparent breakdown so Kevin
+                # sees WHY the lead scored (Budget +30 · Replay +20 · …).
+                if SCORING_MODE == "points" and points_result.reasons:
+                    aircall_card += "\nPunkte: " + " · ".join(points_result.reasons)
 
             # NOTE: lead_call_card property does NOT exist in HubSpot schema.
             # Card content is written as a timeline note via Step 4c instead.
@@ -1242,6 +1343,14 @@ async def run_batch_scoring() -> None:
         list_id = LISTS[list_key]["hubspot_list_id"]
         if not list_id:
             continue
+        # TODO-A: skip DYNAMIC funnel lists (365-370) — they self-populate from
+        # contact properties; pushing members directly is redundant 400-noise.
+        if list_id not in STATIC_LIST_IDS:
+            logger.debug(
+                "Batch: skip dynamic list '%s' (id=%d) — self-populates from properties",
+                list_key, list_id,
+            )
+            continue
         n = await batch_add_to_list(list_id, contact_ids)
         total_listed += n
         logger.info(
@@ -1249,23 +1358,32 @@ async def run_batch_scoring() -> None:
             list_key, list_id, n, len(contact_ids),
         )
 
-    # Step 4c: Write HubSpot notes — Kevin sees these in the contact timeline
+    # Step 4c: Write HubSpot notes — Kevin sees these in the contact timeline.
+    # TODO-B: _write_hubspot_note skips unchanged cards (hash compare), so the
+    # note tail only spends API calls on contacts whose card actually changed.
     hs_notes_written = 0
+    hs_notes_skipped = 0
     if hubspot_notes_queue:
         logger.info("Batch: writing %d HubSpot notes", len(hubspot_notes_queue))
         for note_item in hubspot_notes_queue:
             try:
-                await _write_hubspot_note(
+                wrote = await _write_hubspot_note(
                     contact_id=note_item["contact_id"],
                     body=note_item["card"],
                 )
-                hs_notes_written += 1
+                if wrote:
+                    hs_notes_written += 1
+                else:
+                    hs_notes_skipped += 1
             except Exception as e:
                 logger.warning(
                     "Batch: HubSpot note failed for %s: %s",
                     note_item["email"], e,
                 )
-        logger.info("Batch: wrote %d/%d HubSpot notes", hs_notes_written, len(hubspot_notes_queue))
+        logger.info(
+            "Batch: wrote %d/%d HubSpot notes (%d unchanged, skipped)",
+            hs_notes_written, len(hubspot_notes_queue), hs_notes_skipped,
+        )
 
     # Hot Lead individual Slack alerts removed — batch report summary only
 
