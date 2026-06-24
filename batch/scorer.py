@@ -1416,6 +1416,7 @@ async def run_batch_scoring() -> None:
         "Batch: Aircall queue has %d leads (sorted: EC→Fresh→Hot→Warm)",
         len(aircall_queue),
     )
+    _stats.aircall_queued = len(aircall_queue)
     pushed = 0
     for item in aircall_queue:
         try:
@@ -1457,6 +1458,8 @@ async def run_batch_scoring() -> None:
                     )
         except Exception as e:
             logger.error("Batch: Aircall push failed for %s: %s", item["email"], e)
+            if _stats.aircall_push_error_sample is None:
+                _stats.aircall_push_error_sample = str(e)[:200]
 
     # Step 6: Count decays — no individual Slack alerts, summary goes into batch report
     _stats.decay_count = len(decay_alerts)

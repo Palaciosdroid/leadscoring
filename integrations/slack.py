@@ -235,6 +235,8 @@ class BatchRunStats:
     hs_error_samples: list[str] = field(default_factory=list)   # first 2 error msgs
     aircall_pushed: int = 0
     aircall_rejected: int = 0
+    aircall_queued: int = 0           # leads queued for the Aircall push this run
+    aircall_push_error_sample: str | None = None  # first push failure reason (e.g. 404)
     notes_written: int = 0
     # Post-batch verification: actual dialer count from Aircall API
     # -1 = not checked, 0+ = real count. Gap detected when pushed>0 but count==0.
@@ -249,7 +251,8 @@ class BatchRunStats:
 
 def _build_batch_report_message(stats: BatchRunStats) -> dict[str, Any]:
     """Build a Slack Block Kit message for the batch run health report."""
-    ok = stats.fatal_error is None and stats.hs_chunk_errors == 0
+    aircall_down = stats.aircall_queued > 0 and stats.aircall_pushed == 0
+    ok = stats.fatal_error is None and stats.hs_chunk_errors == 0 and not aircall_down
     status_emoji = "✅" if ok else ("💥" if stats.fatal_error else "⚠️")
     status_text = "OK" if ok else ("FATAL" if stats.fatal_error else "ERRORS")
 
@@ -271,6 +274,18 @@ def _build_batch_report_message(stats: BatchRunStats) -> dict[str, Any]:
         f"*Skipped:* {stats.skipped_cold} cold, {stats.skipped_dnc} DNC",
         f"*Decays:* {stats.decay_count} Tier-Downgrades",
     ]
+
+    # Total-failure alert: queue had leads but NONE were pushed (e.g. dialer
+    # campaign 404). The gap alert below only fires when pushed>0, so without
+    # this a complete push failure stays SILENT (2026-06 Kevin incident).
+    if aircall_down:
+        msg = (
+            f":rotating_light: *AIRCALL DOWN* — {stats.aircall_queued} Leads in Queue, "
+            "aber 0 gepusht! Kevins Dialer bleibt LEER (Dialer-Kampagne fehlt/404)."
+        )
+        if stats.aircall_push_error_sample:
+            msg += f" `{stats.aircall_push_error_sample[:200]}`"
+        lines.append(msg)
 
     # Gap alert: we pushed leads but dialer is empty — silent failure
     if stats.aircall_pushed > 0 and stats.dialer_verified_count == 0:
