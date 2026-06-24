@@ -1111,7 +1111,10 @@ def _build_dialer_csv(contacts: list[dict[str, Any]]) -> str:
     for contact in contacts:
         props = contact.get("properties", {}) or {}
         phone = _re.sub(r"[^\d+]", "", (props.get("phone") or "").strip())
-        if not phone.startswith("+") or phone in seen:
+        # Require valid E.164 ('+' then 8-15 digits). Aircall's Power Dialer import
+        # rejects malformed numbers; junk like "+41" / "+" / "+49" crashed the bulk
+        # import (verified live 2026-06-24) — drop them here, not at Aircall.
+        if not _re.fullmatch(r"\+\d{8,15}", phone) or phone in seen:
             continue
         seen.add(phone)
         writer.writerow([

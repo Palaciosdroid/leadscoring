@@ -27,6 +27,19 @@ def test_non_e164_dropped():
     assert body[0].startswith("+4915112345678")
 
 
+def test_malformed_e164_dropped():
+    # too-short / empty after '+' -> Aircall rejects (crashed the live bulk import) -> drop
+    csv = _build_dialer_csv([_c("+41"), _c("+"), _c("+49"), _c("+436876791337FN"),
+                             _c("+41794674925")])
+    body = csv.strip().splitlines()[1:]
+    # "+41"/"+"/"+49" dropped; "+436876791337FN" keeps digits -> valid; "+41794674925" valid
+    assert all(not r.startswith(("+41,", "+,", "+49,")) for r in body)
+    phones = [r.split(",")[0] for r in body]
+    assert "+436876791337" in phones
+    assert "+41794674925" in phones
+    assert "+41" not in phones and "+" not in phones and "+49" not in phones
+
+
 def test_dedup_by_normalized_phone():
     csv = _build_dialer_csv([_c("+41 79 123 45 67"), _c("+41791234567")])
     body = csv.strip().splitlines()[1:]
