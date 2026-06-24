@@ -7,10 +7,45 @@ import pytest
 import httpx
 
 from integrations.aircall import (
+    _clean_e164,
     _is_fresh,
     _should_dial,
+    _validate_phone,
     add_to_power_dialer,
 )
+
+
+class TestCleanE164:
+    """E.164 cleaning — strip junk, reject uncleanable (regression: dirty numbers
+    like '+41' / '...FN' were pushed raw and rejected by Aircall, killing imports)."""
+
+    def test_valid_passthrough(self):
+        assert _clean_e164("+41765932052") == "+41765932052"
+
+    def test_strips_formatting(self):
+        assert _clean_e164("+1 (800) 555-1234") == "+18005551234"
+
+    def test_strips_stray_letters(self):
+        assert _clean_e164("+49 176 4794427FN") == "+491764794427"
+
+    def test_double_zero_prefix(self):
+        assert _clean_e164("0041765932052") == "+41765932052"
+
+    def test_too_short_rejected(self):
+        assert _clean_e164("+41") == ""
+
+    def test_bare_plus_and_empty_rejected(self):
+        assert _clean_e164("+") == ""
+        assert _clean_e164("") == ""
+        assert _clean_e164(None) == ""
+
+    def test_no_plus_rejected(self):
+        assert _clean_e164("41765932052") == ""
+
+    def test_validate_phone_delegates(self):
+        assert _validate_phone("+41765932052") is True
+        assert _validate_phone("+41") is False
+        assert _validate_phone("+49 176 4794427FN") is True  # cleanable → valid
 
 
 class TestIsFresh:

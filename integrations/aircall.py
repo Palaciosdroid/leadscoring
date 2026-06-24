@@ -48,19 +48,34 @@ DIALABLE_TIERS: frozenset[str] = frozenset({"1_hot", "2_warm"})
 _PHONE_MIN_DIGITS = 7
 
 
-def _validate_phone(phone: str) -> bool:
-    """Return True if phone is a plausible international number.
+def _clean_e164(phone: str) -> str:
+    """Return a strict E.164 number ('+' followed by 7-15 digits) or '' if it
+    cannot be cleaned.
 
-    Accepts:  +41791234567, +4915112345678, +1 (800) 555-1234
-    Rejects:  "+", "", "abc", "123456" (no + prefix), "+123" (too short)
+    Strips spaces, dashes, parentheses and stray non-digit characters (e.g.
+    data-entry notes like 'FN'); converts a leading '00' international prefix
+    to '+'. Aircall rejects malformed numbers, so we always send the cleaned
+    form — never the raw value.
 
-    We intentionally avoid heavy validation — country-specific rules differ.
-    The rule: must start with "+" and contain at least 7 digits after it.
+    Accepts: +41791234567, "+1 (800) 555-1234", "0041791234567", "+49 176 4794427FN"
+    Rejects: "+", "", "abc", "123456" (no + prefix), "+41" (too short)
     """
-    if not phone or not phone.startswith("+"):
-        return False
-    digits = re.sub(r"\D", "", phone[1:])
-    return len(digits) >= _PHONE_MIN_DIGITS
+    if not phone:
+        return ""
+    p = phone.strip()
+    if p.startswith("00"):
+        p = "+" + p[2:]
+    if not p.startswith("+"):
+        return ""
+    digits = re.sub(r"\D", "", p)
+    if not (_PHONE_MIN_DIGITS <= len(digits) <= 15):  # E.164 max is 15 digits
+        return ""
+    return "+" + digits
+
+
+def _validate_phone(phone: str) -> bool:
+    """True if `phone` can be cleaned to a valid E.164 number (see _clean_e164)."""
+    return bool(_clean_e164(phone))
 
 
 def _is_fresh(created_at: datetime | None) -> bool:
@@ -204,13 +219,16 @@ async def add_to_power_dialer(
         )
         return None
 
-    phone = lead.get("phone", "")
-    if not _validate_phone(phone):
+    phone = _clean_e164(lead.get("phone", ""))
+    if not phone:
         logger.warning(
-            "Aircall: invalid phone '%s' for %s — skipping push to avoid 400",
-            phone, lead.get("email"),
+            "Aircall: invalid/uncleanable phone '%s' for %s — skipping push to avoid 400",
+            lead.get("phone"), lead.get("email"),
         )
         return None
+    # Use the cleaned E.164 number everywhere downstream (contact upsert + dialer push),
+    # never the raw value — Aircall rejects malformed numbers (e.g. '+41', '...FN').
+    lead = {**lead, "phone": phone}
 
     # Use pre-built card from scorer if provided (V1: includes Kauf, Naechstes Produkt, Hook).
     # Fall back to _build_call_info header if no card was passed.
