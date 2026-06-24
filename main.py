@@ -15,7 +15,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
 from analytics.buyer_journey import analyze_buyer_journeys, run_weekly_buyer_journey
@@ -270,6 +270,9 @@ app = FastAPI(
 
 WEBHOOK_SECRET = os.environ.get("CIO_WEBHOOK_SECRET", "")
 DEBUG_API_KEY = os.environ.get("DEBUG_API_KEY", "")
+# Key for the bookmarkable dialer CSV export (Kevin). Falls back to DEBUG_API_KEY
+# so it works immediately; set DIALER_EXPORT_KEY for a least-privilege key.
+DIALER_EXPORT_KEY = os.environ.get("DIALER_EXPORT_KEY", "") or DEBUG_API_KEY
 
 # Startup validation — fail-fast for critical secrets, warn for optional ones
 _CRITICAL_ENV_VARS = [
@@ -1090,6 +1093,57 @@ async def batch_prioritize(
         })
 
     return {"total": len(queue), "contacts": queue}
+
+
+def _build_dialer_csv(contacts: list[dict[str, Any]]) -> str:
+    """Aircall-Power-Dialer-ready CSV: column A = E.164 phone (with header), priority
+    order preserved. Aircall reads only column A; the rest is context for Kevin.
+    Non-E.164 numbers are dropped (Aircall rejects them); duplicates removed.
+    """
+    import csv as _csv
+    import io as _io
+    import re as _re
+
+    buf = _io.StringIO()
+    writer = _csv.writer(buf)
+    writer.writerow(["phone_number", "first_name", "last_name", "tier", "score", "interest"])
+    seen: set[str] = set()
+    for contact in contacts:
+        props = contact.get("properties", {}) or {}
+        phone = _re.sub(r"[^\d+]", "", (props.get("phone") or "").strip())
+        if not phone.startswith("+") or phone in seen:
+            continue
+        seen.add(phone)
+        writer.writerow([
+            phone,
+            props.get("firstname", "") or "",
+            props.get("lastname", "") or "",
+            props.get("lead_tier", "") or "",
+            props.get("lead_combined_score", "") or "",
+            props.get("lead_interest_category", "") or "",
+        ])
+    return buf.getvalue()
+
+
+@app.get("/dialer/export.csv")
+async def dialer_export_csv(
+    key: str = Query(default=""),
+    limit: int = Query(default=1000),
+):
+    """Always-fresh, Aircall-ready CSV of the current Power-Dialer queue (Hot→Warm,
+    phone-only, priority-sorted, E.164). Kevin bookmarks this URL with ?key=… and
+    imports the download into the Workspace Power Dialer. Requires DIALER_EXPORT_KEY.
+    """
+    if not DIALER_EXPORT_KEY or key != DIALER_EXPORT_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing key")
+    contacts = await get_prioritized_contacts(limit=min(max(limit, 1), 1000))
+    csv_text = _build_dialer_csv(contacts)
+    fname = f"power-dialer-{datetime.now(timezone.utc).date()}.csv"
+    return Response(
+        content=csv_text,
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
 
 
 @app.post("/batch/run")
