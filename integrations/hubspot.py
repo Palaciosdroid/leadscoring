@@ -984,6 +984,30 @@ async def update_contact_properties(
     return resp.status_code in (200, 204)
 
 
+async def get_contact_id(
+    *,
+    email: str | None = None,
+    phone: str | None = None,
+    timeout: float = 10.0,
+) -> str | None:
+    """Resolve a HubSpot contact id by email (preferred) or phone.
+
+    Returns the numeric contact id string, or None if the contact is not in
+    HubSpot. Used by the dialer suppression gate to look up a lead's stored
+    lifecycle state before a webhook pushes them to the Power Dialer.
+    """
+    if not ACCESS_TOKEN:
+        return None
+    if email and _is_email(email):
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            cid = await _resolve_hubspot_id(email, client)
+            if cid:
+                return cid
+    if phone:
+        return await find_contact_by_phone(phone, timeout=timeout)
+    return None
+
+
 async def find_contact_by_phone(phone: str, *, timeout: float = 10.0) -> str | None:
     """
     Search HubSpot contacts by phone number. Returns HubSpot contact ID or None.

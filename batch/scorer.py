@@ -857,6 +857,7 @@ async def run_batch_scoring() -> None:
     hubspot_updates: list[dict[str, Any]] = []  # {"id": ..., "properties": {...}}
     hubspot_notes_queue: list[dict[str, Any]] = []  # {"contact_id": ..., "email": ..., "card": ...}
     aircall_queue: list[dict[str, Any]] = []     # leads to push to Aircall
+    dialer_remove_phones: set[str] = set()       # hard-excluded leads to PULL from the live queue
     new_hot_leads: list[dict[str, Any]] = []     # leads that became hot THIS run
     decay_alerts: list[dict[str, Any]] = []      # tier downgrades for Slack
     # Map list_key -> [contact_ids] for bulk HubSpot list membership updates
@@ -1178,6 +1179,19 @@ async def run_batch_scoring() -> None:
             if not should_push and not dnc_result.should_skip:
                 skipped_cold += 1
 
+            # Collect HARD-excluded leads (booked / paused / removed / DNC) with a
+            # valid phone so we can actively PULL them from Kevin's live dialer queue
+            # after the loop. The batch previously only declined to re-add them
+            # (should_push=False) but never removed anyone already in the queue.
+            # NOTE: never collect plain score-cold leads — a cooling warm lead must
+            # stay dialable until it is actually paused/removed.
+            if has_phone and _raw_phone and (
+                call_booked
+                or dnc_result.should_skip
+                or _is_paused_or_removed(props, now_utc, scored_events)
+            ):
+                dialer_remove_phones.add(_raw_phone)
+
             # Build HubSpot card properties
             hs_properties = _build_hubspot_card_properties(
                 scoring=scoring,
@@ -1328,6 +1342,7 @@ async def run_batch_scoring() -> None:
                 })
 
         except Exception as e:
+            _stats.scoring_errors += 1
             logger.error("Batch: failed to score %s: %s", email, e)
 
     # Step 4: Batch-update HubSpot contact properties (100 per API call)
@@ -1468,6 +1483,28 @@ async def run_batch_scoring() -> None:
 
     _stats.aircall_pushed = pushed
     _stats.notes_written = hs_notes_written
+
+    # Step 5b: Actively remove hard-excluded leads from Kevin's live dialer queue.
+    # This closes the leak where paused/booked/DNC leads already in the queue stayed
+    # callable forever (the batch only stopped re-adding them). Single queue fetch +
+    # per-id deletes via remove_many_from_power_dialer (which has a mass-removal guard).
+    # Set DIALER_REMOVE_DRYRUN=1 to log what WOULD be removed without touching the queue.
+    if dialer_remove_phones:
+        if os.environ.get("DIALER_REMOVE_DRYRUN", "").strip().lower() in ("1", "true", "yes"):
+            logger.warning(
+                "Batch: [DRYRUN] would remove %d hard-excluded phone(s) from dialer: %s",
+                len(dialer_remove_phones), sorted(dialer_remove_phones),
+            )
+        else:
+            try:
+                from integrations.aircall import remove_many_from_power_dialer
+                _stats.aircall_removed = await remove_many_from_power_dialer(dialer_remove_phones)
+                logger.info(
+                    "Batch: removed %d/%d hard-excluded leads from Kevin's dialer queue",
+                    _stats.aircall_removed, len(dialer_remove_phones),
+                )
+            except Exception as e:
+                logger.error("Batch: dialer remove_many failed: %s", e)
 
     # Step 6b: Verify actual Aircall dialer count — don't trust API response codes alone.
     # This catches the gap between "API returned 200" and "lead actually appears in dialer".

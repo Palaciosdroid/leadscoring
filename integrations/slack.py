@@ -237,6 +237,7 @@ class BatchRunStats:
     aircall_rejected: int = 0
     aircall_queued: int = 0           # leads queued for the Aircall push this run
     aircall_push_error_sample: str | None = None  # first push failure reason (e.g. 404)
+    aircall_removed: int = 0          # hard-excluded leads pulled from the live dialer queue this run
     notes_written: int = 0
     # Post-batch verification: actual dialer count from Aircall API
     # -1 = not checked, 0+ = real count. Gap detected when pushed>0 but count==0.
@@ -244,6 +245,7 @@ class BatchRunStats:
     skipped_cold: int = 0
     skipped_dnc: int = 0
     phone_invalid: int = 0            # leads with an unfixable phone number this run
+    scoring_errors: int = 0           # leads that threw during scoring (silently skipped — H4)
     decay_count: int = 0              # tier downgrades this run (summary only, no individual alerts)
     duration_seconds: float = 0.0
     fatal_error: str | None = None    # set if batch crashed before completing
@@ -252,7 +254,12 @@ class BatchRunStats:
 def _build_batch_report_message(stats: BatchRunStats) -> dict[str, Any]:
     """Build a Slack Block Kit message for the batch run health report."""
     aircall_down = stats.aircall_queued > 0 and stats.aircall_pushed == 0
-    ok = stats.fatal_error is None and stats.hs_chunk_errors == 0 and not aircall_down
+    ok = (
+        stats.fatal_error is None
+        and stats.hs_chunk_errors == 0
+        and not aircall_down
+        and stats.scoring_errors == 0
+    )
     status_emoji = "✅" if ok else ("💥" if stats.fatal_error else "⚠️")
     status_text = "OK" if ok else ("FATAL" if stats.fatal_error else "ERRORS")
 
@@ -270,7 +277,7 @@ def _build_batch_report_message(stats: BatchRunStats) -> dict[str, Any]:
     lines = [
         f"*Leads:* {stats.leads_fetched} fetched → {stats.leads_processed} processed",
         f"*HubSpot:* {stats.hs_updates_ok} updated",
-        f"*Aircall:* {stats.aircall_pushed} pushed, {stats.aircall_rejected} rejected → {dialer_str}",
+        f"*Aircall:* {stats.aircall_pushed} pushed, {stats.aircall_rejected} rejected, {stats.aircall_removed} removed → {dialer_str}",
         f"*Skipped:* {stats.skipped_cold} cold, {stats.skipped_dnc} DNC",
         f"*Decays:* {stats.decay_count} Tier-Downgrades",
     ]
@@ -306,6 +313,12 @@ def _build_batch_report_message(stats: BatchRunStats) -> dict[str, Any]:
     if stats.phone_invalid:
         lines.append(
             f":telephone_receiver: *{stats.phone_invalid} ungültige Nummer(n)* — manuell prüfen"
+        )
+
+    if stats.scoring_errors:
+        lines.append(
+            f":rotating_light: *{stats.scoring_errors} Lead(s) beim Scoring gecrasht* — "
+            "still übersprungen (nicht gescort/gepusht/entfernt), Logs prüfen"
         )
 
     if stats.fatal_error:

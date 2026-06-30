@@ -100,8 +100,10 @@ def _should_dial(
     Cold/Disqualified: CIO nurturing only              → skip.
     Below score 30: not worth calling                  → skip.
     """
-    # Booked leads already have a meeting — never cold-call them
-    if lead_tier == "0_booked":
+    # Booked or disqualified leads must NEVER be dialled — checked FIRST so a
+    # freshness signal can never override a hard exclusion. (The full DNC/pause
+    # gating lives in dialer_gate + the batch path; this is defense-in-depth.)
+    if lead_tier in ("0_booked", "4_disqualified"):
         return False
     # Accept scorer's freshness signal (7-day window) OR Aircall's own 24h check
     if is_fresh or _is_fresh(created_at):
@@ -429,6 +431,52 @@ async def _push_to_dialer_campaign(
     return {"status": "added", "phone": phone}
 
 
+async def _get_dialer_queue(client: httpx.AsyncClient) -> list[dict[str, Any]]:
+    """Fetch all numbers currently in the Closer's dialer campaign.
+
+    Returns a list of {"id": int, "number": str(digits, no '+'), "called": bool}.
+    The v1 endpoint returns every number on a single page under the 'numbers'
+    key (verified 2026-06-30 against Kevin's live Classic campaign).
+    """
+    resp = await _aircall_request(
+        client, "get",
+        f"{AIRCALL_BASE}/users/{AIRCALL_CLOSER_USER_ID}/dialer_campaign/phone_numbers",
+        params={"per_page": 50},
+    )
+    if resp.status_code != 200:
+        logger.warning("Aircall: dialer queue fetch failed: %s %s", resp.status_code, resp.text[:200])
+        return []
+    body = resp.json()
+    return body.get("numbers") or body.get("phone_numbers") or []
+
+
+def _find_number_id(queue: list[dict[str, Any]], phone: str) -> int | None:
+    """Resolve a phone number to its dialer-queue entry id.
+
+    Matches on the full digit string first. Falls back to the last 9 digits
+    ONLY when exactly one queue entry matches — an ambiguous match (two numbers
+    sharing the same 9-digit suffix, e.g. across countries) is refused so we
+    never remove the wrong person from Kevin's queue.
+    """
+    d = re.sub(r"\D", "", phone or "")
+    if not d:
+        return None
+    full = [n for n in queue if re.sub(r"\D", "", n.get("number", "")) == d]
+    if len(full) == 1:
+        return full[0].get("id")
+    if full:
+        logger.warning("Aircall: %s matches %d queue entries by full digits — skipping remove (ambiguous)", phone, len(full))
+        return None
+    if len(d) >= 9:
+        suffix = d[-9:]
+        last9 = [n for n in queue if re.sub(r"\D", "", n.get("number", "")).endswith(suffix)]
+        if len(last9) == 1:
+            return last9[0].get("id")
+        if last9:
+            logger.warning("Aircall: %s ambiguous last-9 match (%d entries) — skipping remove", phone, len(last9))
+    return None
+
+
 async def remove_from_power_dialer(
     phone: str,
     *,
@@ -438,7 +486,11 @@ async def remove_from_power_dialer(
     Remove a phone number from the Closer's Aircall Power Dialer campaign.
     Called when a lead unsubscribes or is marked as "do not contact".
 
-    Returns True if successfully removed, False if not found or error.
+    The v1 API removes by the per-number id (DELETE .../phone_numbers/{id}),
+    NOT by phone string — so we fetch the queue, resolve the id, then delete.
+    A 404/empty match means the number is not in the queue → returns False
+    (nothing removed). We no longer treat a missing number as success, which
+    previously masked the fact that removal never actually worked.
     """
     if not AIRCALL_API_ID or not AIRCALL_API_TOKEN or not AIRCALL_CLOSER_USER_ID:
         logger.warning("Aircall: credentials missing — cannot remove from Power Dialer")
@@ -450,28 +502,84 @@ async def remove_from_power_dialer(
 
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
+            queue = await _get_dialer_queue(client)
+            number_id = _find_number_id(queue, phone)
+            if number_id is None:
+                logger.info("Aircall: %s not in Power Dialer queue — nothing to remove", phone)
+                return False
             response = await _aircall_request(
                 client, "delete",
-                f"{AIRCALL_BASE}/users/{AIRCALL_CLOSER_USER_ID}/dialer_campaign/phone_numbers",
-                json={"phone_numbers": [phone]},
+                f"{AIRCALL_BASE}/users/{AIRCALL_CLOSER_USER_ID}/dialer_campaign/phone_numbers/{number_id}",
             )
 
         if response.status_code in (200, 204):
-            logger.info("Aircall: removed %s from Power Dialer (user %s)", phone, AIRCALL_CLOSER_USER_ID)
+            logger.info("Aircall: removed %s (id=%s) from Power Dialer (user %s)", phone, number_id, AIRCALL_CLOSER_USER_ID)
             return True
-        elif response.status_code == 404:
-            logger.info("Aircall: phone %s not in Power Dialer — already removed or never added", phone)
-            return True  # Already removed, so mission accomplished
-        else:
-            logger.error(
-                "Aircall: failed to remove %s from Power Dialer: %s %s",
-                phone, response.status_code, response.text,
-            )
-            return False
+        logger.error(
+            "Aircall: failed to remove %s (id=%s) from Power Dialer: %s %s",
+            phone, number_id, response.status_code, response.text,
+        )
+        return False
 
     except Exception as e:
         logger.error("Aircall: exception while removing %s from Power Dialer: %s", phone, e)
         return False
+
+
+async def remove_many_from_power_dialer(
+    phones: set[str],
+    *,
+    timeout: float = 30.0,
+) -> int:
+    """
+    Remove multiple phones from the Closer's dialer queue, fetching the queue
+    ONCE (no N×GET). Used by the batch to actively pull hard-excluded leads
+    (paused / removed / booked / DNC) out of Kevin's dialer instead of only
+    declining to re-add them.
+
+    Guardrail: refuses to run if the target set exceeds half the queue (and at
+    least 20) — a mass-removal of that size signals a logic bug, not real
+    exclusions, so we abort and alert rather than wipe Kevin's queue.
+
+    Returns the count actually removed (confirmed 200/204).
+    """
+    if not (AIRCALL_API_ID and AIRCALL_API_TOKEN and AIRCALL_CLOSER_USER_ID) or not phones:
+        return 0
+
+    removed = 0
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            queue = await _get_dialer_queue(client)
+            if not queue:
+                return 0
+            if len(phones) > max(20, len(queue) // 2):
+                logger.error(
+                    "Aircall: remove_many REFUSING — %d targets vs queue %d (>50%%). "
+                    "Aborting to avoid mass-removal; investigate the exclusion logic.",
+                    len(phones), len(queue),
+                )
+                return 0
+            for phone in phones:
+                number_id = _find_number_id(queue, phone)
+                if number_id is None:
+                    continue
+                resp = await _aircall_request(
+                    client, "delete",
+                    f"{AIRCALL_BASE}/users/{AIRCALL_CLOSER_USER_ID}/dialer_campaign/phone_numbers/{number_id}",
+                )
+                if resp.status_code in (200, 204):
+                    removed += 1
+                    logger.info("Aircall: batch-removed %s (id=%s) from Power Dialer", phone, number_id)
+                else:
+                    logger.warning(
+                        "Aircall: batch-remove failed %s (id=%s): %s %s",
+                        phone, number_id, resp.status_code, resp.text[:150],
+                    )
+    except Exception as e:
+        logger.error("Aircall: remove_many exception: %s", e)
+
+    logger.info("Aircall: remove_many removed %d/%d hard-excluded numbers", removed, len(phones))
+    return removed
 
 
 async def log_call_outcome(

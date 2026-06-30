@@ -54,7 +54,8 @@ from integrations.zoom import (
     verify_webhook_signature as verify_zoom_signature,
 )
 from batch.call_summarizer import process_zoom_vtt
-from integrations.aircall import add_to_power_dialer
+from integrations.aircall import add_to_power_dialer, remove_from_power_dialer
+from batch.dialer_gate import dialer_suppressed
 from integrations.supabase import (
     fetch_touchpoints_for_emails,
     fetch_all_lead_data,
@@ -740,35 +741,48 @@ async def realtime_score_webhook(
     # Step 4: Push to Aircall Power Dialer if qualified
     dialer_ok = False
     if should_push and list_key and payload.phone:
-        try:
-            aircall_card = _build_aircall_card(
-                tier_label=tier_label,
-                funnel=funnel,
-                score=score,
-                last_call_date=None,
-                email_summary=email_summary,
-                first_touch=first_touch,
-                last_touch=last_touch,
-                hook=hook,
-                purchased_funnels=purchased_funnels,
-            )
-            dialer_result = await add_to_power_dialer(
-                {
-                    "phone": payload.phone,
-                    "firstname": payload.firstname,
-                    "lastname": payload.lastname,
-                    "email": email,
-                    "notes": aircall_card,
-                },
-                score=score,
-                interest_category=funnel,
-                lead_tier=scoring.lead_tier,
-                list_key=list_key or "",
-            )
-            dialer_ok = dialer_result is not None
-            logger.info("Realtime score: pushed %s to Aircall [%s]", email, list_key)
-        except Exception as e:
-            logger.error("Realtime score: Aircall push failed for %s: %s", email, e)
+        # Gate: never push a lead that is paused / removed / booked / unsubscribed /
+        # DNC / not-interested. The batch path checks this; the webhook must too,
+        # otherwise a phone edit on an existing excluded contact re-adds them.
+        suppressed, reason = await dialer_suppressed(
+            email=email, phone=payload.phone, contact_id=contact_id, funnel=funnel or "",
+        )
+        if suppressed:
+            logger.info("Realtime score: dialer-suppressed %s (%s) — not pushing; removing if present", email, reason)
+            try:
+                await remove_from_power_dialer(payload.phone)
+            except Exception as e:
+                logger.warning("Realtime score: suppression-remove failed for %s: %s", email, e)
+        else:
+            try:
+                aircall_card = _build_aircall_card(
+                    tier_label=tier_label,
+                    funnel=funnel,
+                    score=score,
+                    last_call_date=None,
+                    email_summary=email_summary,
+                    first_touch=first_touch,
+                    last_touch=last_touch,
+                    hook=hook,
+                    purchased_funnels=purchased_funnels,
+                )
+                dialer_result = await add_to_power_dialer(
+                    {
+                        "phone": payload.phone,
+                        "firstname": payload.firstname,
+                        "lastname": payload.lastname,
+                        "email": email,
+                        "notes": aircall_card,
+                    },
+                    score=score,
+                    interest_category=funnel,
+                    lead_tier=scoring.lead_tier,
+                    list_key=list_key or "",
+                )
+                dialer_ok = dialer_result is not None
+                logger.info("Realtime score: pushed %s to Aircall [%s]", email, list_key)
+            except Exception as e:
+                logger.error("Realtime score: Aircall push failed for %s: %s", email, e)
 
     return RealtimeScoreResponse(
         contact_id=contact_id or email,
@@ -902,33 +916,45 @@ async def whatsapp_event_webhook(
     # Step 6: Push to Aircall Power Dialer if qualified
     dialer_ok = False
     if phone and score >= SCORE_WARM and not payload.opted_out:
-        try:
-            name_parts = payload.name.split(" ", 1) if payload.name else ["", ""]
-            firstname = name_parts[0]
-            lastname = name_parts[1] if len(name_parts) > 1 else ""
+        # Gate against stored lifecycle state — payload.opted_out only reflects
+        # THIS request, not whether the contact is already paused/booked/DNC.
+        suppressed, reason = await dialer_suppressed(
+            email=email, phone=phone, funnel=funnel or "",
+        )
+        if suppressed:
+            logger.info("WhatsApp event: dialer-suppressed %s (%s) — not pushing; removing if present", email or phone, reason)
+            try:
+                await remove_from_power_dialer(phone)
+            except Exception as e:
+                logger.warning("WhatsApp event: suppression-remove failed for %s: %s", email or phone, e)
+        else:
+            try:
+                name_parts = payload.name.split(" ", 1) if payload.name else ["", ""]
+                firstname = name_parts[0]
+                lastname = name_parts[1] if len(name_parts) > 1 else ""
 
-            notes = (
-                f"Score: {score:.0f} | Tier: {tier_label} | "
-                f"WA-Score: {payload.whatsapp_score} | "
-                f"Interesse: {funnel or 'unknown'} | "
-                f"{payload.summary}"
-            )
-            dialer_result = await add_to_power_dialer(
-                {
-                    "phone": phone,
-                    "firstname": firstname,
-                    "lastname": lastname,
-                    "email": email,
-                    "notes": notes,
-                },
-                score=score,
-                interest_category=funnel,
-                lead_tier=scoring.lead_tier,
-            )
-            dialer_ok = dialer_result is not None
-            logger.info("WhatsApp event: pushed %s to Aircall", email or phone)
-        except Exception as e:
-            logger.error("WhatsApp event: Aircall push failed for %s: %s", email or phone, e)
+                notes = (
+                    f"Score: {score:.0f} | Tier: {tier_label} | "
+                    f"WA-Score: {payload.whatsapp_score} | "
+                    f"Interesse: {funnel or 'unknown'} | "
+                    f"{payload.summary}"
+                )
+                dialer_result = await add_to_power_dialer(
+                    {
+                        "phone": phone,
+                        "firstname": firstname,
+                        "lastname": lastname,
+                        "email": email,
+                        "notes": notes,
+                    },
+                    score=score,
+                    interest_category=funnel,
+                    lead_tier=scoring.lead_tier,
+                )
+                dialer_ok = dialer_result is not None
+                logger.info("WhatsApp event: pushed %s to Aircall", email or phone)
+            except Exception as e:
+                logger.error("WhatsApp event: Aircall push failed for %s: %s", email or phone, e)
 
     return WhatsAppEventResponse(
         phone=phone,
