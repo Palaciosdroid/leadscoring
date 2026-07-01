@@ -56,6 +56,10 @@ SCORE_HOT = 65       # >= 65 -> same list as warm, tagged hot
 FRESH_WINDOW = timedelta(days=7)  # Wave 4: was 72h, now 7d
 FRESH_MIN_SCORE = 10  # fresh leads need at least this to enter Aircall (avoids single page_visited)
 
+# Max concurrent HubSpot note writes. Each note = a few API calls; 5 in flight
+# cuts the sequential note-tail ~5x while staying well under HubSpot's rate limit.
+_NOTE_WRITE_CONCURRENCY = 5
+
 # Human-readable tier labels for dormant leads (use stored old_tier value)
 _OLD_TIER_LABELS: dict[str, str] = {"1_hot": "HOT", "2_warm": "WARM"}
 
@@ -1385,25 +1389,41 @@ async def run_batch_scoring() -> None:
     hs_notes_written = 0
     hs_notes_skipped = 0
     if hubspot_notes_queue:
-        logger.info("Batch: writing %d HubSpot notes", len(hubspot_notes_queue))
-        for note_item in hubspot_notes_queue:
-            try:
-                wrote = await _write_hubspot_note(
-                    contact_id=note_item["contact_id"],
-                    body=note_item["card"],
-                )
-                if wrote:
-                    hs_notes_written += 1
-                else:
-                    hs_notes_skipped += 1
-            except Exception as e:
-                logger.warning(
-                    "Batch: HubSpot note failed for %s: %s",
-                    note_item["email"], e,
-                )
         logger.info(
-            "Batch: wrote %d/%d HubSpot notes (%d unchanged, skipped)",
+            "Batch: writing %d HubSpot notes (concurrency=%d)",
+            len(hubspot_notes_queue), _NOTE_WRITE_CONCURRENCY,
+        )
+        # Write notes with bounded concurrency — the loop used to run fully
+        # sequentially (one note = several HubSpot round-trips), which dominated
+        # batch wall-time. A semaphore caps in-flight writes to stay under the
+        # HubSpot rate limit while cutting the tail ~5x. Per-note logic and the
+        # unchanged-card skip are unchanged.
+        _note_sem = asyncio.Semaphore(_NOTE_WRITE_CONCURRENCY)
+
+        async def _write_one(note_item: dict[str, Any]) -> str:
+            async with _note_sem:
+                try:
+                    wrote = await _write_hubspot_note(
+                        contact_id=note_item["contact_id"],
+                        body=note_item["card"],
+                    )
+                    return "written" if wrote else "skipped"
+                except Exception as e:
+                    logger.warning(
+                        "Batch: HubSpot note failed for %s: %s",
+                        note_item["email"], e,
+                    )
+                    return "error"
+
+        _note_results = await asyncio.gather(
+            *[_write_one(n) for n in hubspot_notes_queue]
+        )
+        hs_notes_written = _note_results.count("written")
+        hs_notes_skipped = _note_results.count("skipped")
+        logger.info(
+            "Batch: wrote %d/%d HubSpot notes (%d unchanged, %d errors)",
             hs_notes_written, len(hubspot_notes_queue), hs_notes_skipped,
+            _note_results.count("error"),
         )
 
     # Hot Lead individual Slack alerts removed — batch report summary only
