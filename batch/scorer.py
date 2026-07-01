@@ -169,7 +169,7 @@ async def _fetch_active_hubspot_leads() -> list[dict[str, Any]]:
             "hs_email_open_count", "hs_email_click_count",
             "lead_pause_until", "lead_no_answer_streak",
             "lead_no_answer_cycles", "lead_dialer_removed",
-            "lead_phone_dnc",
+            "lead_phone_dnc", "lead_score_updated_at",
         ],
         "limit": 100,
     }
@@ -724,6 +724,7 @@ def _build_aircall_card(
     hook: str,
     purchased_funnels: list[str] | None = None,
     purchases: list[dict] | None = None,
+    score_age_days: int | None = None,
 ) -> str:
     """
     Build the Aircall card info string for the closer.
@@ -744,6 +745,12 @@ def _build_aircall_card(
         if tier_label == "WARM" else
         f"{tier_label} -- {funnel_label} | Score: {score:.0f}",
     ]
+
+    # Stale-score warning: the batch only re-scores active leads, so a dormant
+    # lead can carry a months-old score/tier. Flag it (>90d) so Kevin knows the
+    # score may not reflect current intent. Analysis 01.07: ~31% of scores >90d.
+    if score_age_days is not None and score_age_days > 90:
+        lines.append(f"⚠️ Score {score_age_days}d alt — evtl. veraltet")
 
     # Last call info
     if last_call_date:
@@ -1268,6 +1275,18 @@ async def run_batch_scoring() -> None:
                     "viewed_pricing": offer_signals.get("viewed_pricing"),
                 }
                 hook = generate_hook(hook_context)
+                # Score age — flag stale (>90d) scores on the card. Mostly bites
+                # dormant leads carrying a stored old score; freshly-scored leads
+                # have age ~0. (Analysis 01.07: ~31% of scores are >90d old.)
+                score_age_days = None
+                _sdate = props.get("lead_score_updated_at")
+                if _sdate:
+                    try:
+                        score_age_days = (
+                            now_utc - datetime.fromisoformat(_sdate.replace("Z", "+00:00"))
+                        ).days
+                    except (ValueError, AttributeError):
+                        pass
                 aircall_card = _build_aircall_card(
                     tier_label=card_tier_label,
                     funnel=funnel,
@@ -1279,6 +1298,7 @@ async def run_batch_scoring() -> None:
                     hook=hook,
                     purchased_funnels=purchased_funnels,
                     purchases=purchases,
+                    score_age_days=score_age_days,
                 )
                 # In 'points' mode, append the transparent breakdown so Kevin
                 # sees WHY the lead scored (Budget +30 · Replay +20 · …).
