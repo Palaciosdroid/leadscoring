@@ -18,6 +18,7 @@ import httpx
 
 from batch.do_not_call import check_do_not_call
 from batch.call_window import is_within_call_window
+from scoring.dial_policy import SCORE_WARM, FRESH_MIN_SCORE, should_push_lead
 from integrations.phone import validate_and_normalize, region_for
 from integrations.supabase import (
     fetch_touchpoints_for_emails,
@@ -51,10 +52,10 @@ SCORING_MODE = os.environ.get("SCORING_MODE", "engagement").strip().lower()
 
 # Score thresholds (reverted to v1 — v2 thresholds were too aggressive,
 # caused 152 leads to drop from Warm to Cold and disappear from Aircall)
-SCORE_WARM = 30      # >= 30 -> push to HubSpot/Aircall
+# SCORE_WARM + FRESH_MIN_SCORE live in scoring.dial_policy (single source of
+# truth, shared with the realtime + WhatsApp push paths). Imported below.
 SCORE_HOT = 65       # >= 65 -> same list as warm, tagged hot
 FRESH_WINDOW = timedelta(days=7)  # Wave 4: was 72h, now 7d
-FRESH_MIN_SCORE = 10  # fresh leads need at least this to enter Aircall (avoids single page_visited)
 
 # Max concurrent HubSpot note writes. Each note = a few API calls; 5 in flight
 # cuts the sequential note-tail ~5x while staying well under HubSpot's rate limit.
@@ -1139,16 +1140,13 @@ async def run_batch_scoring() -> None:
                 list_key = None
                 should_push = False
             else:
-                # Eignungscheck leads always get called — form submission is the qualifier,
-                # no score threshold applies. Score is shown on the Aircall card for context only.
-                # Fresh/warm funnel lists require score >= 30 or freshness as a quality gate.
-                # FRESH_MIN_SCORE (10) prevents single page_visited leads (3 pts) from being dialled.
-                # Dormant Hot/Warm: previously scored leads with no recent events — still callable.
-                should_push = has_phone and (
-                    list_key == "eignungscheck"
-                    or (is_fresh and score >= FRESH_MIN_SCORE)
-                    or score >= SCORE_WARM
-                    or is_dormant_warm
+                # Shared push policy (scoring.dial_policy) — identical rule in the
+                # realtime + WhatsApp webhooks so all paths dial the same leads.
+                should_push = has_phone and should_push_lead(
+                    score=score,
+                    is_fresh=is_fresh,
+                    list_key=list_key,
+                    is_dormant_warm=is_dormant_warm,
                 )
 
             # Exclusion: lifecycle pause / removed (replaces the old day-cooldowns).

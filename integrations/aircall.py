@@ -40,7 +40,9 @@ AIRCALL_API_TOKEN    = os.environ.get("AIRCALL_API_TOKEN", "")
 AIRCALL_BASE         = "https://api.aircall.io/v1"
 AIRCALL_CLOSER_USER_ID = os.environ.get("AIRCALL_CLOSER_USER_ID", "")
 
-FRESH_WINDOW_HOURS = 24
+# Fresh window unified with the scorer (scoring FRESH_WINDOW = 7 days). Aircall's
+# own _is_fresh is only a fallback for when the scorer's is_fresh flag isn't passed.
+FRESH_WINDOW_HOURS = 7 * 24
 # Tiers that qualify for the Aircall Power Dialer (Hot + Warm = "Warm" list)
 DIALABLE_TIERS: frozenset[str] = frozenset({"1_hot", "2_warm"})
 
@@ -105,7 +107,7 @@ def _should_dial(
     # gating lives in dialer_gate + the batch path; this is defense-in-depth.)
     if lead_tier in ("0_booked", "4_disqualified"):
         return False
-    # Accept scorer's freshness signal (7-day window) OR Aircall's own 24h check
+    # Accept scorer's freshness signal OR Aircall's own check (both 7-day window)
     if is_fresh or _is_fresh(created_at):
         return True
     # Score < 30 never goes to Aircall
@@ -175,7 +177,7 @@ def _build_call_info(
 
     tier_label = _TIER_EMOJI.get(lead_tier, lead_tier.upper())
     interest_label = _INTEREST_LABEL.get(interest_category or "", interest_category or "")
-    fresh_label = " | 🆕 Fresh (<24h)" if _is_fresh(created_at) else ""
+    fresh_label = " | 🆕 Fresh (<7d)" if _is_fresh(created_at) else ""
 
     parts = [f"{tier_label} | Score: {int(score)}"]
     if interest_label:

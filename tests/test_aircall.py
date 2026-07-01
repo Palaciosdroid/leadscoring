@@ -54,20 +54,25 @@ class TestIsFresh:
         assert _is_fresh(created) is True
 
     def test_old_lead(self):
-        created = datetime.now(timezone.utc) - timedelta(hours=30)
+        created = datetime.now(timezone.utc) - timedelta(days=8)
         assert _is_fresh(created) is False
 
     def test_none_not_fresh(self):
         assert _is_fresh(None) is False
 
-    def test_exactly_24h_not_fresh(self):
-        created = datetime.now(timezone.utc) - timedelta(hours=24)
+    def test_within_7d_is_fresh(self):
+        # Fresh window unified to 7 days (was 24h) — matches scorer FRESH_WINDOW.
+        created = datetime.now(timezone.utc) - timedelta(days=3)
+        assert _is_fresh(created) is True
+
+    def test_beyond_7d_not_fresh(self):
+        created = datetime.now(timezone.utc) - timedelta(days=8)
         assert _is_fresh(created) is False
 
 
 class TestShouldDial:
     def test_fresh_lead_always_dials(self):
-        """Fresh leads (< 24h) dial regardless of score or tier."""
+        """Fresh leads (< 7d) dial regardless of score or tier."""
         created = datetime.now(timezone.utc) - timedelta(hours=1)
         assert _should_dial(0, created, lead_tier="3_cold") is True
 
@@ -83,7 +88,7 @@ class TestShouldDial:
 
     def test_warm_tier_low_score_skipped(self):
         """Warm tier (2_warm) with score < 30 does NOT qualify (TASK B)."""
-        old = datetime.now(timezone.utc) - timedelta(days=3)
+        old = datetime.now(timezone.utc) - timedelta(days=8)
         assert _should_dial(20, old, lead_tier="2_warm") is False
 
     def test_booked_tier_skipped(self):
@@ -93,7 +98,7 @@ class TestShouldDial:
 
     def test_cold_tier_skipped(self):
         """Cold tier (3_cold) does NOT qualify — CIO nurturing only."""
-        old = datetime.now(timezone.utc) - timedelta(days=3)
+        old = datetime.now(timezone.utc) - timedelta(days=8)
         assert _should_dial(10, old, lead_tier="3_cold") is False
 
     def test_disqualified_tier_skipped(self):
@@ -103,7 +108,7 @@ class TestShouldDial:
 
     def test_empty_tier_not_fresh_skipped(self):
         """No tier + not fresh → skip."""
-        old = datetime.now(timezone.utc) - timedelta(days=3)
+        old = datetime.now(timezone.utc) - timedelta(days=8)
         assert _should_dial(50, old, lead_tier="") is False
 
     def test_is_fresh_flag_overrides_created_at_none(self):
@@ -132,7 +137,7 @@ class TestAddToPowerDialer:
     @patch("integrations.aircall.AIRCALL_CLOSER_USER_ID", "12345")
     async def test_cold_tier_returns_none(self):
         """Cold tier lead is not pushed to the Power Dialer."""
-        old = datetime.now(timezone.utc) - timedelta(days=3)
+        old = datetime.now(timezone.utc) - timedelta(days=8)
         result = await add_to_power_dialer(self.LEAD, score=10, created_at=old, lead_tier="3_cold")
         assert result is None
 
@@ -174,7 +179,7 @@ class TestAddToPowerDialer:
     @patch("integrations.aircall._push_to_dialer_campaign", new_callable=AsyncMock, return_value={"status": "added", "phone": "+4915112345678"})
     async def test_is_fresh_flag_with_old_created_at_pushes_to_dialer(self, mock_push, mock_upsert, mock_note):
         """is_fresh=True bypasses created_at age — scorer's 7-day freshness is honoured."""
-        old = datetime.now(timezone.utc) - timedelta(days=5)  # 5 days old — would fail _is_fresh 24h check
+        old = datetime.now(timezone.utc) - timedelta(days=8)  # beyond the 7-day fresh window
         result = await add_to_power_dialer(
             self.LEAD, score=15, created_at=old, lead_tier="3_cold", is_fresh=True
         )
@@ -188,7 +193,7 @@ class TestAddToPowerDialer:
     @patch("integrations.aircall.AIRCALL_CLOSER_USER_ID", "12345")
     async def test_is_fresh_false_with_old_created_at_cold_score_returns_none(self):
         """is_fresh=False + old created_at + score < 30 = correctly rejected."""
-        old = datetime.now(timezone.utc) - timedelta(days=5)
+        old = datetime.now(timezone.utc) - timedelta(days=8)
         result = await add_to_power_dialer(
             self.LEAD, score=15, created_at=old, lead_tier="3_cold", is_fresh=False
         )

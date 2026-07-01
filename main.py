@@ -33,6 +33,7 @@ from batch.scorer import (
     SCORE_WARM,
     VALID_FUNNELS,
 )
+from scoring.dial_policy import should_push_lead
 from batch.scheduled_calls_summarizer import run_scheduled_calls_summarizer
 from batch.unsubscribe_handler import handle_unsubscribe
 from integrations.hubspot import (
@@ -684,16 +685,26 @@ async def realtime_score_webhook(
 
     # Determine list assignment
     has_phone = bool(payload.phone)
-    should_push = has_phone and (is_fresh or score >= SCORE_WARM)
 
-    # Simplified eignungscheck check (no DNC filter in realtime — new leads are clean)
+    # Eignungscheck qualification — require a form submission like the batch path,
+    # so realtime routes the SAME leads to EC (previously it had no form gate).
+    has_submitted_form = any(
+        e.get("event_type") == "application_submitted" for e in scored_events
+    )
     qualifies_eignungscheck = (
         has_phone
+        and has_submitted_form
         and funnel is not None
         and funnel not in purchased_funnels
     )
 
     list_key = _determine_list_key(funnel, is_fresh, score, qualifies_eignungscheck)
+
+    # Shared push policy (scoring.dial_policy) — identical gate to batch + WhatsApp.
+    # Adds the fresh score floor (FRESH_MIN_SCORE) that realtime previously lacked.
+    should_push = has_phone and should_push_lead(
+        score=score, is_fresh=is_fresh, list_key=list_key,
+    )
 
     # Generate hook for Aircall card
     offer_signals = _extract_offer_signals(browser_events)
@@ -914,8 +925,27 @@ async def whatsapp_event_webhook(
             logger.error("WhatsApp event: HubSpot update failed for %s: %s", email, e)
 
     # Step 6: Push to Aircall Power Dialer if qualified
+    # Shared push policy (scoring.dial_policy) — compute freshness + list routing
+    # like the batch/realtime paths so WhatsApp dials the SAME leads (previously
+    # it used score>=30 only and ignored freshness + eignungscheck routing).
+    wa_is_fresh, _ = _determine_freshness(touchpoints)
+    wa_has_form = any(
+        e.get("event_type") == "application_submitted" for e in scored_events
+    )
+    wa_purchased_funnels = _extract_purchased_funnels(purchases)
+    wa_qualifies_ec = (
+        bool(phone)
+        and wa_has_form
+        and funnel is not None
+        and funnel not in wa_purchased_funnels
+    )
+    wa_list_key = _determine_list_key(funnel, wa_is_fresh, score, wa_qualifies_ec)
+    wa_should_push = bool(phone) and should_push_lead(
+        score=score, is_fresh=wa_is_fresh, list_key=wa_list_key,
+    )
+
     dialer_ok = False
-    if phone and score >= SCORE_WARM and not payload.opted_out:
+    if wa_should_push and not payload.opted_out:
         # Gate against stored lifecycle state — payload.opted_out only reflects
         # THIS request, not whether the contact is already paused/booked/DNC.
         suppressed, reason = await dialer_suppressed(
