@@ -554,17 +554,24 @@ async def remove_many_from_power_dialer(
             queue = await _get_dialer_queue(client)
             if not queue:
                 return 0
-            if len(phones) > max(20, len(queue) // 2):
-                logger.error(
-                    "Aircall: remove_many REFUSING — %d targets vs queue %d (>50%%). "
-                    "Aborting to avoid mass-removal; investigate the exclusion logic.",
-                    len(phones), len(queue),
-                )
-                return 0
+            # Resolve queue matches FIRST, then guardrail on the ACTUAL match
+            # count. The excluded set legitimately contains every paused/DNC
+            # lead in HubSpot (hundreds, most not in the queue at all) — sizing
+            # the guardrail on the raw set made it fire every run and killed
+            # batch removal entirely (seen live 03.07: 484 targets vs 385 queue).
+            matches: dict[int, str] = {}
             for phone in phones:
                 number_id = _find_number_id(queue, phone)
-                if number_id is None:
-                    continue
+                if number_id is not None:
+                    matches[number_id] = phone
+            if len(matches) > max(20, len(queue) // 2):
+                logger.error(
+                    "Aircall: remove_many REFUSING — %d queue matches vs queue %d (>50%%). "
+                    "Aborting to avoid mass-removal; investigate the exclusion logic.",
+                    len(matches), len(queue),
+                )
+                return 0
+            for number_id, phone in matches.items():
                 resp = await _aircall_request(
                     client, "delete",
                     f"{AIRCALL_BASE}/users/{AIRCALL_CLOSER_USER_ID}/dialer_campaign/phone_numbers/{number_id}",

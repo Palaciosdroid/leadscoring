@@ -135,12 +135,27 @@ class TestRemoveMany:
     @patch("integrations.aircall._get_dialer_queue", new_callable=AsyncMock)
     @patch("integrations.aircall._aircall_request", new_callable=AsyncMock)
     async def test_mass_removal_guardrail(self, mock_req, mock_queue):
-        # Targets exceed half the queue (and the absolute floor of 20) → refuse.
+        # MATCHED targets exceed half the queue (and the floor of 20) → refuse.
         mock_queue.return_value = [{"id": i, "number": f"49160000{i:04d}"} for i in range(30)]
-        phones = {f"+49160000{i:04d}" for i in range(21)}  # 21 targets > max(20, 30//2=15)
+        phones = {f"+49160000{i:04d}" for i in range(21)}  # 21 matches > max(20, 30//2=15)
         n = await remove_many_from_power_dialer(phones)
         assert n == 0
         mock_req.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("integrations.aircall._get_dialer_queue", new_callable=AsyncMock)
+    @patch("integrations.aircall._aircall_request", new_callable=AsyncMock)
+    async def test_large_excluded_set_with_few_matches_is_not_refused(self, mock_req, mock_queue):
+        # Regression 03.07: the excluded set legitimately holds hundreds of
+        # paused leads NOT in the queue. Guardrail must size on MATCHES, not on
+        # the raw set — 484 targets vs 385 queue refused every batch removal.
+        mock_queue.return_value = [{"id": i, "number": f"49160000{i:04d}"} for i in range(30)]
+        phones = {f"+49170999{i:04d}" for i in range(500)}   # 500 targets, none in queue
+        phones.add("+491600000001")                           # exactly 1 real match
+        mock_req.return_value = _resp(204)
+        n = await remove_many_from_power_dialer(phones)
+        assert n == 1
+        assert mock_req.await_count == 1
 
 
 # ── dialer_suppressed gate (C1) ──────────────────────────────────────────────
