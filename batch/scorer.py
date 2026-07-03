@@ -1175,6 +1175,23 @@ async def run_batch_scoring() -> None:
                 if kaeufer_key and has_phone and contact_id not in list_memberships[kaeufer_key]:
                     list_memberships[kaeufer_key].append(contact_id)
 
+            # Collect HARD-excluded leads (booked / paused / removed / DNC) so we
+            # can actively PULL them from Kevin's live dialer queue after the loop.
+            # MUST run BEFORE the has_phone skip and accept the RAW phone value:
+            # wrong-number leads typically have malformed phones that fail E.164
+            # validation, but their number IS in the queue (matched by digits) —
+            # skipping them here made them permanently unremovable (audit 03.07:
+            # 4 'Falsche Nummer' leads flagged removed=true yet still in queue).
+            # NOTE: never collect plain score-cold leads — a cooling warm lead must
+            # stay dialable until it is actually paused/removed.
+            _removal_phone = _raw_phone or _raw_value
+            if _removal_phone and (
+                call_booked
+                or dnc_result.should_skip
+                or _is_paused_or_removed(props, now_utc, scored_events)
+            ):
+                dialer_remove_phones.add(_removal_phone)
+
             if not has_phone:
                 logger.debug("Batch: skip %s — no phone number", email)
                 skipped_cold += 1
@@ -1187,19 +1204,6 @@ async def run_batch_scoring() -> None:
 
             if not should_push and not dnc_result.should_skip:
                 skipped_cold += 1
-
-            # Collect HARD-excluded leads (booked / paused / removed / DNC) with a
-            # valid phone so we can actively PULL them from Kevin's live dialer queue
-            # after the loop. The batch previously only declined to re-add them
-            # (should_push=False) but never removed anyone already in the queue.
-            # NOTE: never collect plain score-cold leads — a cooling warm lead must
-            # stay dialable until it is actually paused/removed.
-            if has_phone and _raw_phone and (
-                call_booked
-                or dnc_result.should_skip
-                or _is_paused_or_removed(props, now_utc, scored_events)
-            ):
-                dialer_remove_phones.add(_raw_phone)
 
             # Build HubSpot card properties
             hs_properties = _build_hubspot_card_properties(
