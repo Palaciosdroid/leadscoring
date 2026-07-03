@@ -19,7 +19,7 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
 from analytics.buyer_journey import analyze_buyer_journeys, run_weekly_buyer_journey
-from batch.call_poller import run_call_polling
+from batch.call_poller import run_call_polling, record_call_outcome
 from batch.scorer import (
     run_batch_scoring,
     _determine_freshness,
@@ -41,7 +41,6 @@ from integrations.hubspot import (
     upsert_contact_score,
     get_latest_call_for_contact,
     get_prioritized_contacts,
-    write_call_outcome,
     find_contact_by_zoom_meeting,
     find_contact_by_phone,
     add_note,
@@ -1098,12 +1097,17 @@ async def hubspot_call_webhook(
     except (ValueError, TypeError, OSError):
         ts_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    # Write outcome back to HubSpot contact
+    # Write outcome back to HubSpot contact via the SHARED lifecycle writer —
+    # applies the pause state machine + immediate dialer removal, identical to
+    # the 5-min poller. (Previously this path wrote only last_call_outcome
+    # without a pause, so reached leads stayed dialable — RCA 03.07.)
     if payload.contact_id:
         try:
-            await write_call_outcome(payload.contact_id, outcome)
+            await record_call_outcome(
+                payload.contact_id, outcome, datetime.now(tz=timezone.utc)
+            )
         except Exception as e:
-            logger.error("HubSpot write_call_outcome failed: %s", e)
+            logger.error("HubSpot record_call_outcome failed: %s", e)
 
     # No individual Slack card per call — meetings are summarised in the EOD report (18:00 CET)
 

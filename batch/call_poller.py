@@ -13,7 +13,10 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
-from integrations.aircall import log_call_outcome as aircall_log_outcome
+from integrations.aircall import (
+    log_call_outcome as aircall_log_outcome,
+    remove_from_power_dialer,
+)
 from integrations.hubspot import (
     CONNECTED_DISPOSITIONS,
     HS_DISPOSITION_MAP,
@@ -44,18 +47,27 @@ _LIFECYCLE_PROPS = [
 ]
 
 
-async def _persist_lifecycle(contact_id: str, outcome: str, now: datetime) -> None:
-    """Load the lead's lifecycle state, apply the call outcome, and write it
-    back to HubSpot together with last_call_date + last_call_outcome.
+async def record_call_outcome(
+    contact_id: str, outcome: str, now: datetime, phone: str = ""
+) -> None:
+    """SINGLE writer for call outcomes — used by the 5-min poller AND the
+    HubSpot call webhook (main.py), so both paths apply identical rules:
 
-    Runs for EVERY disposition (reached AND no-answer) so the state machine
-    sees no-answer streaks. Best-effort: logs and returns on any error.
+      1. Apply the lifecycle state machine (reached -> 90d pause, no-answer
+         streaks, wrong number -> removed).
+      2. Write lifecycle props + last_call_date + last_call_outcome to HubSpot.
+      3. If the outcome pauses or removes the lead, IMMEDIATELY pull them from
+         Kevin's Aircall queue — don't wait for the next batch run. (RCA 03.07:
+         reached leads stayed dialable because removal only happened in the
+         batch, and the webhook path never wrote a pause at all.)
+
+    Runs for EVERY disposition. Best-effort: logs and returns on any error.
     """
     if not contact_id:
         return
     outcome_class = classify_outcome(outcome)
     try:
-        props = await get_contact_properties(contact_id, _LIFECYCLE_PROPS)
+        props = await get_contact_properties(contact_id, _LIFECYCLE_PROPS + ["phone"])
         state = state_from_props(props)
         new_state = apply_call_outcome(state, outcome_class, now)
 
@@ -69,8 +81,29 @@ async def _persist_lifecycle(contact_id: str, outcome: str, now: datetime) -> No
             new_state.no_answer_streak, new_state.no_answer_cycles,
             new_state.removed, update["lead_pause_until"],
         )
+
+        # Step 3: enforce at the source — paused/removed leads leave the live
+        # queue NOW, not on the next batch cycle.
+        if new_state.removed or (new_state.pause_until and new_state.pause_until > now):
+            target_phone = phone or props.get("phone", "")
+            if target_phone:
+                try:
+                    gone = await remove_from_power_dialer(target_phone)
+                    logger.info(
+                        "call_poller: immediate dialer removal %s (%s) -> %s",
+                        target_phone, outcome_class, gone,
+                    )
+                except Exception as rm_err:
+                    logger.warning(
+                        "call_poller: immediate removal failed for %s: %s",
+                        target_phone, rm_err,
+                    )
     except Exception as e:
         logger.error("call_poller: lifecycle persist failed for %s: %s", contact_id, e)
+
+
+# Backwards-compatible alias (poller-internal name before the webhook shared it)
+_persist_lifecycle = record_call_outcome
 
 
 async def run_call_polling(since_minutes: int = 10) -> None:
@@ -94,7 +127,9 @@ async def run_call_polling(since_minutes: int = 10) -> None:
     now = datetime.now(timezone.utc)
     for c in new_calls:
         outcome = HS_DISPOSITION_MAP.get(c.get("hs_call_disposition", ""), "Unknown")
-        await _persist_lifecycle(c.get("contact_id", ""), outcome, now)
+        await record_call_outcome(
+            c.get("contact_id", ""), outcome, now, phone=c.get("contact_phone", "")
+        )
 
     # Split: Anschläge (no Slack) vs Meetings (connected → send Slack)
     connected_calls = [c for c in new_calls if c.get("hs_call_disposition") in CONNECTED_DISPOSITIONS]
