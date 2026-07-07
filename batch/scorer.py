@@ -668,6 +668,13 @@ def _assemble_point_signals(
         "replay": bool(event_types & _REPLAY_EVENT_TYPES),
         "checkout": "checkout_visited" in event_types,
         "price": "price_info_viewed" in event_types,
+        # Email engagement (ADL fix 07.07): the launch mail series closes buyers
+        # the points model previously couldn't see. Events come from the same
+        # Whyros/CIO touchpoints the engagement model already scores.
+        "email_click": "email_link_clicked" in event_types,
+        "email_engaged": sum(
+            1 for e in scored_events if e.get("event_type") == "email_opened"
+        ) >= 3,
         # Interest category product-fit bonus
         "interest_category": funnel,
         # Hard disqualify

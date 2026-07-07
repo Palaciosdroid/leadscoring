@@ -189,3 +189,28 @@ def test_missing_signals_treated_as_zero():
 def test_unknown_budget_enum_ignored():
     res = compute_points({"budget": "weird_value"})
     assert res.points == 0
+
+
+# --- Email engagement (ADL fix 07.07) ---------------------------------------
+
+def test_email_click_scores():
+    r = compute_points({"email_click": True})
+    assert r.points == 10
+    assert any("Email-Klick" in x for x in r.reasons)
+
+
+def test_email_engaged_scores_without_click():
+    r = compute_points({"email_engaged": True})
+    assert r.points == 5
+
+
+def test_email_click_supersedes_opens_no_double_count():
+    r = compute_points({"email_click": True, "email_engaged": True})
+    assert r.points == 10  # click only, opens not double-counted
+
+
+def test_adl_buyer_profile_email_plus_form_is_not_floor():
+    # ADL 6-case: buyers had form baseline + email engagement -> must exceed
+    # the old 10-point floor that made them invisible in the shadow model.
+    r = compute_points({"form_submit": True, "email_click": True})
+    assert r.points == 20

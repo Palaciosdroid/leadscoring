@@ -14,6 +14,8 @@ Signals (all optional — a missing signal contributes 0, never crashes):
     checkout          — bool (checkout-page visit, W1-mapped)
     price             — bool (price-page visit, W1-mapped)
     form_submit       — bool (optin baseline, W1-mapped)
+    email_click       — bool (any email link click — ADL fix 07.07)
+    email_engaged     — bool (sustained opens >=3 without click)
     interest_category — str  ("hypnose" gets a small product-fit bonus)
     unsubscribed      — bool (hard disqualify)
 
@@ -49,6 +51,16 @@ CHECKOUT_POINTS = 25         # checkout-page visit (W1-mapped)
 PRICE_POINTS = 15            # price-page visit (W1-mapped)
 FORM_SUBMIT_POINTS = 10      # optin baseline — 4.3% (9x lift)
 HYPNOSE_CATEGORY_POINTS = 10  # product-fit bonus for hypnose interest
+
+# Email engagement — added after the ADL launch analysis (pixel-CC 06.07):
+# all 6 ADL buyers closed via the email series (last-touch 6/6 = email), yet
+# the points model scored them <=10 because email was no signal at all — the
+# live engagement model had 2/6 at 1_hot on exactly these clicks. Without this
+# a points-flip would demote email-warm buyers to cold. Weights mirror the
+# engagement model (click 10 / opens 5); PROVISIONAL until
+# analytics/calibrate_points.py re-runs against Deal-Won.
+EMAIL_CLICK_POINTS = 10       # any email link click
+EMAIL_ENGAGED_POINTS = 5      # sustained opens (>=3) without a click
 
 # A SKIPPED Eignungscheck question is "unknown", NOT "low" — empirically it
 # converts near base-rate (missing-interest even higher). Give a neutral weight,
@@ -148,6 +160,14 @@ def compute_points(signals: dict) -> PointsResult:
     if signals.get("form_submit"):
         points += FORM_SUBMIT_POINTS
         reasons.append(f"Form submit +{FORM_SUBMIT_POINTS}")
+
+    # --- Email engagement (click supersedes opens — no double count) --------
+    if signals.get("email_click"):
+        points += EMAIL_CLICK_POINTS
+        reasons.append(f"Email-Klick +{EMAIL_CLICK_POINTS}")
+    elif signals.get("email_engaged"):
+        points += EMAIL_ENGAGED_POINTS
+        reasons.append(f"Email-Engagement +{EMAIL_ENGAGED_POINTS}")
 
     # --- Product-fit bonus -------------------------------------------------
     if signals.get("interest_category") == "hypnose":
