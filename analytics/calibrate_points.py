@@ -492,12 +492,20 @@ async def run() -> CalibrationReport:
         for s in submissions:
             sub = s.get("submission", {})
             email = ""
-            # Tally exposes the respondent email on the submission; fall back to
-            # scanning answers for an email-typed response if absent.
+            # Tally does NOT expose a top-level respondent email — it lives as a
+            # plain-string answer inside `responses` (verified live 07.07: the
+            # old top-level lookup matched nothing → calibration silently ran
+            # without any Eignungscheck signals). Scan the answers instead.
             for key in ("email", "respondentEmail", "respondent_email"):
                 if sub.get(key):
                     email = str(sub[key]).strip().lower()
                     break
+            if not email:
+                for resp in sub.get("responses", []):
+                    ans = resp.get("answer")
+                    if isinstance(ans, str) and "@" in ans and "." in ans.split("@")[-1]:
+                        email = ans.strip().lower()
+                        break
             if email:
                 tally_by_email[email] = s.get("mapped", {})
     except Exception as exc:  # noqa: BLE001
