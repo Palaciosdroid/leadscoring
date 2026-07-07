@@ -113,9 +113,9 @@ def test_unsubscribed_disqualifies():
 
 
 # ---------------------------------------------------------------------------
-# Tier boundaries (Hot >= 50, Warm >= 25, else Cold)
+# Tier boundaries (re-calibrated 07.07: Hot >= 80, Warm >= 50, else Cold)
 # ---------------------------------------------------------------------------
-def test_tier_cold_below_25():
+def test_tier_cold_below_warm():
     # 15 points -> Cold.
     assert compute_points({"budget": "2000_4000"}).tier == "3_cold"
 
@@ -124,31 +124,33 @@ def test_tier_cold_zero():
     assert compute_points({}).tier == "3_cold"
 
 
-def test_tier_warm_at_35():
-    # Exactly 35 -> Warm (>= calibrated boundary; 25 alone is now Cold).
-    res = compute_points({"interest": "naechster_schritt", "form_submit": True})
-    assert res.points == 35
+def test_tier_mid_scores_are_cold_now():
+    # 35 and 55 were Warm/Hot under the old 50/35 thresholds — calibration
+    # showed those bands close at only 1.2-3.3%, below the 4% warm target.
+    assert compute_points({"interest": "naechster_schritt", "form_submit": True}).points == 35
+    assert compute_points({"interest": "naechster_schritt", "form_submit": True}).tier == "3_cold"
+
+
+def test_tier_warm_at_50():
+    # checkout 25 + naechster_schritt 25 = 50 -> Warm (>= boundary).
+    res = compute_points({"checkout": True, "interest": "naechster_schritt"})
+    assert res.points == 50
     assert res.tier == "2_warm"
-    assert compute_points({"interest": "naechster_schritt"}).tier == "3_cold"  # 25 -> Cold
 
 
 def test_tier_warm_range_below_hot():
-    # 30 alone -> Cold; 40 -> Warm; (50+ -> Hot, see hot tests).
-    assert compute_points({"budget": "4000_6000"}).tier == "3_cold"                       # 30
-    assert compute_points({"budget": "4000_6000", "form_submit": True}).tier == "2_warm"  # 40
-
-
-def test_tier_hot_at_50():
-    # budget 30 + interest naechster_schritt 25 = 55 -> Hot.
+    # budget 30 + naechster_schritt 25 = 55 -> Warm (was Hot pre-calibration).
     res = compute_points({"budget": "4000_6000", "interest": "naechster_schritt"})
     assert res.points == 55
-    assert res.tier == "1_hot"
+    assert res.tier == "2_warm"
 
 
-def test_tier_hot_exact_50():
-    # checkout 25 + naechster_schritt 25 = 50 -> Hot (>= boundary).
-    res = compute_points({"checkout": True, "interest": "naechster_schritt"})
-    assert res.points == 50
+def test_tier_hot_at_80():
+    # budget 30 + interest 25 + checkout 25 = 80 -> Hot (>= boundary).
+    res = compute_points({
+        "budget": "4000_6000", "interest": "naechster_schritt", "checkout": True,
+    })
+    assert res.points == 80
     assert res.tier == "1_hot"
 
 

@@ -77,9 +77,14 @@ DISQUALIFIED_TIER = "4_disqualified"
 # tunes them against the real Deal-Won rate before the flag-flip.
 # ---------------------------------------------------------------------------
 TIERS: list[tuple[str, int]] = [
-    ("1_hot",  50),   # calibrated: 8.7% close-rate, 24% of cohort, 58% of all closes
-    ("2_warm", 35),   # 35-49 pts (~3%) — secondary calling tier
-    ("3_cold",  0),   # <35 pts (~1%) — deprioritize
+    # Re-calibrated 07.07 (full base 54,335 contacts, canonical Deal-Won label,
+    # WITH Tally + email signals — see calibration_email_signals.txt):
+    #   80+  -> 10.04% close  |  65-79 -> 5.76%  |  50-64 -> 3.27%
+    # Cumulative-from-top: hot(>=8%) clears at 80, warm(>=4%) at 50. The old
+    # 50/35 thresholds were far too loose (35-49 bucket = 2.2% < warm target).
+    ("1_hot",  80),
+    ("2_warm", 50),
+    ("3_cold",  0),
 ]
 
 
