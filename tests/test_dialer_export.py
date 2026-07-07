@@ -57,3 +57,27 @@ def test_priority_input_order_preserved():
     body = csv.strip().splitlines()[1:]
     assert body[0].startswith("+41791111111")  # hot first (caller already sorted)
     assert body[1].startswith("+41792222222")
+
+
+# --- Number-level exclusion (duplicate-contact leak, 07.07) ------------------
+
+def test_csv_drops_excluded_numbers_full_and_suffix():
+    from main import _build_dialer_csv
+    contacts = [
+        {"properties": {"phone": "+491722647346", "firstname": "Silke", "lastname": "Selent",
+                        "lead_tier": "2_warm", "lead_combined_score": "40", "lead_interest_category": "hypnose"}},
+        {"properties": {"phone": "+41791234567", "firstname": "Clean", "lastname": "Lead",
+                        "lead_tier": "1_hot", "lead_combined_score": "90", "lead_interest_category": "hypnose"}},
+    ]
+    # excluded via full digits (as stored on the paused duplicate contact)
+    csv_text = _build_dialer_csv(contacts, excluded_digits={"491722647346", "722647346"})
+    assert "+491722647346" not in csv_text
+    assert "+41791234567" in csv_text
+
+
+def test_csv_without_exclusions_unchanged():
+    from main import _build_dialer_csv
+    contacts = [{"properties": {"phone": "+41791234567", "firstname": "A", "lastname": "B",
+                                "lead_tier": "1_hot", "lead_combined_score": "90",
+                                "lead_interest_category": "hypnose"}}]
+    assert "+41791234567" in _build_dialer_csv(contacts)

@@ -490,6 +490,72 @@ async def get_prioritized_contacts(
     return [*_safe(h), *_safe(w), *_safe(c)]
 
 
+async def fetch_excluded_phone_digits(*, timeout: float = 30.0) -> set[str]:
+    """
+    Digit-strings (full + last-9 suffix) of every phone whose contact is paused,
+    dialer-removed, or phone-DNC.
+
+    NUMBER-level exclusion for the dialer CSV: duplicate contacts can share one
+    number in different formats (verified leak 07.07 — one contact paused, its
+    duplicate not, so the number re-entered Kevin's CSV). A pause on ANY contact
+    must block the NUMBER, not just that contact record.
+    """
+    if not ACCESS_TOKEN:
+        return set()
+    import re as _re
+
+    now = datetime.now(tz=timezone.utc)
+    digits: set[str] = set()
+    filter_groups = [
+        [{"propertyName": "lead_pause_until", "operator": "HAS_PROPERTY"},
+         {"propertyName": "phone", "operator": "HAS_PROPERTY"}],
+        [{"propertyName": "lead_dialer_removed", "operator": "EQ", "value": "true"},
+         {"propertyName": "phone", "operator": "HAS_PROPERTY"}],
+        [{"propertyName": "lead_phone_dnc", "operator": "EQ", "value": "true"},
+         {"propertyName": "phone", "operator": "HAS_PROPERTY"}],
+    ]
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        after: str | None = None
+        while True:
+            body: dict[str, Any] = {
+                "filterGroups": [{"filters": f} for f in filter_groups],
+                "properties": ["phone", "lead_pause_until", "lead_dialer_removed", "lead_phone_dnc"],
+                "limit": 100,
+            }
+            if after:
+                body["after"] = after
+            r = await client.post(
+                f"{HUBSPOT_BASE}/crm/v3/objects/contacts/search", headers=_headers(), json=body,
+            )
+            if r.status_code != 200:
+                logger.warning("fetch_excluded_phone_digits failed: %s %s", r.status_code, r.text[:150])
+                break
+            j = r.json()
+            for c in j.get("results", []):
+                p = c.get("properties", {})
+                excluded = (
+                    str(p.get("lead_dialer_removed") or "").lower() == "true"
+                    or str(p.get("lead_phone_dnc") or "").lower() == "true"
+                )
+                if not excluded:
+                    pause_raw = (p.get("lead_pause_until") or "").strip()
+                    if pause_raw:
+                        try:
+                            excluded = now < datetime.fromisoformat(pause_raw.replace("Z", "+00:00"))
+                        except (ValueError, AttributeError):
+                            pass
+                if excluded:
+                    d = _re.sub(r"\D", "", p.get("phone") or "")
+                    if d:
+                        digits.add(d)
+                        if len(d) >= 9:
+                            digits.add(d[-9:])
+            after = j.get("paging", {}).get("next", {}).get("after")
+            if not after:
+                break
+    return digits
+
+
 async def poll_completed_calls(
     since_minutes: int = 10,
     *,

@@ -41,6 +41,7 @@ from integrations.hubspot import (
     upsert_contact_score,
     get_latest_call_for_contact,
     get_prioritized_contacts,
+    fetch_excluded_phone_digits,
     find_contact_by_zoom_meeting,
     find_contact_by_phone,
     add_note,
@@ -1155,15 +1156,23 @@ async def batch_prioritize(
     return {"total": len(queue), "contacts": queue}
 
 
-def _build_dialer_csv(contacts: list[dict[str, Any]]) -> str:
+def _build_dialer_csv(
+    contacts: list[dict[str, Any]],
+    excluded_digits: set[str] | None = None,
+) -> str:
     """Aircall-Power-Dialer-ready CSV: column A = E.164 phone (with header), priority
     order preserved. Aircall reads only column A; the rest is context for Kevin.
     Non-E.164 numbers are dropped (Aircall rejects them); duplicates removed.
+
+    excluded_digits: NUMBER-level exclusion set (paused/removed/DNC phones as digit
+    strings incl. last-9 suffixes). Duplicate contacts share numbers, so a pause on
+    any contact must block the number itself (verified leak 07.07).
     """
     import csv as _csv
     import io as _io
     import re as _re
 
+    excluded_digits = excluded_digits or set()
     buf = _io.StringIO()
     writer = _csv.writer(buf)
     writer.writerow(["phone_number", "first_name", "last_name", "tier", "score", "interest"])
@@ -1175,6 +1184,9 @@ def _build_dialer_csv(contacts: list[dict[str, Any]]) -> str:
         # rejects malformed numbers; junk like "+41" / "+" / "+49" crashed the bulk
         # import (verified live 2026-06-24) — drop them here, not at Aircall.
         if not _re.fullmatch(r"\+\d{8,15}", phone) or phone in seen:
+            continue
+        d = phone.lstrip("+")
+        if d in excluded_digits or (len(d) >= 9 and d[-9:] in excluded_digits):
             continue
         seen.add(phone)
         writer.writerow([
@@ -1200,7 +1212,8 @@ async def dialer_export_csv(
     if not DIALER_EXPORT_KEY or key != DIALER_EXPORT_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing key")
     contacts = await get_prioritized_contacts(limit=min(max(limit, 1), 1000))
-    csv_text = _build_dialer_csv(contacts)
+    excluded_digits = await fetch_excluded_phone_digits()
+    csv_text = _build_dialer_csv(contacts, excluded_digits=excluded_digits)
     fname = f"power-dialer-{datetime.now(timezone.utc).date()}.csv"
     return Response(
         content=csv_text,
