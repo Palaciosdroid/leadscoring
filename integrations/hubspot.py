@@ -394,18 +394,41 @@ async def get_prioritized_contacts(
       3. Cold (lead_tier=3_cold) — not called in last 7d
     Only includes contacts with a phone number.
     Contacts never called are always included (no lead_last_call_date).
+
+    HARD EXCLUSIONS (verified leak 07.07): this feeds the /dialer/export.csv
+    Kevin actually dials from — it must honour the same lifecycle rules as the
+    queue. Leads that are paused (reached -> 90d), removed, phone-DNC, booked,
+    or not-interested are filtered out post-fetch (HubSpot filter groups can't
+    express 'missing OR expired' compactly).
     """
     if not ACCESS_TOKEN:
         return []
 
     import asyncio
 
-    now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+    now_dt = datetime.now(tz=timezone.utc)
+    now_ms = int(now_dt.timestamp() * 1000)
     props = [
         "firstname", "lastname", "email", "phone",
         "lead_tier", "lead_combined_score", "lead_interest_category",
         "lead_last_call_date", "lead_last_call_outcome",
+        "lead_pause_until", "lead_dialer_removed", "lead_phone_dnc",
+        "lead_call_booked", "lead_not_interested",
     ]
+
+    def _hard_excluded(c: dict) -> bool:
+        p = c.get("properties", {})
+        for flag in ("lead_dialer_removed", "lead_phone_dnc", "lead_call_booked", "lead_not_interested"):
+            if str(p.get(flag) or "").lower() in ("true", "1", "yes"):
+                return True
+        pause_raw = (p.get("lead_pause_until") or "").strip()
+        if pause_raw:
+            try:
+                if now_dt < datetime.fromisoformat(pause_raw.replace("Z", "+00:00")):
+                    return True
+            except (ValueError, AttributeError):
+                pass
+        return False
 
     async def _fetch_tier(tier: str, cooldown_ms: int) -> list[dict]:
         cutoff_ms = now_ms - cooldown_ms
@@ -444,9 +467,15 @@ async def get_prioritized_contacts(
             return []
 
         results = r.json().get("results", [])
-        for c in results:
+        kept = [c for c in results if not _hard_excluded(c)]
+        if len(kept) < len(results):
+            logger.info(
+                "get_prioritized_contacts tier=%s: filtered %d paused/removed/DNC/booked",
+                tier, len(results) - len(kept),
+            )
+        for c in kept:
             c["_tier"] = tier
-        return results
+        return kept
 
     h, w, c = await asyncio.gather(
         _fetch_tier("1_hot",  24 * 3_600_000),    # Hot:  24h cooldown
