@@ -251,9 +251,9 @@ async def lifespan(app: FastAPI):
     )
     scheduler.start()
     logger.info(
-        "Schedulers started — batch scoring every %dm, call polling every %dm (window=%dm), "
+        "Schedulers started — batch scoring cron 08/12/16 CET, call polling every %dm (window=%dm), "
         "decay check at 17:00 CET, daily summary at 18:00 CET, buyer journey Mon/Wed/Fri 10:00 CET",
-        BATCH_INTERVAL_MINUTES, CALL_POLL_INTERVAL_MINUTES, CALL_POLL_WINDOW_MINUTES,
+        CALL_POLL_INTERVAL_MINUTES, CALL_POLL_WINDOW_MINUTES,
     )
     yield
     scheduler.shutdown()

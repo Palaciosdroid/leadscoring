@@ -417,7 +417,8 @@ async def _push_to_dialer_campaign(
         json={"phone_numbers": [phone]},
     )
 
-    if response.status_code not in (200, 201):
+    # Aircall answers 200/201 or 204 (accepted, no body) — all are success.
+    if response.status_code not in (200, 201, 204):
         # 422 with "already imported" is OK — number already in campaign
         if response.status_code == 422 and "already imported" in response.text:
             logger.info("Aircall: %s already in dialer campaign — skipping", lead.get("email"))
