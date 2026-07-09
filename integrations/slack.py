@@ -238,6 +238,7 @@ class BatchRunStats:
     aircall_queued: int = 0           # leads queued for the Aircall push this run
     aircall_push_error_sample: str | None = None  # first push failure reason (e.g. 404)
     aircall_removed: int = 0          # hard-excluded leads pulled from the live dialer queue this run
+    aircall_window_skipped: int = 0   # queued leads not pushed because outside the 9-20 call window
     notes_written: int = 0
     # Post-batch verification: actual dialer count from Aircall API
     # -1 = not checked, 0+ = real count. Gap detected when pushed>0 but count==0.
@@ -253,7 +254,11 @@ class BatchRunStats:
 
 def _build_batch_report_message(stats: BatchRunStats) -> dict[str, Any]:
     """Build a Slack Block Kit message for the batch run health report."""
-    aircall_down = stats.aircall_queued > 0 and stats.aircall_pushed == 0
+    # "Down" only when leads were actually eligible for pushing. The 08:00
+    # batch runs before the 9-20 call window, so every queued lead is window-
+    # skipped by design — that must not fire a false AIRCALL DOWN alarm.
+    aircall_attempted = stats.aircall_queued - stats.aircall_window_skipped
+    aircall_down = aircall_attempted > 0 and stats.aircall_pushed == 0
     ok = (
         stats.fatal_error is None
         and stats.hs_chunk_errors == 0
@@ -277,7 +282,8 @@ def _build_batch_report_message(stats: BatchRunStats) -> dict[str, Any]:
     lines = [
         f"*Leads:* {stats.leads_fetched} fetched → {stats.leads_processed} processed",
         f"*HubSpot:* {stats.hs_updates_ok} updated",
-        f"*Aircall:* {stats.aircall_pushed} pushed, {stats.aircall_rejected} rejected, {stats.aircall_removed} removed → {dialer_str}",
+        f"*Aircall:* {stats.aircall_pushed} pushed, {stats.aircall_rejected} rejected, {stats.aircall_removed} removed → {dialer_str}"
+        + (f" ({stats.aircall_window_skipped} außerhalb Call-Window)" if stats.aircall_window_skipped else ""),
         f"*Skipped:* {stats.skipped_cold} cold, {stats.skipped_dnc} DNC",
         f"*Decays:* {stats.decay_count} Tier-Downgrades",
     ]

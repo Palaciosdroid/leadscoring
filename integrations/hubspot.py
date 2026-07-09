@@ -455,24 +455,43 @@ async def get_prioritized_contacts(
             "sorts": [{"propertyName": "lead_combined_score", "direction": "DESCENDING"}],
         }
 
+        # Paginate (M5): the search API caps a page at 100 — without paging the
+        # CSV never sees leads beyond the top 100/tier, and hard-excluded rows
+        # eat into that cap. Keep fetching until `limit` KEPT rows or exhausted.
+        kept: list[dict] = []
+        filtered_total = 0
+        after: str | None = None
+        max_pages = max(1, -(-limit // 100)) + 2  # ceil + slack for filtered pages
         async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.post(
-                f"{HUBSPOT_BASE}/crm/v3/objects/contacts/search",
-                headers=_headers(),
-                json=body,
-            )
+            for _ in range(max_pages):
+                if after:
+                    body["after"] = after
+                r = await client.post(
+                    f"{HUBSPOT_BASE}/crm/v3/objects/contacts/search",
+                    headers=_headers(),
+                    json=body,
+                )
+                if r.status_code != 200:
+                    logger.warning(
+                        "get_prioritized_contacts tier=%s failed: %s %s",
+                        tier, r.status_code, r.text,
+                    )
+                    break
+                data = r.json()
+                results = data.get("results", [])
+                page_kept = [c for c in results if not _hard_excluded(c)]
+                filtered_total += len(results) - len(page_kept)
+                kept.extend(page_kept)
+                after = data.get("paging", {}).get("next", {}).get("after")
+                if len(kept) >= limit or not after:
+                    break
 
-        if r.status_code != 200:
-            logger.warning("get_prioritized_contacts tier=%s failed: %s %s", tier, r.status_code, r.text)
-            return []
-
-        results = r.json().get("results", [])
-        kept = [c for c in results if not _hard_excluded(c)]
-        if len(kept) < len(results):
+        if filtered_total:
             logger.info(
                 "get_prioritized_contacts tier=%s: filtered %d paused/removed/DNC/booked",
-                tier, len(results) - len(kept),
+                tier, filtered_total,
             )
+        kept = kept[:limit]
         for c in kept:
             c["_tier"] = tier
         return kept

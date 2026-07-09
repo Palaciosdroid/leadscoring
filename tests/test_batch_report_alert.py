@@ -45,3 +45,25 @@ def test_empty_queue_no_false_alarm():
     stats = BatchRunStats(leads_fetched=100, aircall_queued=0, aircall_pushed=0)
     assert "AIRCALL DOWN" not in _body(stats)
     assert "✅" in _header(stats)
+
+
+def test_window_skipped_no_false_alarm():
+    # 08:00 batch: all queued leads skipped by the 9-20 call window -> NO alarm.
+    # Regression guard for the 08:00 false "AIRCALL DOWN" report (2026-06-30).
+    stats = BatchRunStats(
+        leads_fetched=100, aircall_queued=50, aircall_pushed=0,
+        aircall_window_skipped=50,
+    )
+    assert "AIRCALL DOWN" not in _body(stats)
+    assert "✅" in _header(stats)
+    assert "außerhalb Call-Window" in _body(stats)
+
+
+def test_partial_window_skip_still_alarms():
+    # Some leads WERE eligible (inside window) and none got pushed -> real failure.
+    stats = BatchRunStats(
+        leads_fetched=100, aircall_queued=50, aircall_pushed=0,
+        aircall_window_skipped=30,
+    )
+    assert "AIRCALL DOWN" in _body(stats)
+    assert "✅" not in _header(stats)

@@ -34,9 +34,18 @@ from batch.lifecycle import (
 
 logger = logging.getLogger(__name__)
 
-# In-memory dedup set — prevents duplicate processing of the same call
-# when the 10-min window overlaps two consecutive 5-min poll cycles.
-_processed_call_ids: set[str] = set()
+# In-memory dedup — prevents duplicate processing of the same call when the
+# 10-min window overlaps two consecutive 5-min poll cycles. Insertion-ordered
+# dict with eviction (H2): the process runs for weeks, an unbounded set leaks.
+# Only the last few poll windows matter for dedup, so 10k ids is generous.
+_PROCESSED_CALL_IDS_MAX = 10_000
+_processed_call_ids: dict[str, None] = {}
+
+
+def _mark_call_processed(call_id: str) -> None:
+    _processed_call_ids[call_id] = None
+    while len(_processed_call_ids) > _PROCESSED_CALL_IDS_MAX:
+        _processed_call_ids.pop(next(iter(_processed_call_ids)))
 
 
 _LIFECYCLE_PROPS = [
@@ -137,7 +146,7 @@ async def run_call_polling(since_minutes: int = 10) -> None:
 
     # Silently dedup Anschläge — they count in the EOD report but get no individual Slack card
     for c in anschlaege:
-        _processed_call_ids.add(c["call_id"])
+        _mark_call_processed(c["call_id"])
     if anschlaege:
         logger.info("call_poller: %d Anschlag/-schläge (no Slack): %s", len(anschlaege),
                     [HS_DISPOSITION_MAP.get(c.get("hs_call_disposition",""),"?") for c in anschlaege[:5]])
@@ -191,7 +200,7 @@ async def run_call_polling(since_minutes: int = 10) -> None:
         # No individual Slack card per call — meetings are summarised in the EOD report (18:00 CET)
 
         # Mark as processed AFTER successful handling
-        _processed_call_ids.add(call_id)
+        _mark_call_processed(call_id)
 
         logger.info(
             "call_poller processed call=%s contact=%s direction=%s outcome=%s duration=%ds",

@@ -1487,6 +1487,7 @@ async def run_batch_scoring() -> None:
             from integrations.aircall import add_to_power_dialer
             if item["phone"]:
                 if not is_within_call_window(region_for(item["phone"]), now_utc):
+                    _stats.aircall_window_skipped += 1
                     logger.debug(
                         "Batch: outside call window for %s — skip push this run",
                         item["email"],
