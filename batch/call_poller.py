@@ -83,6 +83,10 @@ async def record_call_outcome(
         update = state_to_props(new_state)
         update["lead_last_call_date"] = now.isoformat()
         update["lead_last_call_outcome"] = outcome
+        if outcome_class == "not_interested":
+            # Permanent opt-out from calling — honoured by dialer_gate, the DNC
+            # check and the CSV number filter. Set alongside removed=true.
+            update["lead_not_interested"] = "true"
         await update_contact_properties(contact_id, update)
         logger.info(
             "call_poller: lifecycle %s outcome=%s class=%s streak=%d cycles=%d removed=%s pause_until=%s",
@@ -131,11 +135,15 @@ async def run_call_polling(since_minutes: int = 10) -> None:
         logger.debug("call_poller: 0 new calls (all %d already processed)", len(calls))
         return
 
-    # Apply lifecycle state for EVERY new call (reached + no-answer + wrong number).
-    # This is the single writer of lead_last_call_* and lifecycle properties.
+    # Apply lifecycle state for EVERY new call (reached + no-answer + wrong number
+    # + not-interested). Single writer of lead_last_call_* and lifecycle props.
+    # Dynamic map so a UI-created disposition (e.g. "Nicht interessiert") resolves
+    # without a deploy; falls back to the static HS_DISPOSITION_MAP on error.
+    from integrations.hubspot import get_disposition_map
+    disposition_map = await get_disposition_map()
     now = datetime.now(timezone.utc)
     for c in new_calls:
-        outcome = HS_DISPOSITION_MAP.get(c.get("hs_call_disposition", ""), "Unknown")
+        outcome = disposition_map.get(c.get("hs_call_disposition", ""), "Unknown")
         await record_call_outcome(
             c.get("contact_id", ""), outcome, now, phone=c.get("contact_phone", "")
         )

@@ -85,3 +85,27 @@ async def test_third_no_answer_pauses_and_removes(mock_get, mock_update, mock_re
     written = mock_update.call_args[0][1]
     assert written["lead_pause_until"] != ""   # 60d pause triggered
     mock_remove.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@patch("batch.call_poller.remove_from_power_dialer", new_callable=AsyncMock, return_value=True)
+@patch("batch.call_poller.update_contact_properties", new_callable=AsyncMock, return_value=True)
+@patch("batch.call_poller.get_contact_properties", new_callable=AsyncMock, return_value=dict(EMPTY_STATE))
+async def test_not_interested_permanent_removal(mock_get, mock_update, mock_remove):
+    # 7th disposition (UI-created): permanent stop — removed flag + property + immediate pull.
+    await record_call_outcome("123", "Nicht interessiert", NOW, phone="+41791234567")
+    written = mock_update.call_args[0][1]
+    assert written["lead_dialer_removed"] == "true"
+    assert written["lead_not_interested"] == "true"
+    assert written["lead_last_call_outcome"] == "Nicht interessiert"
+    mock_remove.assert_awaited_once_with("+41791234567")
+
+
+@pytest.mark.asyncio
+@patch("batch.call_poller.remove_from_power_dialer", new_callable=AsyncMock, return_value=True)
+@patch("batch.call_poller.update_contact_properties", new_callable=AsyncMock, return_value=True)
+@patch("batch.call_poller.get_contact_properties", new_callable=AsyncMock, return_value=dict(EMPTY_STATE))
+async def test_reached_does_not_set_not_interested(mock_get, mock_update, mock_remove):
+    await record_call_outcome("123", "Kontakt aufgenommen", NOW, phone="+41791234567")
+    written = mock_update.call_args[0][1]
+    assert "lead_not_interested" not in written

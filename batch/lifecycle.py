@@ -24,12 +24,17 @@ MAX_NO_ANSWER_CYCLES = 2      # after this many no-answer pauses -> removed
 REACHED_OUTCOMES = frozenset({"Kontakt aufgenommen", "Live-Nachricht hinterlassen"})
 NO_ANSWER_OUTCOMES = frozenset({"Keine Antwort", "Besetzt", "Voicemail hinterlassen"})
 WRONG_NUMBER_OUTCOMES = frozenset({"Falsche Nummer"})
+# 7th disposition — created in the HubSpot UI (no create API, 405). Matched by
+# LABEL so the new GUID is picked up via the dynamic disposition map without a
+# deploy. Kevin selects it when a lead says "kein Interesse" -> permanent stop.
+NOT_INTERESTED_OUTCOMES = frozenset({"Nicht interessiert"})
 
 
 def classify_outcome(outcome: str) -> str | None:
     """Map a raw HubSpot disposition label to an outcome class.
 
-    Returns 'reached' | 'no_answer' | 'wrong_number' | None (unknown).
+    Returns 'reached' | 'no_answer' | 'wrong_number' | 'not_interested'
+    | None (unknown).
     """
     label = (outcome or "").strip()
     if label in REACHED_OUTCOMES:
@@ -38,6 +43,8 @@ def classify_outcome(outcome: str) -> str | None:
         return "no_answer"
     if label in WRONG_NUMBER_OUTCOMES:
         return "wrong_number"
+    if label in NOT_INTERESTED_OUTCOMES:
+        return "not_interested"
     return None
 
 
@@ -77,7 +84,7 @@ def apply_call_outcome(
             )
         return replace(state, no_answer_streak=streak)
 
-    if outcome_class == "wrong_number":
+    if outcome_class in ("wrong_number", "not_interested"):
         return replace(state, removed=True)
 
     # Unknown outcome -> unchanged

@@ -27,6 +27,39 @@ HS_DISPOSITION_MAP: dict[str, str] = {
     "17b47fee-58de-441e-a44c-c6300d46f273": "Falsche Nummer",
 }
 
+# Dynamic disposition map — GET /calling/v1/dispositions merged over the static
+# map above, cached 6h. Lets a NEW disposition created in the HubSpot UI (e.g.
+# "Nicht interessiert" — no create API, POST is 405) flow into outcome handling
+# without a code change: its GUID resolves to its label at runtime.
+_DISPOSITION_CACHE: dict[str, str] = {}
+_DISPOSITION_CACHE_AT: float = 0.0
+_DISPOSITION_CACHE_TTL = 6 * 3600.0
+
+
+async def get_disposition_map(*, timeout: float = 15.0) -> dict[str, str]:
+    """Return GUID -> label for all call dispositions (static + live, cached)."""
+    global _DISPOSITION_CACHE, _DISPOSITION_CACHE_AT
+    import time as _time
+
+    if _DISPOSITION_CACHE and _time.monotonic() - _DISPOSITION_CACHE_AT < _DISPOSITION_CACHE_TTL:
+        return _DISPOSITION_CACHE
+    merged = dict(HS_DISPOSITION_MAP)
+    if ACCESS_TOKEN:
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                r = await client.get(
+                    f"{HUBSPOT_BASE}/calling/v1/dispositions", headers=_headers(),
+                )
+            if r.status_code == 200:
+                for d in r.json():
+                    if d.get("id") and d.get("label") and not d.get("deleted"):
+                        merged[d["id"]] = d["label"]
+        except httpx.HTTPError as exc:
+            logger.warning("get_disposition_map: live fetch failed (%s) — static fallback", exc)
+    _DISPOSITION_CACHE = merged
+    _DISPOSITION_CACHE_AT = _time.monotonic()
+    return merged
+
 # Dispositions where a human actually picked up — these count as "Meetings".
 # Everything else (Keine Antwort, Voicemail, Besetzt, Falsche Nummer) = Anschlag.
 CONNECTED_DISPOSITIONS: frozenset[str] = frozenset({

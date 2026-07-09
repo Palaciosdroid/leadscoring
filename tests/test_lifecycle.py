@@ -99,3 +99,16 @@ def test_state_from_props_handles_missing_and_blank():
     assert back.no_answer_cycles == 0
     assert back.pause_until is None
     assert back.removed is False
+
+
+def test_classify_not_interested():
+    from batch.lifecycle import classify_outcome
+    assert classify_outcome("Nicht interessiert") == "not_interested"
+
+
+def test_not_interested_removes_permanently():
+    from datetime import datetime, timezone
+    from batch.lifecycle import LifecycleState, apply_call_outcome
+    now = datetime(2026, 7, 9, tzinfo=timezone.utc)
+    state = apply_call_outcome(LifecycleState(), "not_interested", now)
+    assert state.removed is True

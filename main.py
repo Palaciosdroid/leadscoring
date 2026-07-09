@@ -1082,7 +1082,11 @@ async def hubspot_call_webhook(
             # Prefer hs_timestamp (call start) over hs_createdate (record created)
             ts_raw_ms = live_call.get("hs_timestamp") or live_call.get("hs_createdate") or ts_raw_ms
 
-    outcome      = HS_DISPOSITION_MAP.get(disposition, disposition or "Unknown")
+    # Dynamic map: resolves UI-created dispositions (e.g. "Nicht interessiert")
+    # by GUID without a deploy; static HS_DISPOSITION_MAP is the fallback.
+    from integrations.hubspot import get_disposition_map
+    _disp_map    = await get_disposition_map()
+    outcome      = _disp_map.get(disposition, disposition or "Unknown")
     duration_sec = (duration_ms or 0) // 1000
 
     # Parse timestamp
