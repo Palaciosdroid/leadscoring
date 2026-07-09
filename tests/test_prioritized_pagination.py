@@ -123,6 +123,48 @@ def test_excluded_still_filtered_across_pages():
     assert [c for c in contacts if c["_tier"] == "1_hot"] == []
 
 
+# ------------------------------------------------- number-level exclusion
+
+class _FakeExclClient(_FakeClient):
+    """Single page sequence regardless of filter shape."""
+
+    def __init__(self, pages):
+        self._seq = pages
+        self.calls = 0
+
+    async def post(self, url, headers=None, json=None):
+        results, next_after = self._seq[min(self.calls, len(self._seq) - 1)]
+        self.calls += 1
+        payload = {"results": results}
+        if next_after:
+            payload["paging"] = {"next": {"after": next_after}}
+        return _FakeResp(payload)
+
+
+def test_excluded_digits_include_mobilephone():
+    # Verified leak 09.07: paused contact carries the number ONLY in
+    # `mobilephone` -> a duplicate contact with the same number in `phone`
+    # re-entered the CSV. The digit set must cover BOTH fields.
+    rows = [
+        {"id": "1", "properties": {
+            "mobilephone": "+41 79 555 55 77",
+            "lead_pause_until": "2099-01-01T00:00:00Z",
+        }},
+        {"id": "2", "properties": {
+            "phone": "+491511000092",
+            "lead_pause_until": "2020-01-01T00:00:00Z",  # expired -> NOT excluded
+        }},
+    ]
+    client = _FakeExclClient([(rows, None)])
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(hs, "ACCESS_TOKEN", "test-token")
+        mp.setattr(hs.httpx, "AsyncClient", client)
+        digits = asyncio.run(hs.fetch_excluded_phone_digits())
+    assert "41795555577" in digits          # mobilephone captured
+    assert "795555577" in digits            # last-9 suffix too
+    assert "491511000092" not in digits     # expired pause stays callable
+
+
 # ---------------------------------------------------------------- H2 tests
 
 def test_processed_call_ids_bounded():

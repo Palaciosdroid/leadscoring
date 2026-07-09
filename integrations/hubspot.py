@@ -525,20 +525,21 @@ async def fetch_excluded_phone_digits(*, timeout: float = 30.0) -> set[str]:
 
     now = datetime.now(tz=timezone.utc)
     digits: set[str] = set()
+    # No phone HAS_PROPERTY pre-filter: the excluded contact may carry the
+    # number in `mobilephone` only (verified leak 09.07 — 2 paused contacts'
+    # numbers re-entered the CSV via a duplicate whose `phone` field matched).
+    # Both fields are read client-side below.
     filter_groups = [
-        [{"propertyName": "lead_pause_until", "operator": "HAS_PROPERTY"},
-         {"propertyName": "phone", "operator": "HAS_PROPERTY"}],
-        [{"propertyName": "lead_dialer_removed", "operator": "EQ", "value": "true"},
-         {"propertyName": "phone", "operator": "HAS_PROPERTY"}],
-        [{"propertyName": "lead_phone_dnc", "operator": "EQ", "value": "true"},
-         {"propertyName": "phone", "operator": "HAS_PROPERTY"}],
+        [{"propertyName": "lead_pause_until", "operator": "HAS_PROPERTY"}],
+        [{"propertyName": "lead_dialer_removed", "operator": "EQ", "value": "true"}],
+        [{"propertyName": "lead_phone_dnc", "operator": "EQ", "value": "true"}],
     ]
     async with httpx.AsyncClient(timeout=timeout) as client:
         after: str | None = None
         while True:
             body: dict[str, Any] = {
                 "filterGroups": [{"filters": f} for f in filter_groups],
-                "properties": ["phone", "lead_pause_until", "lead_dialer_removed", "lead_phone_dnc"],
+                "properties": ["phone", "mobilephone", "lead_pause_until", "lead_dialer_removed", "lead_phone_dnc"],
                 "limit": 100,
             }
             if after:
@@ -564,11 +565,12 @@ async def fetch_excluded_phone_digits(*, timeout: float = 30.0) -> set[str]:
                         except (ValueError, AttributeError):
                             pass
                 if excluded:
-                    d = _re.sub(r"\D", "", p.get("phone") or "")
-                    if d:
-                        digits.add(d)
-                        if len(d) >= 9:
-                            digits.add(d[-9:])
+                    for field in ("phone", "mobilephone"):
+                        d = _re.sub(r"\D", "", p.get(field) or "")
+                        if d:
+                            digits.add(d)
+                            if len(d) >= 9:
+                                digits.add(d[-9:])
             after = j.get("paging", {}).get("next", {}).get("after")
             if not after:
                 break
