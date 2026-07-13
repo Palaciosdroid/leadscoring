@@ -81,3 +81,59 @@ def test_csv_without_exclusions_unchanged():
                                 "lead_tier": "1_hot", "lead_combined_score": "90",
                                 "lead_interest_category": "hypnose"}}]
     assert "+41791234567" in _build_dialer_csv(contacts)
+
+
+# --- get_prioritized_contacts pagination + score-sort (audit fix 09.07) ------
+
+import pytest
+from unittest.mock import patch, AsyncMock, MagicMock
+
+
+def _mk_response(results, after=None):
+    r = MagicMock()
+    r.status_code = 200
+    paging = {"next": {"after": after}} if after else {}
+    r.json = MagicMock(return_value={"results": results, "paging": paging})
+    return r
+
+
+@pytest.mark.asyncio
+async def test_get_prioritized_paginates_full_pool_and_sorts_by_score():
+    """Cursor must page past 100/tier (the audit bug) and output must be
+    score-DESC despite being fetched in hs_object_id order; paused rows drop."""
+    import integrations.hubspot as hs
+
+    # Two pages for the FIRST tier fetched, empty for the others.
+    page1 = [{"id": str(i), "properties": {"phone": f"+4179000{i:04d}",
+              "lead_combined_score": str(i % 50), "lead_tier": "1_hot"}} for i in range(100)]
+    # include a paused contact that must be filtered out
+    page1.append({"id": "999", "properties": {"phone": "+41790009999",
+                  "lead_combined_score": "99", "lead_tier": "1_hot",
+                  "lead_pause_until": "2099-01-01T00:00:00+00:00"}})
+    page2 = [{"id": str(i), "properties": {"phone": f"+4179111{i:04d}",
+              "lead_combined_score": str(i), "lead_tier": "1_hot"}} for i in range(100, 140)]
+
+    calls = {"n": 0}
+    async def fake_post(url, headers=None, json=None):
+        # only the hot tier gets 2 pages; warm/cold return empty immediately
+        is_hot = any(f.get("value") == "1_hot" for g in json["filterGroups"] for f in g["filters"])
+        if not is_hot:
+            return _mk_response([])
+        if "after" not in json:
+            return _mk_response(page1, after="CURSOR")
+        return _mk_response(page2)
+
+    client = MagicMock()
+    client.post = AsyncMock(side_effect=fake_post)
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch.object(hs, "ACCESS_TOKEN", "tok"), \
+         patch.object(hs.httpx, "AsyncClient", return_value=client):
+        out = await hs.get_prioritized_contacts(limit=1000)
+
+    # page1(100)+page2(40) non-paused kept; the 1 paused row filtered (proves paging past page 1)
+    assert len(out) == 140
+    scores = [float(c["properties"]["lead_combined_score"]) for c in out]
+    assert scores == sorted(scores, reverse=True)      # score-DESC restored
+    assert all("2099" not in (c["properties"].get("lead_pause_until") or "") for c in out)  # paused dropped

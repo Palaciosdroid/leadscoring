@@ -463,6 +463,12 @@ async def get_prioritized_contacts(
                 pass
         return False
 
+    def _score(c: dict) -> float:
+        try:
+            return float(c.get("properties", {}).get("lead_combined_score") or 0)
+        except (ValueError, TypeError):
+            return 0.0
+
     async def _fetch_tier(tier: str, cooldown_ms: int) -> list[dict]:
         cutoff_ms = now_ms - cooldown_ms
         body = {
@@ -484,19 +490,22 @@ async def get_prioritized_contacts(
                 },
             ],
             "properties": props,
-            "limit": min(limit, 100),
-            "sorts": [{"propertyName": "lead_combined_score", "direction": "DESCENDING"}],
+            "limit": 100,
+            # Paginate by a STABLE UNIQUE key. HubSpot's `after` cursor terminates
+            # early when sorted by a low-cardinality property — lead_combined_score
+            # has huge ties (most cold leads score ~0), which silently capped the
+            # CSV at ~1 page/tier (audit 09.07: 223 rows vs ~2200 callable, cold
+            # 40 of 991 never-called). hs_object_id gives reliable full-pool
+            # pagination; we re-sort by score in Python below.
+            "sorts": [{"propertyName": "hs_object_id", "direction": "ASCENDING"}],
         }
 
-        # Paginate (M5): the search API caps a page at 100 — without paging the
-        # CSV never sees leads beyond the top 100/tier, and hard-excluded rows
-        # eat into that cap. Keep fetching until `limit` KEPT rows or exhausted.
         kept: list[dict] = []
         filtered_total = 0
         after: str | None = None
-        max_pages = max(1, -(-limit // 100)) + 2  # ceil + slack for filtered pages
+        MAX_PAGES = 60  # safety: 6000 contacts/tier
         async with httpx.AsyncClient(timeout=timeout) as client:
-            for _ in range(max_pages):
+            for _ in range(MAX_PAGES):
                 if after:
                     body["after"] = after
                 r = await client.post(
@@ -516,7 +525,7 @@ async def get_prioritized_contacts(
                 filtered_total += len(results) - len(page_kept)
                 kept.extend(page_kept)
                 after = data.get("paging", {}).get("next", {}).get("after")
-                if len(kept) >= limit or not after:
+                if not after:
                     break
 
         if filtered_total:
@@ -524,6 +533,8 @@ async def get_prioritized_contacts(
                 "get_prioritized_contacts tier=%s: filtered %d paused/removed/DNC/booked",
                 tier, filtered_total,
             )
+        # Restore priority order within the tier (score DESC), then cap.
+        kept.sort(key=_score, reverse=True)
         kept = kept[:limit]
         for c in kept:
             c["_tier"] = tier

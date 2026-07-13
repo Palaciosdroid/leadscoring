@@ -85,18 +85,21 @@ def test_paginates_beyond_first_page():
     assert client.calls_by_tier["1_hot"] == 2
 
 
-def test_stops_at_limit_and_truncates():
-    # Endless pages of 100 clean rows -> must stop once `limit` kept.
+def test_fetches_full_pool_then_truncates_to_limit():
+    # Full-pool fetch (audit fix 09.07): we now sort by hs_object_id for reliable
+    # pagination, so top-N-BY-SCORE requires reading the WHOLE eligible pool
+    # before truncating. It must NOT early-break at `limit` (that would return an
+    # arbitrary id-ordered slice, not the highest-scoring leads).
     page = [_contact(i, "2_warm") for i in range(100)]
     client = _FakeClient({
         "1_hot":  [([], None)],
-        "2_warm": [(page, "more"), (page, "more"), (page, "more"), (page, "more")],
+        "2_warm": [(page, "p2"), (page, "p3"), (page, None)],  # 300 fetched, 3 calls
         "3_cold": [([], None)],
     })
     contacts = _run(client, limit=150)
     warm = [c for c in contacts if c["_tier"] == "2_warm"]
-    assert len(warm) == 150
-    assert client.calls_by_tier["2_warm"] == 2  # 100 + 100 -> truncated to 150
+    assert len(warm) == 150                      # truncated to limit AFTER full fetch
+    assert client.calls_by_tier["2_warm"] == 3   # read all 3 pages, no early break
 
 
 def test_no_paging_key_single_call():
