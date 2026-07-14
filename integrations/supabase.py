@@ -440,6 +440,81 @@ async def fetch_events_for_emails(
     return {e: d["events"] for e, d in data.items()}
 
 
+async def fetch_recently_active_emails(
+    days: int = 14,
+    *,
+    max_pages: int = 120,
+    page_size: int = 1000,
+) -> set[str]:
+    """
+    Emails of contacts with ANY tracked browser event in the last `days`.
+
+    Feeds the batch scorer so recently-ACTIVE-but-unscored contacts get a
+    first score. The batch's own input (`_fetch_active_hubspot_leads`) filters
+    on `lead_tier HAS_PROPERTY` — self-selecting, so freshly engaged leads
+    (e.g. offer-page visitors) never enter it. This closes that coverage gap.
+
+    Read-only. events.visitor_id -> contacts.email (both chunked / paginated).
+    Uses the params-dict path (httpx URL-encodes the `+00:00` cutoff safely —
+    do NOT hand-build the query string, that triggers PostgREST error 22007).
+
+    Returns a set of lowercased emails.
+    """
+    client = get_supabase_client()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+    # Step 1: distinct active visitor_ids from events in the window
+    visitors: set[str] = set()
+    offset = 0
+    for page in range(max_pages):
+        rows = await client._get("events", {
+            "select": "visitor_id",
+            "created_at": f"gte.{cutoff}",
+            "order": "created_at.desc",
+            "limit": str(page_size),
+            "offset": str(offset),
+        })
+        for ev in rows:
+            vid = ev.get("visitor_id")
+            if vid:
+                visitors.add(str(vid))
+        if len(rows) < page_size:
+            break
+        offset += page_size
+        if page == max_pages - 1:
+            logger.warning(
+                "fetch_recently_active_emails: hit max_pages=%d — active set may be truncated",
+                max_pages,
+            )
+
+    if not visitors:
+        logger.info("fetch_recently_active_emails: 0 active visitors in last %dd", days)
+        return set()
+
+    # Step 2: resolve visitor_id -> email (chunked IN)
+    emails: set[str] = set()
+    vids = list(visitors)
+    for i in range(0, len(vids), _CHUNK_SIZE_UUID):
+        chunk = vids[i:i + _CHUNK_SIZE_UUID]
+        ids_csv = ",".join(str(v) for v in chunk)
+        contacts = await client._get("contacts", {
+            "select": "email",
+            "visitor_id": f"in.({ids_csv})",
+        })
+        for c in contacts:
+            em = (c.get("email") or "").strip().lower()
+            if em:
+                emails.add(em)
+        if i + _CHUNK_SIZE_UUID < len(vids):
+            await asyncio.sleep(0.05)
+
+    logger.info(
+        "fetch_recently_active_emails: %d active visitors -> %d emails (last %dd)",
+        len(visitors), len(emails), days,
+    )
+    return emails
+
+
 async def fetch_purchases_for_emails(
     emails: list[str],
 ) -> dict[str, list[dict]]:

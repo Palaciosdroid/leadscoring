@@ -248,6 +248,8 @@ class BatchRunStats:
     phone_invalid: int = 0            # leads with an unfixable phone number this run
     scoring_errors: int = 0           # leads that threw during scoring (silently skipped — H4)
     decay_count: int = 0              # tier downgrades this run (summary only, no individual alerts)
+    active_unscored_added: int = 0    # recently-active unscored contacts merged into the batch (flag ON)
+    active_unscored_shadow: int = 0   # ...that WOULD be merged if SCORE_ACTIVE_UNSCORED were ON (flag OFF)
     duration_seconds: float = 0.0
     fatal_error: str | None = None    # set if batch crashed before completing
 
@@ -287,6 +289,12 @@ def _build_batch_report_message(stats: BatchRunStats) -> dict[str, Any]:
         f"*Skipped:* {stats.skipped_cold} cold, {stats.skipped_dnc} DNC",
         f"*Decays:* {stats.decay_count} Tier-Downgrades",
     ]
+
+    # Coverage-gap fix status (only shown when it has something to report)
+    if stats.active_unscored_added:
+        lines.append(f"*Coverage:* +{stats.active_unscored_added} aktive unscored Kontakte gescort")
+    elif stats.active_unscored_shadow:
+        lines.append(f"*Coverage (Shadow):* {stats.active_unscored_shadow} aktive unscored Kontakte — würden gescort (Flag aus)")
 
     # Total-failure alert: queue had leads but NONE were pushed (e.g. dialer
     # campaign 404). The gap alert below only fires when pushed>0, so without

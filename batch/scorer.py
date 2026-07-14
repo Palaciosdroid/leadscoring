@@ -23,6 +23,7 @@ from integrations.phone import validate_and_normalize, region_for
 from integrations.supabase import (
     fetch_touchpoints_for_emails,
     fetch_all_lead_data,
+    fetch_recently_active_emails,
 )
 from scoring.combined import ScoringResult, combine_scores
 from scoring.engagement import calculate_engagement_score
@@ -44,6 +45,29 @@ HUBSPOT_TOKEN = os.environ.get("HUBSPOT_ACCESS_TOKEN", "")
 
 # Only re-score leads updated in the last N days to keep API calls low
 RESCORE_WINDOW_DAYS = int(os.environ.get("RESCORE_WINDOW_DAYS", "14"))
+
+# Coverage-gap fix: also score contacts that are recently ACTIVE (Supabase event
+# in the last RESCORE_WINDOW_DAYS) but have no lead_tier yet — the batch's own
+# input is self-selecting on lead_tier, so freshly engaged leads never get a
+# first score otherwise. Default OFF = pure shadow (logs "would add N"), zero
+# behaviour change. Flip to "1"/"true" only after reviewing the shadow numbers.
+SCORE_ACTIVE_UNSCORED = os.environ.get(
+    "SCORE_ACTIVE_UNSCORED", ""
+).strip().lower() in ("1", "true", "yes", "on")
+
+# HubSpot contact properties needed for scoring — shared by both fetch paths
+# (active-leads scan + recently-active-by-email lookup).
+_LEAD_PROPERTIES: list[str] = [
+    "email", "firstname", "lastname", "phone", "mobilephone",
+    "lead_engagement_score", "lead_tier",
+    "lead_interest_category",   # stored funnel — fallback for dormant leads
+    "lead_last_call_date", "lead_last_call_outcome",
+    "lead_call_attempts", "lead_not_interested", "lead_call_booked",
+    "hs_email_open_count", "hs_email_click_count",
+    "lead_pause_until", "lead_no_answer_streak",
+    "lead_no_answer_cycles", "lead_dialer_removed",
+    "lead_phone_dnc", "lead_score_updated_at",
+]
 
 # Scoring mode: 'engagement' (default/rollback — live tier UNCHANGED, point-system
 # runs shadow-only into lead_points) | 'points' (flip — point-system drives the tier).
@@ -160,17 +184,7 @@ async def _fetch_active_hubspot_leads() -> list[dict[str, Any]]:
                 ]
             }
         ],
-        "properties": [
-            "email", "firstname", "lastname", "phone", "mobilephone",
-            "lead_engagement_score", "lead_tier",
-            "lead_interest_category",   # stored funnel — fallback for dormant leads
-            "lead_last_call_date", "lead_last_call_outcome",
-            "lead_call_attempts", "lead_not_interested", "lead_call_booked",
-            "hs_email_open_count", "hs_email_click_count",
-            "lead_pause_until", "lead_no_answer_streak",
-            "lead_no_answer_cycles", "lead_dialer_removed",
-            "lead_phone_dnc", "lead_score_updated_at",
-        ],
+        "properties": _LEAD_PROPERTIES,
         "limit": 100,
     }
 
@@ -209,6 +223,64 @@ async def _fetch_active_hubspot_leads() -> list[dict[str, Any]]:
                 break
             # Small delay between pages to avoid HubSpot 429
             await asyncio.sleep(0.5)
+
+    return results
+
+
+async def _fetch_hubspot_contacts_by_emails(
+    emails: list[str],
+) -> list[dict[str, Any]]:
+    """
+    Fetch HubSpot contacts for a specific set of emails (search IN, 100/chunk).
+
+    Used by the coverage-gap fix to pull recently-active contacts that the
+    lead_tier-filtered main scan misses. Returns the same shape as
+    `_fetch_active_hubspot_leads` (list of {id, properties}). Emails not in
+    HubSpot are simply absent from the result.
+    """
+    if not emails:
+        return []
+
+    headers = {
+        "Authorization": f"Bearer {HUBSPOT_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    results: list[dict[str, Any]] = []
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for i in range(0, len(emails), 100):
+            chunk = emails[i:i + 100]
+            payload: dict[str, Any] = {
+                "filterGroups": [
+                    {"filters": [
+                        {"propertyName": "email", "operator": "IN", "values": chunk}
+                    ]}
+                ],
+                "properties": _LEAD_PROPERTIES,
+                "limit": 100,
+            }
+            after: str | None = None
+            while True:
+                if after:
+                    payload["after"] = after
+                resp = None
+                for attempt in range(4):
+                    resp = await client.post(
+                        f"{HUBSPOT_BASE}/crm/v3/objects/contacts/search",
+                        headers=headers,
+                        json=payload,
+                    )
+                    if resp.status_code < 500:
+                        break
+                    await asyncio.sleep(2 ** attempt)
+                resp.raise_for_status()
+                data = resp.json()
+                results.extend(data.get("results", []))
+                after = data.get("paging", {}).get("next", {}).get("after")
+                if not after:
+                    break
+                await asyncio.sleep(0.2)
+            await asyncio.sleep(0.1)
 
     return results
 
@@ -848,6 +920,42 @@ async def run_batch_scoring() -> None:
         email = props.get("email", "")
         if email and contact.get("id"):
             email_lead_map[email] = contact
+
+    # Step 1b: Coverage-gap fix — pull recently-ACTIVE contacts the lead_tier
+    # scan misses. Shadow by default (logs "would add N", no behaviour change);
+    # only merges into the batch when SCORE_ACTIVE_UNSCORED is enabled.
+    # Wrapped so a Supabase/HubSpot hiccup here never breaks the core batch.
+    try:
+        active_emails = await fetch_recently_active_emails(days=RESCORE_WINDOW_DAYS)
+        existing_lc = {e.lower() for e in email_lead_map}
+        new_active = sorted(active_emails - existing_lc)
+        if new_active:
+            extra = await _fetch_hubspot_contacts_by_emails(new_active)
+            added = 0
+            for contact in extra:
+                props = contact.get("properties", {})
+                email = props.get("email", "")
+                if email and contact.get("id") and email not in email_lead_map:
+                    if SCORE_ACTIVE_UNSCORED:
+                        email_lead_map[email] = contact
+                    added += 1
+            if SCORE_ACTIVE_UNSCORED:
+                logger.info(
+                    "Coverage-gap: merged %d recently-active unscored contacts "
+                    "(%d active emails, %d not in HubSpot)",
+                    added, len(new_active), len(new_active) - len(extra),
+                )
+                _stats.active_unscored_added = added
+            else:
+                logger.info(
+                    "Coverage-gap SHADOW: would add %d recently-active unscored "
+                    "contacts (%d active emails not already in batch, %d not in "
+                    "HubSpot). Set SCORE_ACTIVE_UNSCORED=1 to enable.",
+                    added, len(new_active), len(new_active) - len(extra),
+                )
+                _stats.active_unscored_shadow = added
+    except Exception as exc:
+        logger.warning("Coverage-gap step failed (non-fatal): %s", exc)
 
     all_emails = list(email_lead_map.keys())
     if not all_emails:
