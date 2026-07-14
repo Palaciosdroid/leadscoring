@@ -25,6 +25,7 @@ from integrations.supabase import (
     fetch_all_lead_data,
     fetch_recently_active_emails,
 )
+from integrations.customerio import fetch_launchcall_registered_emails
 from scoring.combined import ScoringResult, combine_scores
 from scoring.engagement import calculate_engagement_score
 from scoring.hook_engine import generate_hook
@@ -713,6 +714,7 @@ def _assemble_point_signals(
     props: dict[str, Any],
     funnel: str | None,
     unsubscribed: bool,
+    launchcall_registered: bool = False,
 ) -> dict[str, Any]:
     """
     Build the `compute_points()` signal dict from W1-mapped behavior, the
@@ -747,6 +749,8 @@ def _assemble_point_signals(
         "email_engaged": sum(
             1 for e in scored_events if e.get("event_type") == "email_opened"
         ) >= 3,
+        # Declared sales-call intent (CIO launchcall-reminder segment)
+        "launchcall": launchcall_registered,
         # Interest category product-fit bonus
         "interest_category": funnel,
         # Hard disqualify
@@ -995,6 +999,15 @@ async def run_batch_scoring() -> None:
 
     now_utc = datetime.now(timezone.utc)
 
+    # Launchcall-registration intent (CIO segments, funnel-agnostic). Feeds the
+    # point-scorer a strong signal it was blind to. Non-fatal: on any failure we
+    # fall back to an empty set (no launchcall points) rather than break the run.
+    try:
+        launchcall_emails = await fetch_launchcall_registered_emails()
+    except Exception as exc:
+        logger.warning("Launchcall signal fetch failed (non-fatal): %s", exc)
+        launchcall_emails = set()
+
     for email, contact in email_lead_map.items():
         props = contact.get("properties", {})
         contact_id = contact["id"]
@@ -1123,6 +1136,7 @@ async def run_batch_scoring() -> None:
             # Phone is NEVER a point signal (leakage protection).
             point_signals = _assemble_point_signals(
                 scored_events, props, funnel, unsubscribed,
+                launchcall_registered=email.lower() in launchcall_emails,
             )
             points_result: PointsResult = compute_points(point_signals)
 

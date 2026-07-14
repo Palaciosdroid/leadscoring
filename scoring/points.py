@@ -16,6 +16,7 @@ Signals (all optional — a missing signal contributes 0, never crashes):
     form_submit       — bool (optin baseline, W1-mapped)
     email_click       — bool (any email link click — ADL fix 07.07)
     email_engaged     — bool (sustained opens >=3 without click)
+    launchcall        — bool (registered for a funnel's sales call — CIO segment)
     interest_category — str  ("hypnose" gets a small product-fit bonus)
     unsubscribed      — bool (hard disqualify)
 
@@ -61,6 +62,14 @@ HYPNOSE_CATEGORY_POINTS = 10  # product-fit bonus for hypnose interest
 # analytics/calibrate_points.py re-runs against Deal-Won.
 EMAIL_CLICK_POINTS = 10       # any email link click
 EMAIL_ENGAGED_POINTS = 5      # sustained opens (>=3) without a click
+
+# Launchcall registration (CIO segment intent) — added 14.07 after the
+# cross-funnel gap analysis: ~2,880 leads across 5 funnels registered for a
+# sales call yet the point model had no signal for it (declared sales intent
+# is comparable to a checkout-page visit). PROVISIONAL weight — mirrors
+# CHECKOUT_POINTS pending an analytics/calibrate_points.py re-run vs Deal-Won.
+# See project_sbc_launchcall_intent_gap.
+LAUNCHCALL_POINTS = 25
 
 # A SKIPPED Eignungscheck question is "unknown", NOT "low" — empirically it
 # converts near base-rate (missing-interest even higher). Give a neutral weight,
@@ -173,6 +182,11 @@ def compute_points(signals: dict) -> PointsResult:
     elif signals.get("email_engaged"):
         points += EMAIL_ENGAGED_POINTS
         reasons.append(f"Email-Engagement +{EMAIL_ENGAGED_POINTS}")
+
+    # --- Launchcall registration (declared sales-call intent) --------------
+    if signals.get("launchcall"):
+        points += LAUNCHCALL_POINTS
+        reasons.append(f"Launchcall registriert +{LAUNCHCALL_POINTS}")
 
     # --- Product-fit bonus -------------------------------------------------
     if signals.get("interest_category") == "hypnose":

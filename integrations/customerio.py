@@ -31,6 +31,18 @@ BUYER_SEGMENTS: dict[str, int] = {
     "lifecoach": 170,
 }
 
+# "Launchcall Reminder (aktuell)" segment per funnel = people currently
+# registered for the funnel's sales call. Highest pre-purchase intent signal,
+# funnel-agnostic. See project_sbc_launchcall_intent_gap: ~2,880 registered
+# non-buyers across funnels are invisible to the current point model.
+LAUNCHCALL_SEGMENTS: dict[str, int] = {
+    "al":              395,   # Ausbildung deines Lebens
+    "hypnose":         309,   # HC
+    "lifecoach":       362,   # GC / Gesprächscoach
+    "meditation":      296,   # MC
+    "bewusstseinsformel": 324,  # BF
+}
+
 # Cache: {segment_id: (timestamp, set_of_emails)}
 _segment_cache: dict[int, tuple[float, set[str]]] = {}
 _CACHE_TTL_SECONDS = 3600  # 1 hour
@@ -143,6 +155,30 @@ async def get_purchased_funnels(email: str) -> list[str]:
 
     logger.debug("CIO: %s purchased funnels: %s", email, purchased or "none")
     return purchased
+
+
+async def fetch_launchcall_registered_emails() -> set[str]:
+    """
+    Union of member emails across all funnels' "Launchcall Reminder" segments
+    = everyone currently registered for a sales call, any funnel.
+
+    Feeds the point-scorer with a strong, funnel-agnostic intent signal that
+    was previously invisible (the batch never read CIO segment intent). Reuses
+    the 1-hour segment cache. Read-only; a per-segment failure is skipped so a
+    single bad segment never blanks the whole signal.
+
+    Returns a set of lowercase emails.
+    """
+    emails: set[str] = set()
+    for funnel, segment_id in LAUNCHCALL_SEGMENTS.items():
+        try:
+            emails |= await _fetch_segment_members(segment_id)
+        except Exception as exc:  # noqa: BLE001 — one bad segment must not blank the rest
+            logger.warning(
+                "CIO launchcall segment %d (%s) failed: %s", segment_id, funnel, exc
+            )
+    logger.info("CIO launchcall-registered union: %d emails", len(emails))
+    return emails
 
 
 async def is_unsubscribed(cio_id: str) -> bool:

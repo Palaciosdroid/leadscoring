@@ -88,6 +88,13 @@ class TestAssemblePointSignals:
         sig = scorer._assemble_point_signals([], {}, None, True)
         assert sig["unsubscribed"] is True
 
+    def test_launchcall_flows_through(self):
+        sig = scorer._assemble_point_signals([], {}, None, False, launchcall_registered=True)
+        assert sig["launchcall"] is True
+        # default is off when not passed
+        sig2 = scorer._assemble_point_signals([], {}, None, False)
+        assert sig2["launchcall"] is False
+
 
 # ---------------------------------------------------------------------------
 # Full-batch harness — one lead, every external call mocked.
@@ -145,7 +152,11 @@ def _patch_batch(monkeypatch, captured):
     async def _send_report(stats):
         captured["stats"] = stats
 
+    async def _launchcall():
+        return set()
+
     monkeypatch.setattr(scorer, "_fetch_active_hubspot_leads", _fetch_active)
+    monkeypatch.setattr(scorer, "fetch_launchcall_registered_emails", _launchcall)
     monkeypatch.setattr(scorer, "fetch_touchpoints_for_emails", _fetch_touchpoints)
     monkeypatch.setattr(scorer, "fetch_all_lead_data", _fetch_all)
     monkeypatch.setattr(scorer, "_batch_update_hubspot_contacts", _batch_update)

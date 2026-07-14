@@ -8,11 +8,34 @@ from scoring.points import (
     FORM_SUBMIT_POINTS,
     HYPNOSE_CATEGORY_POINTS,
     INTEREST_POINTS,
+    LAUNCHCALL_POINTS,
     PRICE_POINTS,
     REPLAY_POINTS,
     VIDEO_COMPLETE_POINTS,
     compute_points,
 )
+
+
+def test_launchcall():
+    res = compute_points({"launchcall": True})
+    assert res.points == LAUNCHCALL_POINTS
+    assert any("Launchcall" in r for r in res.reasons)
+    assert compute_points({"launchcall": False}).points == 0
+
+
+def test_launchcall_stacks_and_can_reach_hot():
+    # launchcall (25) + checkout (25) + strong interest (25) + budget (30) = 105 -> hot
+    res = compute_points({
+        "launchcall": True, "checkout": True,
+        "interest": "naechster_schritt", "budget": "4000_6000",
+    })
+    assert res.points == LAUNCHCALL_POINTS + CHECKOUT_POINTS + 25 + 30
+    assert res.tier == "1_hot"
+
+
+def test_launchcall_does_not_override_disqualify():
+    res = compute_points({"launchcall": True, "unsubscribed": True})
+    assert res.tier == DISQUALIFIED_TIER
 
 
 # ---------------------------------------------------------------------------
