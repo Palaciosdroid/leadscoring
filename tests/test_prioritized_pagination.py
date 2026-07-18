@@ -126,6 +126,67 @@ def test_excluded_still_filtered_across_pages():
     assert [c for c in contacts if c["_tier"] == "1_hot"] == []
 
 
+# ------------------------------------------------- 429 retry (audit 18.07)
+
+class _RetryResp:
+    def __init__(self, status, payload=None, headers=None):
+        self.status_code = status
+        self._payload = payload or {}
+        self.headers = headers or {}
+        self.text = ""
+
+    def json(self):
+        return self._payload
+
+
+class _ThrottleClient:
+    """429s the first `fail_n` warm-tier page calls, then serves the page.
+
+    Reproduces the audit-18.07 bug: 3 concurrent tier fetches breach HubSpot's
+    SECONDLY search limit; the old code broke on the 429 and silently truncated
+    Kevin's list (1010/454/344 rows on identical calls).
+    """
+
+    def __init__(self, page, fail_n=2):
+        self.page = page
+        self.fail_n = fail_n
+        self.warm_calls = 0
+
+    def __call__(self, *a, **kw):
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def post(self, url, headers=None, json=None):
+        tier = json["filterGroups"][0]["filters"][0]["value"]
+        if tier != "2_warm":
+            return _RetryResp(200, {"results": []})
+        self.warm_calls += 1
+        if self.warm_calls <= self.fail_n:
+            return _RetryResp(429, {"status": "error"}, headers={"Retry-After": "0"})
+        return _RetryResp(200, {"results": self.page})
+
+
+def test_retries_on_429_instead_of_truncating(monkeypatch):
+    async def _noop_sleep(*a, **k):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", _noop_sleep)
+    page = [_contact(i, "2_warm") for i in range(50)]
+    client = _ThrottleClient(page, fail_n=2)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(hs, "ACCESS_TOKEN", "test-token")
+        mp.setattr(hs.httpx, "AsyncClient", client)
+        contacts = asyncio.run(hs.get_prioritized_contacts(limit=200))
+    warm = [c for c in contacts if c["_tier"] == "2_warm"]
+    assert len(warm) == 50          # full page returned despite 2x 429
+    assert client.warm_calls == 3   # 2 throttled + 1 success — retried, not truncated
+
+
 # ------------------------------------------------- number-level exclusion
 
 class _FakeExclClient(_FakeClient):

@@ -441,6 +441,12 @@ async def get_prioritized_contacts(
 
     now_dt = datetime.now(tz=timezone.utc)
     now_ms = int(now_dt.timestamp() * 1000)
+    # Cap concurrent HubSpot search calls across the 3 tier fetches. They run via
+    # asyncio.gather and each paginates many pages; unbounded, they breach HubSpot's
+    # SECONDLY search limit -> 429 -> silent truncation (audit 18.07: 1010/454/344
+    # rows on identical calls). The per-page retry below is the correctness net;
+    # this semaphore just keeps the burst down so retries stay rare.
+    sem = asyncio.Semaphore(2)
     props = [
         "firstname", "lastname", "email", "phone",
         "lead_tier", "lead_combined_score", "lead_interest_category",
@@ -508,15 +514,33 @@ async def get_prioritized_contacts(
             for _ in range(MAX_PAGES):
                 if after:
                     body["after"] = after
-                r = await client.post(
-                    f"{HUBSPOT_BASE}/crm/v3/objects/contacts/search",
-                    headers=_headers(),
-                    json=body,
-                )
-                if r.status_code != 200:
-                    logger.warning(
-                        "get_prioritized_contacts tier=%s failed: %s %s",
-                        tier, r.status_code, r.text,
+                # Retry throttled/transient pages — a 429 mid-pagination must NOT
+                # silently truncate Kevin's list. Only a hard non-retryable error
+                # (or exhausted retries) breaks the loop.
+                r = None
+                for attempt in range(8):
+                    async with sem:
+                        r = await client.post(
+                            f"{HUBSPOT_BASE}/crm/v3/objects/contacts/search",
+                            headers=_headers(),
+                            json=body,
+                        )
+                    if r.status_code == 200:
+                        break
+                    if r.status_code in (429, 502, 503, 504):
+                        wait = float(r.headers.get("Retry-After", 0) or 0) or min(2 ** attempt * 0.5, 10)
+                        logger.warning(
+                            "get_prioritized_contacts tier=%s: %s throttled — retry %d in %.1fs",
+                            tier, r.status_code, attempt + 1, wait,
+                        )
+                        await asyncio.sleep(wait)
+                        continue
+                    break  # non-retryable (4xx other than 429)
+                if r is None or r.status_code != 200:
+                    logger.error(
+                        "get_prioritized_contacts tier=%s: page fetch failed after retries "
+                        "(%s) — list may be truncated",
+                        tier, getattr(r, "status_code", "?"),
                     )
                     break
                 data = r.json()

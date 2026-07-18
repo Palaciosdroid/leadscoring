@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 # enough to hold contacts per bucket, fine enough to locate a tier threshold.
 # Disqualified contacts (interest=keines / unsubscribed) are reported in their
 # own row — they are excluded from threshold/concentration math by definition.
-BUCKET_EDGES: tuple[int, ...] = (0, 10, 25, 35, 50, 65, 80)
+BUCKET_EDGES: tuple[int, ...] = (0, 10, 25, 35, 40, 45, 50, 60, 65, 80)
 
 # A bucket needs at least this many contacts before its close-rate is trusted
 # for a threshold recommendation (small buckets are noise).
