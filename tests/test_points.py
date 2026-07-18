@@ -147,17 +147,25 @@ def test_tier_cold_zero():
     assert compute_points({}).tier == "3_cold"
 
 
-def test_tier_warm_at_35():
-    # naechster_schritt 25 + form_submit 10 = 35 -> Warm (>= boundary).
-    # (Was Cold under the old 50 warm floor; the 15.07 re-calibration showed the
-    # 35-49 band closes at 3.40% — inside the 4% cumulative warm target.)
+def test_tier_cold_at_35():
+    # naechster_schritt 25 + form_submit 10 = 35 -> Cold now. The 18.07 fine-bucket
+    # calibration showed the 35-39 band closes at only 1.16% (near base), so the
+    # warm floor moved up to 40 to keep the band out of Kevin's warm priority.
     res = compute_points({"interest": "naechster_schritt", "form_submit": True})
     assert res.points == 35
+    assert res.tier == "3_cold"
+
+
+def test_tier_warm_at_40():
+    # budget 4000_6000 30 + form_submit 10 = 40 -> Warm (>= boundary). The 40-44
+    # band closes at 8.07% — the strongest sub-hot signal.
+    res = compute_points({"budget": "4000_6000", "form_submit": True})
+    assert res.points == 40
     assert res.tier == "2_warm"
 
 
 def test_tier_cold_just_below_warm():
-    # 30 points (budget 2000_4000 15 + form_submit 10 + ... ) stays Cold below 35.
+    # 25 points (budget 2000_4000 15 + form_submit 10) stays Cold below 40.
     assert compute_points({"budget": "2000_4000", "form_submit": True}).points == 25
     assert compute_points({"budget": "2000_4000", "form_submit": True}).tier == "3_cold"
 
