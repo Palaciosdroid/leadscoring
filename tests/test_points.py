@@ -136,10 +136,10 @@ def test_unsubscribed_disqualifies():
 
 
 # ---------------------------------------------------------------------------
-# Tier boundaries (re-calibrated 07.07: Hot >= 80, Warm >= 50, else Cold)
+# Tier boundaries (re-calibrated 15.07 WITH launchcall: Hot >= 65, Warm >= 35, else Cold)
 # ---------------------------------------------------------------------------
 def test_tier_cold_below_warm():
-    # 15 points -> Cold.
+    # 15 points -> Cold (below the 35 warm floor).
     assert compute_points({"budget": "2000_4000"}).tier == "3_cold"
 
 
@@ -147,15 +147,23 @@ def test_tier_cold_zero():
     assert compute_points({}).tier == "3_cold"
 
 
-def test_tier_mid_scores_are_cold_now():
-    # 35 and 55 were Warm/Hot under the old 50/35 thresholds — calibration
-    # showed those bands close at only 1.2-3.3%, below the 4% warm target.
-    assert compute_points({"interest": "naechster_schritt", "form_submit": True}).points == 35
-    assert compute_points({"interest": "naechster_schritt", "form_submit": True}).tier == "3_cold"
+def test_tier_warm_at_35():
+    # naechster_schritt 25 + form_submit 10 = 35 -> Warm (>= boundary).
+    # (Was Cold under the old 50 warm floor; the 15.07 re-calibration showed the
+    # 35-49 band closes at 3.40% — inside the 4% cumulative warm target.)
+    res = compute_points({"interest": "naechster_schritt", "form_submit": True})
+    assert res.points == 35
+    assert res.tier == "2_warm"
+
+
+def test_tier_cold_just_below_warm():
+    # 30 points (budget 2000_4000 15 + form_submit 10 + ... ) stays Cold below 35.
+    assert compute_points({"budget": "2000_4000", "form_submit": True}).points == 25
+    assert compute_points({"budget": "2000_4000", "form_submit": True}).tier == "3_cold"
 
 
 def test_tier_warm_at_50():
-    # checkout 25 + naechster_schritt 25 = 50 -> Warm (>= boundary).
+    # checkout 25 + naechster_schritt 25 = 50 -> Warm.
     res = compute_points({"checkout": True, "interest": "naechster_schritt"})
     assert res.points == 50
     assert res.tier == "2_warm"

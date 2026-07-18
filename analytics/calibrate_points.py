@@ -87,6 +87,7 @@ def assemble_signals(
     browser_events: list[dict],
     props: dict,
     unsubscribed: bool,
+    launchcall_registered: bool = False,
 ) -> dict:
     """
     Build the `compute_points` signal dict for one contact, identically to the
@@ -102,7 +103,10 @@ def assemble_signals(
     interest = detect_interest_category(scored_events)
     funnel = interest.get("category")
 
-    return _assemble_point_signals(scored_events, props, funnel, unsubscribed)
+    return _assemble_point_signals(
+        scored_events, props, funnel, unsubscribed,
+        launchcall_registered=launchcall_registered,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +143,21 @@ class CalibrationReport:
     # Concentration of real closes in the recommended Hot+Warm band.
     hotwarm_closes: int = 0
     hotwarm_contacts: int = 0
+    # Launchcall-signal lift: close-rate of launchcall-registered vs the rest.
+    # Validates whether LAUNCHCALL_POINTS (+25) is data-justified.
+    launchcall_total: int = 0
+    launchcall_converted: int = 0
+    nolaunchcall_total: int = 0
+    nolaunchcall_converted: int = 0
     notes: list[str] = field(default_factory=list)
+
+    @property
+    def launchcall_rate(self) -> float:
+        return self.launchcall_converted / self.launchcall_total if self.launchcall_total else 0.0
+
+    @property
+    def nolaunchcall_rate(self) -> float:
+        return self.nolaunchcall_converted / self.nolaunchcall_total if self.nolaunchcall_total else 0.0
 
     @property
     def overall_rate(self) -> float:
@@ -220,6 +238,7 @@ def build_report(
     events_by_visitor: dict[str, list[dict]],
     won_set: set[str],
     completed_set: set[str],
+    launchcall_set: set[str] | None = None,
 ) -> CalibrationReport:
     """
     Assemble the calibration report from already-fetched data.
@@ -234,6 +253,7 @@ def build_report(
     Pure: no network. Fail-soft — empty inputs yield an empty-but-valid report.
     """
     report = CalibrationReport()
+    launchcall_set = launchcall_set or set()
 
     if not contacts:
         report.notes.append("No contacts available — bucket table empty.")
@@ -257,13 +277,27 @@ def build_report(
             (e.get("event_type") or "") == "email_unsubscribed" for e in browser_events
         )
 
-        signals = assemble_signals(touchpoints, browser_events, c, unsubscribed)
+        launchcall = bool(email) and str(email).lower() in launchcall_set
+        signals = assemble_signals(
+            touchpoints, browser_events, c, unsubscribed,
+            launchcall_registered=launchcall,
+        )
         result = compute_points(signals)
 
         converted = is_converted(cid, email, won_set, completed_set)
         report.contacts_total += 1
         if converted:
             report.contacts_converted += 1
+
+        # Launchcall-signal lift tracking (independent of tier/bucket).
+        if launchcall:
+            report.launchcall_total += 1
+            if converted:
+                report.launchcall_converted += 1
+        else:
+            report.nolaunchcall_total += 1
+            if converted:
+                report.nolaunchcall_converted += 1
 
         # Disqualified leads (interest=keines / unsubscribed) are not part of the
         # tierable population — bucket them separately so they don't skew the table.
@@ -315,6 +349,21 @@ def format_report(report: CalibrationReport) -> str:
         f"Disqualified (interest=keines / unsubscribed): {report.disqualified_total} "
         f"(converted {report.disqualified_converted})  |  tierable: {tierable}"
     )
+
+    # --- launchcall signal lift (validates LAUNCHCALL_POINTS +25) ---
+    lc_r = report.launchcall_rate * 100
+    nolc_r = report.nolaunchcall_rate * 100
+    lift = (lc_r / nolc_r) if nolc_r else 0.0
+    lines.append("\n" + "-" * 70)
+    lines.append("LAUNCHCALL-SIGNAL LIFT (registriert vs. nicht — rechtfertigt +25?)")
+    lines.append("-" * 70)
+    lines.append(
+        f"  registriert:  n={report.launchcall_total:6d}  conv={report.launchcall_converted:5d}  rate={lc_r:6.2f}%"
+    )
+    lines.append(
+        f"  nicht:        n={report.nolaunchcall_total:6d}  conv={report.nolaunchcall_converted:5d}  rate={nolc_r:6.2f}%"
+    )
+    lines.append(f"  → LIFT: {lift:.1f}×" if nolc_r else "  → LIFT: n/a (keine Basis)")
 
     # --- bucket close-rate table ---
     lines.append("\n" + "-" * 70)
@@ -538,8 +587,19 @@ async def run() -> CalibrationReport:
         events_by_visitor = {}
         notes.append(f"Event fetch failed ({exc}) — behavior signals reduced.")
 
+    # Launchcall-registered set (CIO segment intent) — best-effort, so the
+    # calibration can measure whether LAUNCHCALL_POINTS (+25) is data-justified.
+    try:
+        from integrations.customerio import fetch_launchcall_registered_emails
+        launchcall_set = await fetch_launchcall_registered_emails()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("calibrate: launchcall fetch failed: %s", exc)
+        launchcall_set = set()
+        notes.append(f"Launchcall fetch failed ({exc}) — signal-lift unavailable.")
+
     report = build_report(
         contacts, touchpoints_by_contact, events_by_visitor, won_set, completed_set,
+        launchcall_set=launchcall_set,
     )
     report.notes = notes + report.notes
     return report

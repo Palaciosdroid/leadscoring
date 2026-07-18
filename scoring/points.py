@@ -86,13 +86,14 @@ DISQUALIFIED_TIER = "4_disqualified"
 # tunes them against the real Deal-Won rate before the flag-flip.
 # ---------------------------------------------------------------------------
 TIERS: list[tuple[str, int]] = [
-    # Re-calibrated 07.07 (full base 54,335 contacts, canonical Deal-Won label,
-    # WITH Tally + email signals — see calibration_email_signals.txt):
-    #   80+  -> 10.04% close  |  65-79 -> 5.76%  |  50-64 -> 3.27%
-    # Cumulative-from-top: hot(>=8%) clears at 80, warm(>=4%) at 50. The old
-    # 50/35 thresholds were far too loose (35-49 bucket = 2.2% < warm target).
-    ("1_hot",  80),
-    ("2_warm", 50),
+    # Re-calibrated 15.07 (full base 55,301 contacts, canonical Deal-Won label,
+    # WITH the launchcall signal — 13.3x lift, see project_sbc_launchcall_intent_gap).
+    # Bucket close-rates: 80+ -> 13.32% | 65-79 -> 5.20% | 35-49 -> 3.40%.
+    # Cumulative-from-top clears hot(>=8%) at 65 and warm(>=4%) at 35. Adding
+    # launchcall lifted Hot+Warm closes-concentration 27% -> 60.6%, so the band
+    # widened from 80/50 (too strict, dropped the 65-79 + 35-49 closers).
+    ("1_hot",  65),
+    ("2_warm", 35),
     ("3_cold",  0),
 ]
 
