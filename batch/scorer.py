@@ -925,14 +925,27 @@ async def run_batch_scoring() -> None:
         if email and contact.get("id"):
             email_lead_map[email] = contact
 
-    # Step 1b: Coverage-gap fix — pull recently-ACTIVE contacts the lead_tier
-    # scan misses. Shadow by default (logs "would add N", no behaviour change);
-    # only merges into the batch when SCORE_ACTIVE_UNSCORED is enabled.
-    # Wrapped so a Supabase/HubSpot hiccup here never breaks the core batch.
+    # Launchcall-registration intent (CIO segments, funnel-agnostic). Fetched
+    # HERE (before the coverage merge) so registrants can be UNIONED into the
+    # scoring set, not just used as a signal for leads already in scope. Non-fatal.
+    try:
+        launchcall_emails = await fetch_launchcall_registered_emails()
+    except Exception as exc:
+        logger.warning("Launchcall signal fetch failed (non-fatal): %s", exc)
+        launchcall_emails = set()
+
+    # Step 1b: Coverage-gap fix — pull contacts the lead_tier scan misses:
+    #   (a) recently-ACTIVE (Supabase event in window), and
+    #   (b) LAUNCHCALL-registered (declared sales-call intent, 13.3x close-lift)
+    #       even without a recent browser event — the strongest signal was
+    #       otherwise dead for dormant registrants.
+    # Shadow by default (logs "would add N"); merges only when SCORE_ACTIVE_UNSCORED
+    # is on. Wrapped so a Supabase/HubSpot hiccup never breaks the core batch.
     try:
         active_emails = await fetch_recently_active_emails(days=RESCORE_WINDOW_DAYS)
         existing_lc = {e.lower() for e in email_lead_map}
-        new_active = sorted(active_emails - existing_lc)
+        candidate_emails = (active_emails | launchcall_emails) - existing_lc
+        new_active = sorted(candidate_emails)
         if new_active:
             extra = await _fetch_hubspot_contacts_by_emails(new_active)
             added = 0
@@ -943,19 +956,20 @@ async def run_batch_scoring() -> None:
                     if SCORE_ACTIVE_UNSCORED:
                         email_lead_map[email] = contact
                     added += 1
+            lc_only = len(launchcall_emails - active_emails - existing_lc)
             if SCORE_ACTIVE_UNSCORED:
                 logger.info(
-                    "Coverage-gap: merged %d recently-active unscored contacts "
-                    "(%d active emails, %d not in HubSpot)",
-                    added, len(new_active), len(new_active) - len(extra),
+                    "Coverage-gap: merged %d unscored contacts "
+                    "(%d candidates, %d launchcall-only, %d not in HubSpot)",
+                    added, len(new_active), lc_only, len(new_active) - len(extra),
                 )
                 _stats.active_unscored_added = added
             else:
                 logger.info(
-                    "Coverage-gap SHADOW: would add %d recently-active unscored "
-                    "contacts (%d active emails not already in batch, %d not in "
-                    "HubSpot). Set SCORE_ACTIVE_UNSCORED=1 to enable.",
-                    added, len(new_active), len(new_active) - len(extra),
+                    "Coverage-gap SHADOW: would add %d unscored contacts "
+                    "(%d candidates, %d launchcall-only, %d not in HubSpot). "
+                    "Set SCORE_ACTIVE_UNSCORED=1 to enable.",
+                    added, len(new_active), lc_only, len(new_active) - len(extra),
                 )
                 _stats.active_unscored_shadow = added
     except Exception as exc:
@@ -999,15 +1013,8 @@ async def run_batch_scoring() -> None:
 
     now_utc = datetime.now(timezone.utc)
 
-    # Launchcall-registration intent (CIO segments, funnel-agnostic). Feeds the
-    # point-scorer a strong signal it was blind to. Non-fatal: on any failure we
-    # fall back to an empty set (no launchcall points) rather than break the run.
-    try:
-        launchcall_emails = await fetch_launchcall_registered_emails()
-    except Exception as exc:
-        logger.warning("Launchcall signal fetch failed (non-fatal): %s", exc)
-        launchcall_emails = set()
-
+    # launchcall_emails was fetched above (Step 1b) and is reused here as the
+    # per-lead point signal — every registrant is now also IN email_lead_map.
     for email, contact in email_lead_map.items():
         props = contact.get("properties", {})
         contact_id = contact["id"]
