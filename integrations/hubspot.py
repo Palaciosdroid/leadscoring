@@ -453,6 +453,12 @@ async def get_prioritized_contacts(
         "lead_last_call_date", "lead_last_call_outcome",
         "lead_pause_until", "lead_dialer_removed", "lead_phone_dnc",
         "lead_call_booked", "lead_not_interested",
+        # PostHog intent sync (posthog-CC, contract 20.07): which product Kevin
+        # pitches. DISPLAY/ROUTING ONLY — never a score signal. The property does
+        # not exist in HubSpot yet; HubSpot's search silently ignores unknown
+        # property names (verified 20.07), so this stays inert until the sync
+        # creates and fills it.
+        "intent_funnel",
     ]
 
     def _hard_excluded(c: dict) -> bool:

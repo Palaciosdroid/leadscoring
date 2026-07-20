@@ -48,7 +48,25 @@ def test_dedup_by_normalized_phone():
 
 def test_empty_contacts_yields_header_only():
     csv = _build_dialer_csv([])
-    assert csv.strip() == "phone_number,first_name,last_name,tier,score,interest"
+    assert csv.strip() == "phone_number,first_name,last_name,tier,score,interest,intent_funnel"
+
+
+def test_intent_funnel_last_column_and_inert_when_missing():
+    # PostHog-sync contract (posthog-CC, 20.07): intent_funnel is display/routing
+    # only and MUST be the last column so Aircall's column-A phone contract and
+    # Kevin's existing column order stay untouched. Absent property -> empty cell,
+    # never a crash (the HubSpot property does not exist yet).
+    with_funnel = _build_dialer_csv(
+        [_c("+41791234567", intent_funnel="AL (Ausbildung deines Lebens)")]
+    ).strip().splitlines()
+    assert with_funnel[0].split(",")[0] == "phone_number"          # column A unchanged
+    assert with_funnel[0].endswith("intent_funnel")                # appended last
+    assert with_funnel[1].startswith("+41791234567,")
+    assert "AL (Ausbildung deines Lebens)" in with_funnel[1]
+
+    without = _build_dialer_csv([_c("+41791234567")]).strip().splitlines()
+    assert without[1].startswith("+41791234567,")
+    assert without[1].endswith(",")                                 # empty trailing cell
 
 
 def test_priority_input_order_preserved():

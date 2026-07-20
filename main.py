@@ -1179,7 +1179,13 @@ def _build_dialer_csv(
     excluded_digits = excluded_digits or set()
     buf = _io.StringIO()
     writer = _csv.writer(buf)
-    writer.writerow(["phone_number", "first_name", "last_name", "tier", "score", "interest"])
+    # intent_funnel appended LAST on purpose: Aircall imports column A only, and
+    # Kevin's existing column order must not shift. Empty until the PostHog sync
+    # (posthog-CC) creates + fills the property — display/routing only, no score.
+    writer.writerow([
+        "phone_number", "first_name", "last_name", "tier", "score", "interest",
+        "intent_funnel",
+    ])
     seen: set[str] = set()
     for contact in contacts:
         props = contact.get("properties", {}) or {}
@@ -1200,6 +1206,7 @@ def _build_dialer_csv(
             props.get("lead_tier", "") or "",
             props.get("lead_combined_score", "") or "",
             props.get("lead_interest_category", "") or "",
+            props.get("intent_funnel", "") or "",
         ])
     return buf.getvalue()
 
