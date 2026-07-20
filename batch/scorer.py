@@ -30,7 +30,7 @@ from scoring.combined import ScoringResult, combine_scores
 from scoring.engagement import calculate_engagement_score
 from scoring.hook_engine import generate_hook
 from scoring.interest import detect_interest_category
-from scoring.points import compute_points, PointsResult
+from scoring.points import compute_points, posthog_signals_enabled, PointsResult
 from scoring.touchpoint_mapper import (
     extract_first_last_touch,
     map_touchpoints_batch,
@@ -68,6 +68,13 @@ _LEAD_PROPERTIES: list[str] = [
     "lead_pause_until", "lead_no_answer_streak",
     "lead_no_answer_cycles", "lead_dialer_removed",
     "lead_phone_dnc", "lead_score_updated_at",
+    # PostHog intent signals (daily Railway sync since 20.07 — see
+    # INSTRUCTIONS-PostHog-Sync-2026-07-20.md). Fetching is unconditional
+    # (extra props change nothing); SCORING them is gated behind
+    # POSTHOG_SIGNAL_POINTS_ENABLED in _assemble_point_signals.
+    # intent_funnel is routing/display only (dialer CSV), never a score input.
+    "offer_dwell_minutes", "payment_page_visited",
+    "vsl_watched_percent", "intent_funnel",
 ]
 
 # Scoring mode: 'engagement' (default/rollback — live tier UNCHANGED, point-system
@@ -709,6 +716,70 @@ def _format_touch_summary(tp: dict | None) -> str:
 _REPLAY_EVENT_TYPES: frozenset[str] = frozenset({"video_watched_50", "video_watched_75"})
 
 
+def _parse_hubspot_number(raw: Any) -> float | None:
+    """HubSpot returns number props as strings; tolerate junk → None."""
+    if raw is None or raw == "":
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _payment_page_age_days(raw: Any, now: datetime | None = None) -> float | None:
+    """
+    Age in days of the payment_page_visited HubSpot DATE property.
+
+    Tolerates both wire formats (ISO date string "2026-07-20" and epoch-millis
+    string "1752969600000"). Unparseable / empty → None (signal absent).
+    """
+    if not raw:
+        return None
+    now = now or datetime.now(timezone.utc)
+    s = str(raw).strip()
+    dt: datetime | None = None
+    if s.isdigit():
+        try:
+            dt = datetime.fromtimestamp(int(s) / 1000.0, tz=timezone.utc)
+        except (ValueError, OverflowError, OSError):
+            return None
+    else:
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+    return max((now - dt).total_seconds() / 86400.0, 0.0)
+
+
+def _posthog_signal_extras(props: dict[str, Any]) -> dict[str, Any]:
+    """
+    Flag-gated PostHog intent-signal keys for the point-signal dict.
+
+    Flag OFF (default) → empty dict → the signal dict is byte-identical to
+    today's and compute_points behaves unchanged. Flag ON → adds the decayed/
+    parsed values; missing or junk props stay absent (0 points, never crash).
+
+    intent_funnel is deliberately NOT returned — routing/display only.
+    Decay note: only payment_page_visited carries a date; dwell/vsl decay is an
+    OPEN question (see scoring/points.py header) and is not applied here.
+    """
+    if not posthog_signals_enabled():
+        return {}
+    extras: dict[str, Any] = {}
+    age = _payment_page_age_days(props.get("payment_page_visited"))
+    if age is not None:
+        extras["payment_page_age_days"] = age
+    dwell = _parse_hubspot_number(props.get("offer_dwell_minutes"))
+    if dwell is not None:
+        extras["offer_dwell_minutes"] = dwell
+    vsl = _parse_hubspot_number(props.get("vsl_watched_percent"))
+    if vsl is not None:
+        extras["vsl_watched_percent"] = vsl
+    return extras
+
+
 def _assemble_point_signals(
     scored_events: list[dict],
     props: dict[str, Any],
@@ -755,6 +826,9 @@ def _assemble_point_signals(
         "interest_category": funnel,
         # Hard disqualify
         "unsubscribed": unsubscribed,
+        # PostHog intent signals — FLAG-GATED (POSTHOG_SIGNAL_POINTS_ENABLED,
+        # default off = no extra keys = byte-identical scoring).
+        **_posthog_signal_extras(props),
     }
 
 

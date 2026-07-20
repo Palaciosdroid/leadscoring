@@ -20,12 +20,20 @@ Signals (all optional — a missing signal contributes 0, never crashes):
     interest_category — str  ("hypnose" gets a small product-fit bonus)
     unsubscribed      — bool (hard disqualify)
 
+PostHog intent signals (flag-gated at assembly — POSTHOG_SIGNAL_POINTS_ENABLED,
+default OFF; keys absent = 0 points = today's behavior):
+    payment_page_age_days — float days since payment_page_visited (decayed)
+    offer_dwell_minutes   — float max active minutes on offer page (14d window)
+    vsl_watched_percent   — float max VSL watch percent (14d window)
+    (intent_funnel is ROUTING-ONLY and intentionally NOT a signal here.)
+
 Phone is INTENTIONALLY not a signal — it is the dialer gate, not a score input
 (leakage protection). Do not add it here.
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 
 # ---------------------------------------------------------------------------
@@ -70,6 +78,77 @@ EMAIL_ENGAGED_POINTS = 5      # sustained opens (>=3) without a click
 # CHECKOUT_POINTS pending an analytics/calibrate_points.py re-run vs Deal-Won.
 # See project_sbc_launchcall_intent_gap.
 LAUNCHCALL_POINTS = 25
+
+# ---------------------------------------------------------------------------
+# PostHog-Intent-Signale (Spec 2026-07-09, Sync live 2026-07-20) — FLAG-GATED.
+#
+# UNCALIBRATED start weights from SPEC-Hot-Lead-Signals-2026-07-09.md. The
+# properties were first populated 2026-07-20 (481 contacts, 14d window, buyers
+# excluded at source), so the first analytics/calibrate_posthog_signals.py run
+# has ~zero Deal-Won overlap by construction — re-calibrate before any flip.
+#
+# The flag lives in the SIGNAL ASSEMBLY (batch/scorer._assemble_point_signals):
+# with POSTHOG_SIGNAL_POINTS_ENABLED off (default) the signal dict simply never
+# contains these keys, so compute_points stays byte-identical to today. The
+# scoring below is therefore unconditional-but-inert, same pattern as every
+# other optional signal.
+#
+# Decay (spec: >14d → halve, >30d → 0):
+#   payment_page_visited IS a date → age-based decay implemented here via the
+#   pre-computed `payment_page_age_days` signal (assembly derives it, keeping
+#   this function pure).
+#   offer_dwell_minutes / vsl_watched_percent have NO date in HubSpot (sync
+#   writes max-values only, monotonic). OPEN DECAY QUESTION — options per
+#   INSTRUCTIONS-PostHog-Sync-2026-07-20.md: (a) posthog-CC adds an
+#   `intent_signals_updated_at` anchor property (recommended), (b) decay via
+#   lead_score_updated_at. Until decided: NO decay on dwell/vsl. The sync's own
+#   14d event window bounds staleness at source, but values never reset.
+# ---------------------------------------------------------------------------
+POSTHOG_SIGNAL_FLAG_ENV = "POSTHOG_SIGNAL_POINTS_ENABLED"
+
+PAYMENT_PAGE_POINTS = 40      # payment page visited, no purchase — hot
+OFFER_DWELL_HOT_POINTS = 25   # offer dwell >= 5 min — hot
+OFFER_DWELL_WARM_POINTS = 15  # offer dwell >= 2 min — warm
+VSL_HOT_POINTS = 25           # VSL >= 90% watched — hot
+VSL_WARM_POINTS = 15          # VSL >= 50% watched — warm
+
+OFFER_DWELL_HOT_MIN = 5.0     # minutes
+OFFER_DWELL_WARM_MIN = 2.0    # minutes
+VSL_HOT_MIN = 90.0            # percent
+VSL_WARM_MIN = 50.0           # percent
+
+# payment_page_visited age decay (days): full weight through 14d, half to 30d,
+# then 0. (Spec: "älter 14 Tage → Punkte halbieren; älter 30 Tage → 0".)
+PAYMENT_DECAY_FULL_DAYS = 14
+PAYMENT_DECAY_HALF_DAYS = 30
+
+# NOTE: the spec's "+10 ADL-Mail-Klick" is ALREADY covered by the existing
+# EMAIL_CLICK_POINTS (+10) via CIO email_link_clicked events — do NOT add
+# adl_mail_click_last as a second mail-click signal (double count).
+
+
+def posthog_signals_enabled() -> bool:
+    """Feature flag for the PostHog intent signals (default OFF).
+
+    Read per-call (not at import) so tests and Railway env changes take effect
+    without a restart. Only the signal ASSEMBLY consults this — compute_points
+    itself is flag-free and pure.
+    """
+    return os.environ.get(POSTHOG_SIGNAL_FLAG_ENV, "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def payment_page_points_for_age(age_days: float | None) -> int:
+    """Decayed payment-page points: full ≤14d, half ≤30d, 0 after (None → 0)."""
+    if age_days is None or age_days < 0:
+        return 0
+    if age_days <= PAYMENT_DECAY_FULL_DAYS:
+        return PAYMENT_PAGE_POINTS
+    if age_days <= PAYMENT_DECAY_HALF_DAYS:
+        return PAYMENT_PAGE_POINTS // 2
+    return 0
+
 
 # A SKIPPED Eignungscheck question is "unknown", NOT "low" — empirically it
 # converts near base-rate (missing-interest even higher). Give a neutral weight,
@@ -190,6 +269,35 @@ def compute_points(signals: dict) -> PointsResult:
     if signals.get("launchcall"):
         points += LAUNCHCALL_POINTS
         reasons.append(f"Launchcall registriert +{LAUNCHCALL_POINTS}")
+
+    # --- PostHog intent signals (flag-gated at ASSEMBLY, inert here) --------
+    # These keys only exist in the signal dict when POSTHOG_SIGNAL_POINTS_ENABLED
+    # is on (see batch/scorer._assemble_point_signals) — flag off = keys absent
+    # = 0 points = byte-identical scoring. Weights are UNCALIBRATED spec starts.
+    payment_age = signals.get("payment_page_age_days")
+    if payment_age is not None:
+        pts = payment_page_points_for_age(payment_age)
+        if pts:
+            points += pts
+            reasons.append(f"Payment-Page besucht ({payment_age:.0f}d) +{pts}")
+
+    dwell = signals.get("offer_dwell_minutes")
+    if isinstance(dwell, (int, float)):
+        if dwell >= OFFER_DWELL_HOT_MIN:
+            points += OFFER_DWELL_HOT_POINTS
+            reasons.append(f"Offer-Dwell {dwell:.0f}min +{OFFER_DWELL_HOT_POINTS}")
+        elif dwell >= OFFER_DWELL_WARM_MIN:
+            points += OFFER_DWELL_WARM_POINTS
+            reasons.append(f"Offer-Dwell {dwell:.0f}min +{OFFER_DWELL_WARM_POINTS}")
+
+    vsl = signals.get("vsl_watched_percent")
+    if isinstance(vsl, (int, float)):
+        if vsl >= VSL_HOT_MIN:
+            points += VSL_HOT_POINTS
+            reasons.append(f"VSL {vsl:.0f}% +{VSL_HOT_POINTS}")
+        elif vsl >= VSL_WARM_MIN:
+            points += VSL_WARM_POINTS
+            reasons.append(f"VSL {vsl:.0f}% +{VSL_WARM_POINTS}")
 
     # --- Product-fit bonus -------------------------------------------------
     if signals.get("interest_category") == "hypnose":
