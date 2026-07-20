@@ -39,10 +39,26 @@ def _days_ago_iso(days: float) -> str:
 
 _POSTHOG_PROPS = {
     "offer_dwell_minutes": "5.5",
+    "offer_dwell_last_at": _days_ago_iso(1),
     "payment_page_visited": _days_ago_iso(1),
     "vsl_watched_percent": "95",
+    "vsl_watched_last_at": _days_ago_iso(1),
     "intent_funnel": "MC (Meditationscoach)",
 }
+
+
+def _dwell(minutes: str, anchor_days: float | None):
+    props = {"offer_dwell_minutes": minutes}
+    if anchor_days is not None:
+        props["offer_dwell_last_at"] = _days_ago_iso(anchor_days)
+    return props
+
+
+def _vsl(percent: str, anchor_days: float | None):
+    props = {"vsl_watched_percent": percent}
+    if anchor_days is not None:
+        props["vsl_watched_last_at"] = _days_ago_iso(anchor_days)
+    return props
 
 
 @pytest.fixture
@@ -113,27 +129,27 @@ class TestFlagOnBuckets:
         assert result.reasons == []
 
     def test_dwell_hot_plus_25(self, flag_on):
-        sig = scorer._assemble_point_signals([], {"offer_dwell_minutes": "5"}, None, False)
+        sig = scorer._assemble_point_signals([], _dwell("5", 0), None, False)
         assert compute_points(sig).points == OFFER_DWELL_HOT_POINTS == 25
 
     def test_dwell_warm_plus_15(self, flag_on):
-        sig = scorer._assemble_point_signals([], {"offer_dwell_minutes": "2.0"}, None, False)
+        sig = scorer._assemble_point_signals([], _dwell("2.0", 0), None, False)
         assert compute_points(sig).points == OFFER_DWELL_WARM_POINTS == 15
 
     def test_dwell_below_warm_zero(self, flag_on):
-        sig = scorer._assemble_point_signals([], {"offer_dwell_minutes": "1.9"}, None, False)
+        sig = scorer._assemble_point_signals([], _dwell("1.9", 0), None, False)
         assert compute_points(sig).points == 0
 
     def test_vsl_hot_plus_25(self, flag_on):
-        sig = scorer._assemble_point_signals([], {"vsl_watched_percent": "90"}, None, False)
+        sig = scorer._assemble_point_signals([], _vsl("90", 0), None, False)
         assert compute_points(sig).points == VSL_HOT_POINTS == 25
 
     def test_vsl_warm_plus_15(self, flag_on):
-        sig = scorer._assemble_point_signals([], {"vsl_watched_percent": "50"}, None, False)
+        sig = scorer._assemble_point_signals([], _vsl("50", 0), None, False)
         assert compute_points(sig).points == VSL_WARM_POINTS == 15
 
     def test_vsl_below_warm_zero(self, flag_on):
-        sig = scorer._assemble_point_signals([], {"vsl_watched_percent": "49.9"}, None, False)
+        sig = scorer._assemble_point_signals([], _vsl("49.9", 0), None, False)
         assert compute_points(sig).points == 0
 
     def test_all_three_signals_stack_to_90(self, flag_on):
@@ -154,12 +170,79 @@ class TestFlagOnBuckets:
         # dwell hot (25) + vsl hot (25) + payment 20d (20) = 70 >= 65 hot
         props = {
             "offer_dwell_minutes": "7",
+            "offer_dwell_last_at": _days_ago_iso(3),
             "vsl_watched_percent": "100",
+            "vsl_watched_last_at": _days_ago_iso(3),
             "payment_page_visited": _days_ago_iso(20),
         }
         result = compute_points(scorer._assemble_point_signals([], props, None, False))
         assert result.points == 70
         assert result.tier == "1_hot"
+
+
+# ---------------------------------------------------------------------------
+# Dwell/VSL decay via per-signal anchors (offer_dwell_last_at /
+# vsl_watched_last_at — REPLY-posthog-CC-Decay-Anchors-2026-07-20.md)
+# ---------------------------------------------------------------------------
+
+class TestDwellVslAnchorDecay:
+    def test_dwell_fresh_anchor_full(self, flag_on):
+        sig = scorer._assemble_point_signals([], _dwell("6", 10), None, False)
+        assert compute_points(sig).points == 25
+
+    def test_dwell_anchor_15_to_30_days_halved(self, flag_on):
+        sig = scorer._assemble_point_signals([], _dwell("6", 20), None, False)
+        assert compute_points(sig).points == 25 // 2
+        sig = scorer._assemble_point_signals([], _dwell("2.5", 20), None, False)
+        assert compute_points(sig).points == 15 // 2
+
+    def test_dwell_anchor_older_30_days_zero(self, flag_on):
+        sig = scorer._assemble_point_signals([], _dwell("6", 40), None, False)
+        result = compute_points(sig)
+        assert result.points == 0
+        assert result.reasons == []
+
+    def test_dwell_value_without_anchor_scores_zero(self, flag_on):
+        # Conservative: legacy value with no anchor must not look fresh forever.
+        sig = scorer._assemble_point_signals([], _dwell("6", None), None, False)
+        assert "offer_dwell_minutes" in sig
+        assert "offer_dwell_age_days" not in sig
+        assert compute_points(sig).points == 0
+
+    def test_vsl_fresh_anchor_full(self, flag_on):
+        sig = scorer._assemble_point_signals([], _vsl("95", 10), None, False)
+        assert compute_points(sig).points == 25
+
+    def test_vsl_anchor_15_to_30_days_halved(self, flag_on):
+        sig = scorer._assemble_point_signals([], _vsl("95", 20), None, False)
+        assert compute_points(sig).points == 25 // 2
+        sig = scorer._assemble_point_signals([], _vsl("60", 20), None, False)
+        assert compute_points(sig).points == 15 // 2
+
+    def test_vsl_anchor_older_30_days_zero(self, flag_on):
+        sig = scorer._assemble_point_signals([], _vsl("95", 40), None, False)
+        assert compute_points(sig).points == 0
+
+    def test_vsl_value_without_anchor_scores_zero(self, flag_on):
+        sig = scorer._assemble_point_signals([], _vsl("95", None), None, False)
+        assert "vsl_watched_percent" in sig
+        assert "vsl_watched_age_days" not in sig
+        assert compute_points(sig).points == 0
+
+    def test_junk_anchor_treated_as_missing(self, flag_on):
+        props = {"offer_dwell_minutes": "6", "offer_dwell_last_at": "not-a-date"}
+        sig = scorer._assemble_point_signals([], props, None, False)
+        assert compute_points(sig).points == 0
+
+    def test_anchors_decay_independently(self, flag_on):
+        # dwell fresh (25) + vsl half (12) + payment expired (0) = 37
+        props = {
+            **_dwell("6", 5),
+            **_vsl("95", 20),
+            "payment_page_visited": _days_ago_iso(45),
+        }
+        sig = scorer._assemble_point_signals([], props, None, False)
+        assert compute_points(sig).points == 25 + 12
 
 
 # ---------------------------------------------------------------------------

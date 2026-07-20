@@ -108,7 +108,10 @@ class SignalReport:
 
 
 def spec_points_for(dwell: float | None, payment: bool, vsl: float | None) -> int:
-    """Would-be PostHog-signal points under the spec weights (highest step per signal)."""
+    """Would-be PostHog-signal points under the spec weights (highest step per
+    signal). NOTE: ignores the per-signal decay anchors (offer_dwell_last_at /
+    vsl_watched_last_at) — i.e. simulates all signals as fresh. Fine on day-one
+    data; for later runs treat these as an upper bound."""
     pts = 0
     if payment:
         pts += PAYMENT_PAGE_POINTS

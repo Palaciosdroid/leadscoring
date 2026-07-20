@@ -24,7 +24,9 @@ PostHog intent signals (flag-gated at assembly — POSTHOG_SIGNAL_POINTS_ENABLED
 default OFF; keys absent = 0 points = today's behavior):
     payment_page_age_days — float days since payment_page_visited (decayed)
     offer_dwell_minutes   — float max active minutes on offer page (14d window)
+    offer_dwell_age_days  — float days since offer_dwell_last_at (decay anchor)
     vsl_watched_percent   — float max VSL watch percent (14d window)
+    vsl_watched_age_days  — float days since vsl_watched_last_at (decay anchor)
     (intent_funnel is ROUTING-ONLY and intentionally NOT a signal here.)
 
 Phone is INTENTIONALLY not a signal — it is the dialer gate, not a score input
@@ -93,16 +95,18 @@ LAUNCHCALL_POINTS = 25
 # scoring below is therefore unconditional-but-inert, same pattern as every
 # other optional signal.
 #
-# Decay (spec: >14d → halve, >30d → 0):
-#   payment_page_visited IS a date → age-based decay implemented here via the
-#   pre-computed `payment_page_age_days` signal (assembly derives it, keeping
-#   this function pure).
-#   offer_dwell_minutes / vsl_watched_percent have NO date in HubSpot (sync
-#   writes max-values only, monotonic). OPEN DECAY QUESTION — options per
-#   INSTRUCTIONS-PostHog-Sync-2026-07-20.md: (a) posthog-CC adds an
-#   `intent_signals_updated_at` anchor property (recommended), (b) decay via
-#   lead_score_updated_at. Until decided: NO decay on dwell/vsl. The sync's own
-#   14d event window bounds staleness at source, but values never reset.
+# Decay (spec: >14d → halve, >30d → 0) — ALL three signals are date-decayed:
+#   payment_page_visited          IS the event date itself.
+#   offer_dwell_last_at (date)    anchor for offer_dwell_minutes — date of the
+#                                 YOUNGEST offer_engaged event (never sync date).
+#   vsl_watched_last_at (date)    anchor for vsl_watched_percent — date of the
+#                                 youngest video_watched event.
+# Anchors are per-signal, monotonic, live since 20.07 evening (posthog-CC,
+# 420 contacts backfilled) — see REPLY-posthog-CC-Decay-Anchors-2026-07-20.md.
+# There is deliberately NO collective `intent_signals_updated_at` — do not add
+# one. A value WITHOUT its anchor scores 0 (conservative: legacy data must not
+# look eternally fresh). Assembly pre-computes the ages, keeping compute_points
+# pure; the shared curve lives in decayed_points().
 # ---------------------------------------------------------------------------
 POSTHOG_SIGNAL_FLAG_ENV = "POSTHOG_SIGNAL_POINTS_ENABLED"
 
@@ -117,10 +121,15 @@ OFFER_DWELL_WARM_MIN = 2.0    # minutes
 VSL_HOT_MIN = 90.0            # percent
 VSL_WARM_MIN = 50.0           # percent
 
-# payment_page_visited age decay (days): full weight through 14d, half to 30d,
-# then 0. (Spec: "älter 14 Tage → Punkte halbieren; älter 30 Tage → 0".)
-PAYMENT_DECAY_FULL_DAYS = 14
-PAYMENT_DECAY_HALF_DAYS = 30
+# Signal age decay (days), shared by all three PostHog signals: full weight
+# through 14d, half to 30d, then 0. (Spec: "älter 14 Tage → Punkte halbieren;
+# älter 30 Tage → 0".)
+SIGNAL_DECAY_FULL_DAYS = 14
+SIGNAL_DECAY_HALF_DAYS = 30
+
+# Backward-compat aliases (first cut named these payment-specific).
+PAYMENT_DECAY_FULL_DAYS = SIGNAL_DECAY_FULL_DAYS
+PAYMENT_DECAY_HALF_DAYS = SIGNAL_DECAY_HALF_DAYS
 
 # NOTE: the spec's "+10 ADL-Mail-Klick" is ALREADY covered by the existing
 # EMAIL_CLICK_POINTS (+10) via CIO email_link_clicked events — do NOT add
@@ -139,15 +148,24 @@ def posthog_signals_enabled() -> bool:
     )
 
 
-def payment_page_points_for_age(age_days: float | None) -> int:
-    """Decayed payment-page points: full ≤14d, half ≤30d, 0 after (None → 0)."""
+def decayed_points(base: int, age_days: float | None) -> int:
+    """
+    Shared decay curve for the PostHog signals: full weight ≤14d, half ≤30d,
+    0 after. `age_days is None` (no anchor for a present value) → 0 —
+    conservative, so legacy values without an anchor never look fresh forever.
+    """
     if age_days is None or age_days < 0:
         return 0
-    if age_days <= PAYMENT_DECAY_FULL_DAYS:
-        return PAYMENT_PAGE_POINTS
-    if age_days <= PAYMENT_DECAY_HALF_DAYS:
-        return PAYMENT_PAGE_POINTS // 2
+    if age_days <= SIGNAL_DECAY_FULL_DAYS:
+        return base
+    if age_days <= SIGNAL_DECAY_HALF_DAYS:
+        return base // 2
     return 0
+
+
+def payment_page_points_for_age(age_days: float | None) -> int:
+    """Decayed payment-page points (see decayed_points)."""
+    return decayed_points(PAYMENT_PAGE_POINTS, age_days)
 
 
 # A SKIPPED Eignungscheck question is "unknown", NOT "low" — empirically it
@@ -281,23 +299,35 @@ def compute_points(signals: dict) -> PointsResult:
             points += pts
             reasons.append(f"Payment-Page besucht ({payment_age:.0f}d) +{pts}")
 
+    # dwell/vsl decay via their per-signal anchors (offer_dwell_last_at /
+    # vsl_watched_last_at). Missing anchor for a present value → 0 points.
     dwell = signals.get("offer_dwell_minutes")
     if isinstance(dwell, (int, float)):
+        base = 0
         if dwell >= OFFER_DWELL_HOT_MIN:
-            points += OFFER_DWELL_HOT_POINTS
-            reasons.append(f"Offer-Dwell {dwell:.0f}min +{OFFER_DWELL_HOT_POINTS}")
+            base = OFFER_DWELL_HOT_POINTS
         elif dwell >= OFFER_DWELL_WARM_MIN:
-            points += OFFER_DWELL_WARM_POINTS
-            reasons.append(f"Offer-Dwell {dwell:.0f}min +{OFFER_DWELL_WARM_POINTS}")
+            base = OFFER_DWELL_WARM_POINTS
+        if base:
+            dwell_age = signals.get("offer_dwell_age_days")
+            pts = decayed_points(base, dwell_age)
+            if pts:
+                points += pts
+                reasons.append(f"Offer-Dwell {dwell:.0f}min ({dwell_age:.0f}d) +{pts}")
 
     vsl = signals.get("vsl_watched_percent")
     if isinstance(vsl, (int, float)):
+        base = 0
         if vsl >= VSL_HOT_MIN:
-            points += VSL_HOT_POINTS
-            reasons.append(f"VSL {vsl:.0f}% +{VSL_HOT_POINTS}")
+            base = VSL_HOT_POINTS
         elif vsl >= VSL_WARM_MIN:
-            points += VSL_WARM_POINTS
-            reasons.append(f"VSL {vsl:.0f}% +{VSL_WARM_POINTS}")
+            base = VSL_WARM_POINTS
+        if base:
+            vsl_age = signals.get("vsl_watched_age_days")
+            pts = decayed_points(base, vsl_age)
+            if pts:
+                points += pts
+                reasons.append(f"VSL {vsl:.0f}% ({vsl_age:.0f}d) +{pts}")
 
     # --- Product-fit bonus -------------------------------------------------
     if signals.get("interest_category") == "hypnose":

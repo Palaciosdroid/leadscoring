@@ -73,8 +73,11 @@ _LEAD_PROPERTIES: list[str] = [
     # (extra props change nothing); SCORING them is gated behind
     # POSTHOG_SIGNAL_POINTS_ENABLED in _assemble_point_signals.
     # intent_funnel is routing/display only (dialer CSV), never a score input.
+    # offer_dwell_last_at / vsl_watched_last_at are the per-signal decay
+    # anchors (event dates, posthog-CC — REPLY-posthog-CC-Decay-Anchors).
     "offer_dwell_minutes", "payment_page_visited",
     "vsl_watched_percent", "intent_funnel",
+    "offer_dwell_last_at", "vsl_watched_last_at",
 ]
 
 # Scoring mode: 'engagement' (default/rollback — live tier UNCHANGED, point-system
@@ -726,12 +729,13 @@ def _parse_hubspot_number(raw: Any) -> float | None:
         return None
 
 
-def _payment_page_age_days(raw: Any, now: datetime | None = None) -> float | None:
+def _hubspot_date_age_days(raw: Any, now: datetime | None = None) -> float | None:
     """
-    Age in days of the payment_page_visited HubSpot DATE property.
+    Age in days of a HubSpot DATE property (payment_page_visited and the
+    per-signal decay anchors offer_dwell_last_at / vsl_watched_last_at).
 
     Tolerates both wire formats (ISO date string "2026-07-20" and epoch-millis
-    string "1752969600000"). Unparseable / empty → None (signal absent).
+    string "1752969600000"). Unparseable / empty → None (anchor absent).
     """
     if not raw:
         return None
@@ -762,21 +766,30 @@ def _posthog_signal_extras(props: dict[str, Any]) -> dict[str, Any]:
     parsed values; missing or junk props stay absent (0 points, never crash).
 
     intent_funnel is deliberately NOT returned — routing/display only.
-    Decay note: only payment_page_visited carries a date; dwell/vsl decay is an
-    OPEN question (see scoring/points.py header) and is not applied here.
+    Decay: every signal decays by its own event date — payment_page_visited
+    directly, dwell/vsl via the per-signal anchors offer_dwell_last_at /
+    vsl_watched_last_at (REPLY-posthog-CC-Decay-Anchors-2026-07-20.md). A value
+    whose anchor is missing/unparseable gets NO age key → compute_points scores
+    it 0 (conservative — legacy values must not look eternally fresh).
     """
     if not posthog_signals_enabled():
         return {}
     extras: dict[str, Any] = {}
-    age = _payment_page_age_days(props.get("payment_page_visited"))
+    age = _hubspot_date_age_days(props.get("payment_page_visited"))
     if age is not None:
         extras["payment_page_age_days"] = age
     dwell = _parse_hubspot_number(props.get("offer_dwell_minutes"))
     if dwell is not None:
         extras["offer_dwell_minutes"] = dwell
+        dwell_age = _hubspot_date_age_days(props.get("offer_dwell_last_at"))
+        if dwell_age is not None:
+            extras["offer_dwell_age_days"] = dwell_age
     vsl = _parse_hubspot_number(props.get("vsl_watched_percent"))
     if vsl is not None:
         extras["vsl_watched_percent"] = vsl
+        vsl_age = _hubspot_date_age_days(props.get("vsl_watched_last_at"))
+        if vsl_age is not None:
+            extras["vsl_watched_age_days"] = vsl_age
     return extras
 
 
