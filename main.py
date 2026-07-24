@@ -1182,9 +1182,14 @@ def _build_dialer_csv(
     # intent_funnel appended LAST on purpose: Aircall imports column A only, and
     # Kevin's existing column order must not shift. Empty until the PostHog sync
     # (posthog-CC) creates + fills the property — display/routing only, no score.
+    # Behaviour-signal columns (24.07) appended after intent_funnel — display
+    # only for Kevin's call prep (objection, payment-page recency); sort stays
+    # score-based until the 17.08 re-calibration per the posthog-CC contract.
     writer.writerow([
         "phone_number", "first_name", "last_name", "tier", "score", "interest",
         "intent_funnel",
+        "engagement_level", "payment_page_visited", "workshop_registered",
+        "masterclass_pct", "survey_einwand", "offer_dwell_min",
     ])
     seen: set[str] = set()
     for contact in contacts:
@@ -1207,6 +1212,12 @@ def _build_dialer_csv(
             props.get("lead_combined_score", "") or "",
             props.get("lead_interest_category", "") or "",
             props.get("intent_funnel", "") or "",
+            props.get("engagement_level", "") or "",
+            props.get("payment_page_visited", "") or "",
+            props.get("workshop_registered", "") or "",
+            props.get("masterclass_watched_percent", "") or "",
+            props.get("survey_objection_last", "") or "",
+            props.get("offer_dwell_minutes", "") or "",
         ])
     return buf.getvalue()
 

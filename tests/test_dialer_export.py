@@ -46,27 +46,59 @@ def test_dedup_by_normalized_phone():
     assert len(body) == 1  # same number after whitespace strip
 
 
+EXPECTED_HEADER = (
+    "phone_number,first_name,last_name,tier,score,interest,intent_funnel,"
+    "engagement_level,payment_page_visited,workshop_registered,"
+    "masterclass_pct,survey_einwand,offer_dwell_min"
+)
+
+
 def test_empty_contacts_yields_header_only():
     csv = _build_dialer_csv([])
-    assert csv.strip() == "phone_number,first_name,last_name,tier,score,interest,intent_funnel"
+    assert csv.strip() == EXPECTED_HEADER
 
 
-def test_intent_funnel_last_column_and_inert_when_missing():
+def test_intent_funnel_position_and_inert_when_missing():
     # PostHog-sync contract (posthog-CC, 20.07): intent_funnel is display/routing
-    # only and MUST be the last column so Aircall's column-A phone contract and
-    # Kevin's existing column order stay untouched. Absent property -> empty cell,
-    # never a crash (the HubSpot property does not exist yet).
+    # only; new columns are appended AFTER it so Aircall's column-A phone
+    # contract and Kevin's existing column order stay untouched. Absent
+    # property -> empty cell, never a crash.
     with_funnel = _build_dialer_csv(
         [_c("+41791234567", intent_funnel="AL (Ausbildung deines Lebens)")]
     ).strip().splitlines()
     assert with_funnel[0].split(",")[0] == "phone_number"          # column A unchanged
-    assert with_funnel[0].endswith("intent_funnel")                # appended last
+    assert with_funnel[0].split(",")[6] == "intent_funnel"         # position stable
     assert with_funnel[1].startswith("+41791234567,")
     assert "AL (Ausbildung deines Lebens)" in with_funnel[1]
 
     without = _build_dialer_csv([_c("+41791234567")]).strip().splitlines()
     assert without[1].startswith("+41791234567,")
-    assert without[1].endswith(",")                                 # empty trailing cell
+    assert without[1].endswith(",")                                 # empty trailing cells
+
+
+def test_behavior_signal_columns_display_only():
+    # 24.07: behaviour signals (posthog daily sync) as trailing DISPLAY columns —
+    # call-prep context for Kevin. Sort/score influence is contractually deferred
+    # to the 17.08 re-calibration (feature/posthog-signal-points, flag off).
+    rows = _build_dialer_csv([_c(
+        "+41791234567",
+        engagement_level="hot",
+        payment_page_visited="2026-07-23",
+        masterclass_watched_percent="100",
+        survey_objection_last="Preis",
+        offer_dwell_minutes="7",
+    )]).strip().splitlines()
+    header = rows[0].split(",")
+    row = rows[1].split(",")
+    assert header[-6:] == ["engagement_level", "payment_page_visited",
+                           "workshop_registered", "masterclass_pct",
+                           "survey_einwand", "offer_dwell_min"]
+    assert row[header.index("engagement_level")] == "hot"
+    assert row[header.index("payment_page_visited")] == "2026-07-23"
+    assert row[header.index("workshop_registered")] == ""            # sparse = empty
+    assert row[header.index("masterclass_pct")] == "100"
+    assert row[header.index("survey_einwand")] == "Preis"
+    assert row[header.index("offer_dwell_min")] == "7"
 
 
 def test_priority_input_order_preserved():

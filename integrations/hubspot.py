@@ -459,6 +459,13 @@ async def get_prioritized_contacts(
         # property names (verified 20.07), so this stays inert until the sync
         # creates and fills it.
         "intent_funnel",
+        # Behaviour signals for Kevin's call prep (24.07) — DISPLAY ONLY, same
+        # contract: score/sort influence waits for the 17.08 re-calibration
+        # (feature/posthog-signal-points, flag off). Sparse fields are fine —
+        # they fill as the daily sync runs.
+        "engagement_level", "payment_page_visited", "workshop_registered",
+        "masterclass_watched_percent", "survey_objection_last",
+        "offer_dwell_minutes",
     ]
 
     def _hard_excluded(c: dict) -> bool:
