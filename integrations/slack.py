@@ -261,14 +261,22 @@ def _build_batch_report_message(stats: BatchRunStats) -> dict[str, Any]:
     # skipped by design — that must not fire a false AIRCALL DOWN alarm.
     aircall_attempted = stats.aircall_queued - stats.aircall_window_skipped
     aircall_down = aircall_attempted > 0 and stats.aircall_pushed == 0
+
+    # SCORING DEAD: the run produced no scored contact at all. Own criterion on
+    # purpose — during the 18.-26.07 outage the batch died in Step 1 and reported
+    # "0 leads, 0 hs_ok, 0 chunk_errors", which read like a quiet run. The pool is
+    # always >10k contacts, so zero processed is never legitimate.
+    scoring_dead = stats.leads_processed == 0 or stats.hs_updates_ok == 0
+
     ok = (
         stats.fatal_error is None
         and stats.hs_chunk_errors == 0
         and not aircall_down
         and stats.scoring_errors == 0
+        and not scoring_dead
     )
-    status_emoji = "✅" if ok else ("💥" if stats.fatal_error else "⚠️")
-    status_text = "OK" if ok else ("FATAL" if stats.fatal_error else "ERRORS")
+    status_emoji = "✅" if ok else ("💥" if (stats.fatal_error or scoring_dead) else "⚠️")
+    status_text = "OK" if ok else ("FATAL" if (stats.fatal_error or scoring_dead) else "ERRORS")
 
     mins, secs = divmod(int(stats.duration_seconds), 60)
     duration_str = f"{mins}m {secs}s" if mins else f"{secs}s"
@@ -335,12 +343,29 @@ def _build_batch_report_message(stats: BatchRunStats) -> dict[str, Any]:
             "still übersprungen (nicht gescort/gepusht/entfernt), Logs prüfen"
         )
 
+    if scoring_dead:
+        lines.append(
+            ":skull: *SCORING TOT* — 0 Kontakte gescort. Der Lead-Pool ist immer "
+            ">10k, also ist das NIE normal. Läuft das seit mehreren Runs, veraltet "
+            "Kevins Priorisierung still (Ausfall 18.-26.07: 8 Tage unbemerkt)."
+        )
+
     if stats.fatal_error:
         lines.append(f":skull: *Fatal:* `{stats.fatal_error[:300]}`")
 
     body = "\n".join(lines)
 
+    # @channel on a dead run: the 18.-26.07 outage DID post ~24 FATAL reports
+    # that nobody acted on. A silent card in a busy channel is not an alarm —
+    # the mention forces a push notification.
+    if scoring_dead or stats.fatal_error:
+        body = "<!channel>\n" + body
+
+    # Top-level `text` is what Slack shows in push notifications and channel
+    # previews. Block-Kit-only messages preview as blank, so the alarm was
+    # invisible on mobile — that is part of why the outage ran for 8 days.
     return {
+        "text": header,
         "blocks": [
             {
                 "type": "header",
@@ -350,7 +375,7 @@ def _build_batch_report_message(stats: BatchRunStats) -> dict[str, Any]:
                 "type": "section",
                 "text": {"type": "mrkdwn", "text": body},
             },
-        ]
+        ],
     }
 
 

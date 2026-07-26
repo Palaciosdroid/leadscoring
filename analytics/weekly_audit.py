@@ -120,6 +120,58 @@ def dialer_csv_health():
     return {"rows": len(rows), "status": 200, "tiers": tiers}
 
 
+def alert_slack(flags, snap):
+    """Post to Slack when any check is red.
+
+    WHY this exists separately from the batch report: the batch report is posted
+    BY the batch. During the 18.-26.07 outage the batch died in Step 1, and while
+    it did still post ~24 FATAL cards, nothing independent ever cross-checked the
+    result. This audit runs outside the service (scheduled task), so it can still
+    speak when the batch is broken — a watchdog must not share the failure domain
+    of the thing it watches.
+
+    Caveat (documented, not solved here): this runs on Sandro's machine, so a
+    laptop that stays off is a blind window. A cloud-side cron would close it.
+    """
+    red = [f for f in flags if f.startswith("🔴")]
+    if not red:
+        return False
+
+    hook = ""
+    try:
+        sec = json.load(open(SECRETS, encoding="utf-8"))
+        hook = sec.get("slack_sbc_leadscoring", {}).get("webhook", "")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  (Slack-Alarm nicht gesendet: SECRETS unlesbar — {exc})")
+        return False
+    if not hook:
+        print("  (Slack-Alarm nicht gesendet: kein Webhook in SECRETS.json)")
+        return False
+
+    headline = f"🔴 Lead-Scoring Audit — {len(red)} Problem(e)"
+    body = "<!channel>\n" + "\n".join(f"• {f}" for f in red)
+    body += (
+        f"\n\n_Unabhängiger Audit-Lauf {snap['ts']} (läuft ausserhalb des Services). "
+        f"Tier: {snap['tier_distribution']} · CSV: {snap['dialer_csv']['rows']} Zeilen_"
+    )
+    payload = {
+        # top-level text = what Slack shows in push notifications
+        "text": headline,
+        "blocks": [
+            {"type": "header", "text": {"type": "plain_text", "text": headline, "emoji": True}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": body}},
+        ],
+    }
+    try:
+        r = httpx.post(hook, json=payload, timeout=10)
+        ok = r.status_code == 200
+        print(f"  → Slack-Alarm {'gesendet' if ok else f'FEHLGESCHLAGEN ({r.status_code})'}")
+        return ok
+    except Exception as exc:  # noqa: BLE001
+        print(f"  → Slack-Alarm fehlgeschlagen: {exc}")
+        return False
+
+
 def load_previous():
     if not AUDIT_LOG.exists():
         return None
@@ -190,6 +242,9 @@ def main():
     print(f"  Launchcall registriert (CIO): {snap['launchcall_registered']}")
     print(f"  Kevin-CSV Tiers: {snap['dialer_csv']['tiers']}")
     print(f"\n  → geloggt nach {AUDIT_LOG}")
+
+    # Escalate red findings — a monitor nobody reads is not a monitor.
+    alert_slack(flags, snap)
 
 
 if __name__ == "__main__":
