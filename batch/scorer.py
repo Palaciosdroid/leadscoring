@@ -181,33 +181,51 @@ FUNNEL_SHORT: dict[str, str] = {
 async def _fetch_active_hubspot_leads() -> list[dict[str, Any]]:
     """
     Pull all contacts that have been scored at least once.
-    Paginates through HubSpot search results (max 100 per page).
+
+    Walks the pool by ASCENDING hs_object_id, re-issuing a fresh search per
+    chunk (`hs_object_id GT last_seen`) instead of following HubSpot's `after`
+    cursor.
+
+    WHY (outage 18.-26.07, ~8 days of no scoring): HubSpot's search API caps a
+    single result set at 10,000 — paging past it returns a bare HTTP 400. When
+    SCORE_ACTIVE_UNSCORED went live it scored ~1,500 extra contacts, pushing the
+    scored pool to 10,678, so every batch died on page 101 (`after=10000`) and
+    Step 1 aborted the whole run. Restarting the query per chunk keeps every
+    request inside the cap, so the pool can grow without limit. Request count is
+    unchanged (still one call per 100 contacts).
     """
     headers = {
         "Authorization": f"Bearer {HUBSPOT_TOKEN}",
         "Content-Type": "application/json",
     }
-    payload: dict[str, Any] = {
-        "filterGroups": [
-            {
-                "filters": [
-                    {"propertyName": "lead_tier", "operator": "HAS_PROPERTY"}
-                ]
-            }
-        ],
-        "properties": _LEAD_PROPERTIES,
-        "limit": 100,
-    }
 
     results: list[dict[str, Any]] = []
-    after: str | None = None
+    last_id = 0
+    # Safety stop: 100k contacts. Guards against a non-advancing cursor looping
+    # forever (e.g. a HubSpot id that fails to parse as int).
+    MAX_CHUNKS = 1000
 
     async with httpx.AsyncClient(timeout=30.0) as client:
-        while True:
-            if after:
-                payload["after"] = after
+        for _ in range(MAX_CHUNKS):
+            payload: dict[str, Any] = {
+                "filterGroups": [
+                    {
+                        "filters": [
+                            {"propertyName": "lead_tier", "operator": "HAS_PROPERTY"},
+                            {
+                                "propertyName": "hs_object_id",
+                                "operator": "GT",
+                                "value": str(last_id),
+                            },
+                        ]
+                    }
+                ],
+                "properties": _LEAD_PROPERTIES,
+                "sorts": [{"propertyName": "hs_object_id", "direction": "ASCENDING"}],
+                "limit": 100,
+            }
 
-            # Retry up to 4 times on transient HubSpot 5xx errors
+            # Retry transient HubSpot 5xx / 429 (rate limit must not truncate the pool)
             resp = None
             for attempt in range(4):
                 resp = await client.post(
@@ -215,25 +233,44 @@ async def _fetch_active_hubspot_leads() -> list[dict[str, Any]]:
                     headers=headers,
                     json=payload,
                 )
-                if resp.status_code < 500:
+                if resp.status_code < 500 and resp.status_code != 429:
                     break
                 wait = 2 ** attempt  # 1s, 2s, 4s, 8s
                 logger.warning(
-                    "HubSpot search page %s: %s — retry %d/4 in %ds",
-                    after or "first", resp.status_code, attempt + 1, wait,
+                    "HubSpot search after id %s: %s — retry %d/4 in %ds",
+                    last_id, resp.status_code, attempt + 1, wait,
                 )
                 await asyncio.sleep(wait)
 
             resp.raise_for_status()
-            data = resp.json()
-            results.extend(data.get("results", []))
-
-            paging = data.get("paging", {}).get("next", {})
-            after = paging.get("after")
-            if not after:
+            batch = resp.json().get("results", [])
+            if not batch:
                 break
-            # Small delay between pages to avoid HubSpot 429
+            results.extend(batch)
+
+            # Advance the cursor past the highest id in this chunk.
+            try:
+                highest = max(int(c["id"]) for c in batch if c.get("id"))
+            except (ValueError, TypeError, KeyError):
+                logger.error(
+                    "HubSpot search: unparsable contact id in chunk after %s — "
+                    "stopping to avoid an infinite loop (%d fetched)",
+                    last_id, len(results),
+                )
+                break
+            if highest <= last_id:
+                break  # cursor did not advance — pool exhausted
+            last_id = highest
+
+            if len(batch) < 100:
+                break  # short page = last chunk
+            # Small delay between chunks to avoid HubSpot 429
             await asyncio.sleep(0.5)
+        else:
+            logger.error(
+                "HubSpot search hit MAX_CHUNKS (%d) — lead pool may be truncated at %d",
+                MAX_CHUNKS, len(results),
+            )
 
     return results
 
