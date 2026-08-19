@@ -36,10 +36,12 @@ import httpx
 
 from analytics.labels import (
     HUBSPOT_BASE,
+    ConversionTiming,
     _headers,
-    fetch_won_contacts,
-    fetch_completed_purchase_emails,
-    is_converted,
+    _parse_ts,
+    converted_after,
+    fetch_completed_purchase_dates,
+    fetch_won_contact_dates,
 )
 from scoring.points import (
     PAYMENT_PAGE_POINTS,
@@ -60,6 +62,11 @@ SIGNAL_PROPERTIES = [
     "payment_page_visited",
     "vsl_watched_percent",
     "intent_funnel",
+    # Per-signal anchors — required to order a purchase against the signal that
+    # is supposed to predict it. Without them the report counts past customers
+    # revisiting the offer page as conversions (measured 19.08.2026: 22 of 26).
+    "offer_dwell_last_at",
+    "vsl_watched_last_at",
 ]
 
 # Minimum conversions inside a bucket before its rate is worth printing as a
@@ -105,6 +112,9 @@ class SignalReport:
     funnel_split: dict[str, int] = field(default_factory=dict)
     spec_points: dict[int, Bucket] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
+    # Removed from the population, not counted as failures — see build_report.
+    prior_buyers_excluded: int = 0
+    undecidable_excluded: int = 0
 
 
 def spec_points_for(dwell: float | None, payment: bool, vsl: float | None) -> int:
@@ -130,10 +140,28 @@ def spec_points_for(dwell: float | None, payment: bool, vsl: float | None) -> in
 
 def build_report(
     contacts: list[dict],
-    won_set: set[str],
-    completed_set: set[str],
+    won_dates: dict[str, datetime],
+    purchase_dates: dict[str, datetime],
 ) -> SignalReport:
-    """Pure assembly from already-fetched data (unit-testable, no I/O)."""
+    """Pure assembly from already-fetched data (unit-testable, no I/O).
+
+    TIME-ORDERED as of 19.08.2026. This used to take the "ever bought" sets and
+    call any overlap a conversion. On the live population that meant 22 of 26
+    resolvable conversions were past customers whose purchase predated the signal
+    by a median of 456 days — they sat in every bucket, pushed all six rates into
+    a 9.2-13.5% band, and inverted the ranking (vsl>=90% scored below vsl<50%).
+    The sync only excludes buyers with a PostHog purchase inside 60 days, so a
+    deal won two years ago stays in.
+
+    Two rules follow:
+
+    - Each bucket is judged against ITS OWN anchor. Crediting a dwell signal with
+      a purchase that happened before that dwell is the same error in miniature.
+    - Past customers LEAVE the population; they are not negative examples. They
+      already bought and are out of the market, so counting them as failures
+      would understate every signal — the mirror image of the original mistake.
+      They are reported separately so the shrinkage stays visible.
+    """
     report = SignalReport()
 
     buckets = {
@@ -153,34 +181,56 @@ def build_report(
 
         dwell = parse_number(props.get("offer_dwell_minutes"))
         vsl = parse_number(props.get("vsl_watched_percent"))
-        payment = bool(props.get("payment_page_visited"))
+        payment_at = _parse_ts(props.get("payment_page_visited"))
+        payment = payment_at is not None
+        dwell_at = _parse_ts(props.get("offer_dwell_last_at"))
+        vsl_at = _parse_ts(props.get("vsl_watched_last_at"))
         funnel = (props.get("intent_funnel") or "(leer)").strip() or "(leer)"
 
-        converted = is_converted(cid, email, won_set, completed_set)
+        hit_labels: list[tuple[str, datetime | None]] = []
+        if payment:
+            hit_labels.append(("payment_page_visited (gesetzt)", payment_at))
+        if dwell is not None and dwell >= OFFER_DWELL_HOT_MIN:
+            hit_labels.append((f"offer_dwell >= {OFFER_DWELL_HOT_MIN:g} min", dwell_at))
+        elif dwell is not None and dwell >= OFFER_DWELL_WARM_MIN:
+            hit_labels.append(
+                (f"offer_dwell {OFFER_DWELL_WARM_MIN:g}-<{OFFER_DWELL_HOT_MIN:g} min", dwell_at))
+        if vsl is not None:
+            if vsl >= VSL_HOT_MIN:
+                hit_labels.append((f"vsl >= {VSL_HOT_MIN:g}%", vsl_at))
+            elif vsl >= VSL_WARM_MIN:
+                hit_labels.append((f"vsl {VSL_WARM_MIN:g}-<{VSL_HOT_MIN:g}%", vsl_at))
+            else:
+                hit_labels.append((f"vsl < {VSL_WARM_MIN:g}%", vsl_at))
+
+        # Population verdict uses the EARLIEST anchor: if any signal preceded the
+        # purchase, this contact was still in the market when we saw them. The
+        # strictest reading (latest anchor) would discard genuine early signals.
+        anchors = [a for _, a in hit_labels if a is not None]
+        overall = converted_after(cid, email, won_dates, purchase_dates,
+                                  min(anchors) if anchors else None)
+
+        if overall is ConversionTiming.UNDECIDABLE:
+            report.undecidable_excluded += 1
+            continue
+        if overall is ConversionTiming.PRIOR_BUYER:
+            report.prior_buyers_excluded += 1
+            continue
+
+        converted = overall is ConversionTiming.CONVERTED_AFTER
         report.contacts_total += 1
         if converted:
             report.contacts_converted += 1
         report.funnel_split[funnel] = report.funnel_split.get(funnel, 0) + 1
 
-        hit_labels: list[str] = []
-        if payment:
-            hit_labels.append("payment_page_visited (gesetzt)")
-        if dwell is not None and dwell >= OFFER_DWELL_HOT_MIN:
-            hit_labels.append(f"offer_dwell >= {OFFER_DWELL_HOT_MIN:g} min")
-        elif dwell is not None and dwell >= OFFER_DWELL_WARM_MIN:
-            hit_labels.append(f"offer_dwell {OFFER_DWELL_WARM_MIN:g}-<{OFFER_DWELL_HOT_MIN:g} min")
-        if vsl is not None:
-            if vsl >= VSL_HOT_MIN:
-                hit_labels.append(f"vsl >= {VSL_HOT_MIN:g}%")
-            elif vsl >= VSL_WARM_MIN:
-                hit_labels.append(f"vsl {VSL_WARM_MIN:g}-<{VSL_HOT_MIN:g}%")
-            else:
-                hit_labels.append(f"vsl < {VSL_WARM_MIN:g}%")
-
-        for label in hit_labels:
+        for label, anchor in hit_labels:
+            timing = converted_after(cid, email, won_dates, purchase_dates, anchor)
+            if timing in (ConversionTiming.UNDECIDABLE, ConversionTiming.PRIOR_BUYER):
+                # This particular signal cannot claim this purchase.
+                continue
             b = buckets[label]
             b.total += 1
-            if converted:
+            if timing is ConversionTiming.CONVERTED_AFTER:
                 b.converted += 1
 
         pts = spec_points_for(dwell, payment, vsl)
@@ -191,9 +241,19 @@ def build_report(
 
     report.buckets = list(buckets.values())
 
-    if not won_set and not completed_set:
+    if not won_dates and not purchase_dates:
         report.notes.append(
             "Beide Label-Quellen leer — als Fetch-Fehler behandeln, nicht als 0-Conversion."
+        )
+    if report.prior_buyers_excluded:
+        report.notes.append(
+            f"{report.prior_buyers_excluded} Altkäufer aus der Grundgesamtheit entfernt "
+            "(Kauf lag VOR dem Signal). Sie sind keine Fehlschläge, sondern nicht mehr im Markt."
+        )
+    if report.undecidable_excluded:
+        report.notes.append(
+            f"{report.undecidable_excluded} Kontakte ohne Signal-Anker entfernt — ohne Anker "
+            "ist keine Reihenfolge feststellbar."
         )
     return report
 
@@ -202,19 +262,34 @@ def format_report(report: SignalReport) -> str:
     lines: list[str] = []
     bar = "=" * 72
     lines.append(bar)
-    lines.append("POSTHOG-INTENT-SIGNAL KALIBRIERUNG — canonical label (Deal Won / completed)")
+    lines.append("POSTHOG-INTENT-SIGNAL KALIBRIERUNG — Kauf NACH dem Signal (zeitgeordnet)")
     lines.append(f"Stand: {datetime.now(timezone.utc).date().isoformat()} — Properties LIVE seit 2026-07-20 (!)")
     lines.append(bar)
 
     overall = report.contacts_converted / report.contacts_total if report.contacts_total else 0.0
     lines.append(
-        f"\nKontakte mit PostHog-Signal: {report.contacts_total}  |  "
-        f"konvertiert (canonical): {report.contacts_converted}  |  rate: {overall * 100:.2f}%"
+        f"\nAuswertbare Kontakte: {report.contacts_total}  |  "
+        f"Kauf NACH dem Signal: {report.contacts_converted}  |  rate: {overall * 100:.2f}%"
     )
     lines.append(f"Referenz-Base-Rate (Vollbasis-Kalibrierung 18.07): {REFERENCE_BASE_RATE * 100:.1f}%")
 
+    removed = report.prior_buyers_excluded + report.undecidable_excluded
+    if removed:
+        gross = report.contacts_total + removed
+        lines.append(
+            f"\nAus der Grundgesamtheit entfernt: {removed} von {gross} "
+            f"({removed / gross * 100:.0f}%)"
+        )
+        lines.append(
+            f"  · {report.prior_buyers_excluded} Altkäufer (Kauf lag VOR dem Signal — "
+            "kein Fehlschlag, nur nicht mehr im Markt)"
+        )
+        lines.append(
+            f"  · {report.undecidable_excluded} ohne Signal-Anker (Reihenfolge nicht feststellbar)"
+        )
+
     lines.append("\n" + "-" * 72)
-    lines.append("SIGNAL-BUCKET → n / Deal-Won-Überlappung")
+    lines.append("SIGNAL-BUCKET → n / Käufe NACH diesem Signal")
     lines.append("-" * 72)
     lines.append(f"  {'bucket':<34s} {'n':>6s} {'conv':>6s} {'rate':>8s}  {'belastbar?':s}")
     for b in report.buckets:
@@ -309,22 +384,22 @@ async def run() -> SignalReport:
     notes: list[str] = []
 
     try:
-        won_set = await fetch_won_contacts()
+        won_dates = await fetch_won_contact_dates()
     except Exception as exc:  # noqa: BLE001 — fail-soft on labels, loud in notes
-        logger.error("posthog-calibrate: fetch_won_contacts failed: %s", exc)
-        won_set = set()
+        logger.error("posthog-calibrate: fetch_won_contact_dates failed: %s", exc)
+        won_dates = {}
         notes.append(f"HubSpot Won fetch failed ({exc}) — primary label missing.")
 
     try:
-        completed_set = await fetch_completed_purchase_emails()
+        purchase_dates = await fetch_completed_purchase_dates()
     except Exception as exc:  # noqa: BLE001
         logger.error("posthog-calibrate: completed-purchase fetch failed: %s", exc)
-        completed_set = set()
+        purchase_dates = {}
         notes.append(f"Whyros completed-purchase fetch failed ({exc}) — secondary label missing.")
 
     contacts = await fetch_signal_contacts()
 
-    report = build_report(contacts, won_set, completed_set)
+    report = build_report(contacts, won_dates, purchase_dates)
     report.notes = notes + report.notes
     return report
 
