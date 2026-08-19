@@ -110,6 +110,37 @@ def launchcall_count():
     return len(ids)
 
 
+def aircall_health():
+    """Can the SERVICE reach Aircall — and is Kevin's dialer queue readable?
+
+    THE BLINDSPOT THIS CLOSES: the Aircall key died on 18.07.2026 and every /v1/*
+    call has 403'd since. Scoring, the CSV and the HubSpot lists all stayed green,
+    so this audit reported a healthy system for four weeks while a whole output
+    channel was dead — no new contacts, no score cards, no queue top-up, no queue
+    cleanup. Kevin noticed before the monitoring did.
+
+    Measured THROUGH the service (/debug/aircall-status), not from here, for two
+    reasons: the service's network path is the one that matters in production, and
+    this script runs on a laptop whose own route to api.aircall.io is unreliable
+    (verified 19.08.2026: /v1/* resets the connection locally while the service
+    gets a clean 403). A local probe would report the laptop, not the system.
+
+    Sharing the service's failure domain is acceptable here because a service that
+    cannot answer is itself a red finding — the check stays truthful either way.
+    """
+    r = req("GET", f"{DIALER_URL}/debug/aircall-status", headers={"X-Api-Key": DIALER_KEY})
+    if r is None or r.status_code != 200:
+        status = "no response" if r is None else r.status_code
+        return {"reachable": False, "error": f"status endpoint unreachable ({status})", "queue": None}
+    body = r.json()
+    if body.get("error"):
+        return {"reachable": False, "error": str(body["error"])[:200], "queue": None}
+    dc = body.get("dialer_campaign") or {}
+    if dc.get("error"):
+        return {"reachable": True, "error": f"queue unreadable: {str(dc['error'])[:160]}", "queue": None}
+    return {"reachable": True, "error": None, "queue": dc.get("contacts_count")}
+
+
 def dialer_csv_health():
     r = req("GET", f"{DIALER_URL}/dialer/export.csv", params={"key": DIALER_KEY, "limit": 5000})
     if r.status_code != 200:
@@ -193,6 +224,7 @@ def main():
         "newest_score_age_h": newest_score_age_hours(),
         "launchcall_registered": launchcall_count(),
         "dialer_csv": dialer_csv_health(),
+        "aircall": aircall_health(),
     }
     d = snap["tier_distribution"]
     hotwarm = (d.get("1_hot", 0) or 0) + (d.get("2_warm", 0) or 0)
@@ -216,6 +248,17 @@ def main():
         flags.append(f"🔴 Kevin-CSV nur {csv_rows} Zeilen (<{CSV_MIN_ROWS}) — Liste fast leer!")
     else:
         flags.append(f"✅ Kevin-CSV: {csv_rows} anrufbare Leads")
+
+    ac = snap["aircall"]
+    if not ac["reachable"] or ac["error"]:
+        flags.append(
+            f"🔴 Aircall-Kanal tot: {ac['error']} — keine neuen Kontakte, keine Score-Karten, "
+            "keine Queue-Befüllung, und hart ausgeschlossene Leads bleiben in Kevins Dialer anrufbar"
+        )
+    elif ac["queue"] == 0:
+        flags.append("🔴 Aircall erreichbar, aber Kevins Dialer-Queue ist LEER (0 Nummern)")
+    else:
+        flags.append(f"✅ Aircall erreichbar: {ac['queue']} Nummern in Kevins Dialer-Queue")
 
     if prev:
         prev_hw = prev.get("hotwarm", 0) or 0

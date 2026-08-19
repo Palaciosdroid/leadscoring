@@ -49,6 +49,11 @@ DIALABLE_TIERS: frozenset[str] = frozenset({"1_hot", "2_warm"})
 # Minimum digits after the country code prefix "+" to be a valid number
 _PHONE_MIN_DIGITS = 7
 
+# remove_many_from_power_dialer returns this instead of a count when the queue
+# could not be read at all. A real count is never negative, so callers and the
+# batch report can tell "removed nothing" from "could not look".
+QUEUE_UNREADABLE = -1
+
 
 def _clean_e164(phone: str) -> str:
     """Return a strict E.164 number ('+' followed by 7-15 digits) or '' if it
@@ -434,12 +439,18 @@ async def _push_to_dialer_campaign(
     return {"status": "added", "phone": phone}
 
 
-async def _get_dialer_queue(client: httpx.AsyncClient) -> list[dict[str, Any]]:
+async def _get_dialer_queue(client: httpx.AsyncClient) -> list[dict[str, Any]] | None:
     """Fetch all numbers currently in the Closer's dialer campaign.
 
     Returns a list of {"id": int, "number": str(digits, no '+'), "called": bool}.
     The v1 endpoint returns every number on a single page under the 'numbers'
     key (verified 2026-06-30 against Kevin's live Classic campaign).
+
+    Returns None when the queue could NOT be read (any non-200). That is a
+    different fact from an empty queue and must stay distinguishable: this used
+    to return [], so callers concluded "the number is not queued" from a request
+    that never saw the queue. With the key dead since 18.07.2026 every call 403s,
+    and four weeks of runs reported a working removal path on that basis.
     """
     resp = await _aircall_request(
         client, "get",
@@ -448,7 +459,7 @@ async def _get_dialer_queue(client: httpx.AsyncClient) -> list[dict[str, Any]]:
     )
     if resp.status_code != 200:
         logger.warning("Aircall: dialer queue fetch failed: %s %s", resp.status_code, resp.text[:200])
-        return []
+        return None
     body = resp.json()
     return body.get("numbers") or body.get("phone_numbers") or []
 
@@ -506,6 +517,13 @@ async def remove_from_power_dialer(
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             queue = await _get_dialer_queue(client)
+            if queue is None:
+                logger.error(
+                    "Aircall: queue unreadable — cannot remove %s. The number may still "
+                    "be callable in Kevin's dialer.",
+                    phone,
+                )
+                return False
             number_id = _find_number_id(queue, phone)
             if number_id is None:
                 logger.info("Aircall: %s not in Power Dialer queue — nothing to remove", phone)
@@ -544,7 +562,9 @@ async def remove_many_from_power_dialer(
     least 20) — a mass-removal of that size signals a logic bug, not real
     exclusions, so we abort and alert rather than wipe Kevin's queue.
 
-    Returns the count actually removed (confirmed 200/204).
+    Returns the count actually removed (confirmed 200/204), or QUEUE_UNREADABLE
+    when the queue could not be read — the batch must not print that as "0
+    removed", which reads like a clean run with nothing to do.
     """
     if not (AIRCALL_API_ID and AIRCALL_API_TOKEN and AIRCALL_CLOSER_USER_ID) or not phones:
         return 0
@@ -553,6 +573,13 @@ async def remove_many_from_power_dialer(
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             queue = await _get_dialer_queue(client)
+            if queue is None:
+                logger.error(
+                    "Aircall: queue unreadable — %d hard-excluded number(s) could NOT be "
+                    "removed and may still be callable in Kevin's dialer.",
+                    len(phones),
+                )
+                return QUEUE_UNREADABLE
             if not queue:
                 return 0
             # Resolve queue matches FIRST, then guardrail on the ACTUAL match

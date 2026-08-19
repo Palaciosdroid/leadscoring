@@ -11,6 +11,10 @@ from typing import Any
 
 import httpx
 
+# Sentinel for "the dialer queue could not be read" — defined next to the code
+# that produces it so there is one definition, not two that can drift apart.
+from integrations.aircall import QUEUE_UNREADABLE
+
 logger = logging.getLogger(__name__)
 
 SLACK_WEBHOOK_URL       = os.environ.get("SLACK_WEBHOOK_URL", "")
@@ -268,12 +272,19 @@ def _build_batch_report_message(stats: BatchRunStats) -> dict[str, Any]:
     # always >10k contacts, so zero processed is never legitimate.
     scoring_dead = stats.leads_processed == 0 or stats.hs_updates_ok == 0
 
+    # QUEUE UNREADABLE: removal could not even be attempted, so hard-excluded
+    # leads (paused / booked / DNC) stay callable in Kevin's dialer. Own criterion
+    # because it can happen on a run where every push succeeded — and because "0
+    # removed" is what it printed before, which is what a clean run looks like.
+    queue_unreadable = stats.aircall_removed == QUEUE_UNREADABLE
+
     ok = (
         stats.fatal_error is None
         and stats.hs_chunk_errors == 0
         and not aircall_down
         and stats.scoring_errors == 0
         and not scoring_dead
+        and not queue_unreadable
     )
     status_emoji = "✅" if ok else ("💥" if (stats.fatal_error or scoring_dead) else "⚠️")
     status_text = "OK" if ok else ("FATAL" if (stats.fatal_error or scoring_dead) else "ERRORS")
@@ -289,10 +300,12 @@ def _build_batch_report_message(stats: BatchRunStats) -> dict[str, Any]:
     else:
         dialer_str = "nicht verifiziert"
 
+    removed_str = "Queue nicht lesbar" if queue_unreadable else f"{stats.aircall_removed} removed"
+
     lines = [
         f"*Leads:* {stats.leads_fetched} fetched → {stats.leads_processed} processed",
         f"*HubSpot:* {stats.hs_updates_ok} updated",
-        f"*Aircall:* {stats.aircall_pushed} pushed, {stats.aircall_rejected} rejected, {stats.aircall_removed} removed → {dialer_str}"
+        f"*Aircall:* {stats.aircall_pushed} pushed, {stats.aircall_rejected} rejected, {removed_str} → {dialer_str}"
         + (f" ({stats.aircall_window_skipped} außerhalb Call-Window)" if stats.aircall_window_skipped else ""),
         f"*Skipped:* {stats.skipped_cold} cold, {stats.skipped_dnc} DNC",
         f"*Decays:* {stats.decay_count} Tier-Downgrades",
@@ -308,13 +321,25 @@ def _build_batch_report_message(stats: BatchRunStats) -> dict[str, Any]:
     # campaign 404). The gap alert below only fires when pushed>0, so without
     # this a complete push failure stays SILENT (2026-06 Kevin incident).
     if aircall_down:
+        # No cause is named here on purpose. The old text asserted "Dialer-Kampagne
+        # fehlt/404" without measuring it; when the real cause turned out to be a
+        # 403 on the credentials (18.07.2026), the wrong label made the alarm look
+        # like a known-noise repeat and it was dismissed for four weeks. The error
+        # sample below is measured — the diagnosis belongs there, not in the headline.
         msg = (
             f":rotating_light: *AIRCALL DOWN* — {stats.aircall_queued} Leads in Queue, "
-            "aber 0 gepusht! Kevins Dialer bleibt LEER (Dialer-Kampagne fehlt/404)."
+            "aber 0 gepusht! Kevins Dialer wird nicht mehr befüllt. Ursache siehe Fehlermeldung."
         )
         if stats.aircall_push_error_sample:
             msg += f" `{stats.aircall_push_error_sample[:200]}`"
         lines.append(msg)
+
+    if queue_unreadable:
+        lines.append(
+            ":rotating_light: *DIALER-QUEUE NICHT LESBAR* — hart ausgeschlossene Leads "
+            "(pausiert/gebucht/DNC) konnten NICHT aus Kevins Dialer entfernt werden und "
+            "bleiben dort anrufbar. Aircall-Zugang prüfen."
+        )
 
     # Gap alert: we pushed leads but dialer is empty — silent failure
     if stats.aircall_pushed > 0 and stats.dialer_verified_count == 0:
