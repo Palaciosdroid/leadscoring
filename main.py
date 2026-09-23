@@ -1418,7 +1418,9 @@ async def debug_aircall_status(x_api_key: str | None = Header(default=None)):
     if not DEBUG_API_KEY or x_api_key != DEBUG_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key header")
 
-    from integrations.aircall import AIRCALL_API_ID, AIRCALL_API_TOKEN, AIRCALL_CLOSER_USER_ID, AIRCALL_BASE, _headers
+    from integrations.aircall import (
+        AIRCALL_API_ID, AIRCALL_API_TOKEN, AIRCALL_CLOSER_USER_ID, AIRCALL_BASE, AIRCALL_BASE_V2, _headers,
+    )
     import httpx as _httpx
 
     result: dict = {
@@ -1438,9 +1440,9 @@ async def debug_aircall_status(x_api_key: str | None = Header(default=None)):
 
     try:
         async with _httpx.AsyncClient(timeout=10.0) as client:
-            # Check user exists
+            # Check user exists — User V1 is removed on 30.09.2026, so this uses V2
             r = await client.get(
-                f"{AIRCALL_BASE}/users/{AIRCALL_CLOSER_USER_ID}",
+                f"{AIRCALL_BASE_V2}/users/{AIRCALL_CLOSER_USER_ID}",
                 headers=_headers(),
             )
             if r.status_code == 200:
@@ -1449,7 +1451,7 @@ async def debug_aircall_status(x_api_key: str | None = Header(default=None)):
                     "id": u.get("id"),
                     "name": u.get("name"),
                     "email": u.get("email"),
-                    "available": u.get("availability"),
+                    "available": u.get("availability_status"),
                 }
             else:
                 result["error"] = f"User lookup failed: {r.status_code} {r.text[:200]}"
