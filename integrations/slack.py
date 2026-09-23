@@ -243,6 +243,7 @@ class BatchRunStats:
     aircall_push_error_sample: str | None = None  # first push failure reason (e.g. 404)
     aircall_removed: int = 0          # hard-excluded leads pulled from the live dialer queue this run
     aircall_window_skipped: int = 0   # queued leads not pushed because outside the 9-20 call window
+    aircall_auth_skipped: int = 0     # leads not tried because Aircall rejected the key (401/403)
     notes_written: int = 0
     # Post-batch verification: actual dialer count from Aircall API
     # -1 = not checked, 0+ = real count. Gap detected when pushed>0 but count==0.
@@ -332,6 +333,11 @@ def _build_batch_report_message(stats: BatchRunStats) -> dict[str, Any]:
         )
         if stats.aircall_push_error_sample:
             msg += f" `{stats.aircall_push_error_sample[:200]}`"
+        if stats.aircall_auth_skipped:
+            msg += (
+                f" Aircall lehnt den API-Schlüssel ab, Push nach dem ersten Lead abgebrochen "
+                f"({stats.aircall_auth_skipped} nicht versucht)."
+            )
         lines.append(msg)
 
     if queue_unreadable:
