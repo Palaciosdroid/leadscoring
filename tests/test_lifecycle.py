@@ -112,3 +112,15 @@ def test_not_interested_removes_permanently():
     now = datetime(2026, 7, 9, tzinfo=timezone.utc)
     state = apply_call_outcome(LifecycleState(), "not_interested", now)
     assert state.removed is True
+
+
+def test_termin_vereinbart_counts_as_reached():
+    """8th disposition 'Termin vereinbart' (in HubSpot since before 23.09.2026, never
+    mapped): a lead with a booked appointment was reached, so it gets the same
+    90-day pause and immediate queue removal instead of staying callable."""
+    from batch.lifecycle import classify_outcome, apply_call_outcome, LifecycleState, REACHED_PAUSE_DAYS
+    assert classify_outcome("Termin vereinbart") == "reached"
+    now = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
+    s = apply_call_outcome(LifecycleState(), classify_outcome("Termin vereinbart"), now)
+    assert s.pause_until == now + timedelta(days=REACHED_PAUSE_DAYS)
+    assert s.removed is False

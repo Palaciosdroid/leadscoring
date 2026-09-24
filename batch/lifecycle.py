@@ -6,7 +6,7 @@ after each call outcome. State is persisted via HubSpot properties; the batch
 scorer reads `pause_until` / `removed` to gate the dialer queue.
 
 Outcome classes (from HS_DISPOSITION_MAP in integrations/hubspot.py):
-  reached      -> Kontakt aufgenommen, Live-Nachricht hinterlassen
+  reached      -> Kontakt aufgenommen, Live-Nachricht hinterlassen, Termin vereinbart
   no_answer    -> Keine Antwort, Besetzt, Voicemail hinterlassen
   wrong_number -> Falsche Nummer
 """
@@ -21,7 +21,9 @@ NO_ANSWER_PAUSE_DAYS = 60     # 2 months after 3 consecutive no-answers
 NO_ANSWER_STREAK_LIMIT = 3    # consecutive no-answers that trigger a pause
 MAX_NO_ANSWER_CYCLES = 2      # after this many no-answer pauses -> removed
 
-REACHED_OUTCOMES = frozenset({"Kontakt aufgenommen", "Live-Nachricht hinterlassen"})
+# "Termin vereinbart" exists as a HubSpot disposition (seen 23.09.2026) but was
+# unmapped, so a booked lead stayed callable. Booked means reached: same pause.
+REACHED_OUTCOMES = frozenset({"Kontakt aufgenommen", "Live-Nachricht hinterlassen", "Termin vereinbart"})
 NO_ANSWER_OUTCOMES = frozenset({"Keine Antwort", "Besetzt", "Voicemail hinterlassen"})
 WRONG_NUMBER_OUTCOMES = frozenset({"Falsche Nummer"})
 # 7th disposition — created in the HubSpot UI (no create API, 405). Matched by
