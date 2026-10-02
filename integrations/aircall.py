@@ -422,6 +422,17 @@ async def _push_to_dialer_campaign(
         json={"phone_numbers": [phone]},
     )
 
+    # 404 = "User has no active campaign" (Aircall docs). Adding needs one, so
+    # create it with this number. Seen 02.10.2026: Kevin had none after 68 days
+    # of a dead key, every push would have failed with the new key too.
+    if response.status_code == 404:
+        logger.warning("Aircall: user %s has no active dialer campaign — creating it", AIRCALL_CLOSER_USER_ID)
+        response = await _aircall_request(
+            client, "post",
+            f"{AIRCALL_BASE}/users/{AIRCALL_CLOSER_USER_ID}/dialer_campaign",
+            json={"phone_numbers": [phone]},
+        )
+
     # Aircall answers 200/201 or 204 (accepted, no body) — all are success.
     if response.status_code not in (200, 201, 204):
         # 422 with "already imported" is OK — number already in campaign
@@ -451,12 +462,18 @@ async def _get_dialer_queue(client: httpx.AsyncClient) -> list[dict[str, Any]] |
     to return [], so callers concluded "the number is not queued" from a request
     that never saw the queue. With the key dead since 18.07.2026 every call 403s,
     and four weeks of runs reported a working removal path on that basis.
+
+    404 is the one non-200 that IS a measured answer: Aircall defines it as
+    "User has no active campaign", so there is no queue and nothing in it.
     """
     resp = await _aircall_request(
         client, "get",
         f"{AIRCALL_BASE}/users/{AIRCALL_CLOSER_USER_ID}/dialer_campaign/phone_numbers",
         params={"per_page": 50},
     )
+    if resp.status_code == 404:
+        logger.info("Aircall: user %s has no active dialer campaign — queue empty", AIRCALL_CLOSER_USER_ID)
+        return []
     if resp.status_code != 200:
         logger.warning("Aircall: dialer queue fetch failed: %s %s", resp.status_code, resp.text[:200])
         return None

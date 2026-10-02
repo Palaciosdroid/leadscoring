@@ -341,6 +341,41 @@ class TestPushToDialerCampaign:
             with pytest.raises(httpx.HTTPStatusError):
                 await _push_to_dialer_campaign(mock_client, self.LEAD)
 
+    @pytest.mark.asyncio
+    @patch("integrations.aircall.AIRCALL_CLOSER_USER_ID", "1492144")
+    async def test_no_active_campaign_404_creates_campaign(self):
+        """404 on add = no active campaign -> POST /dialer_campaign with the number."""
+        from integrations.aircall import _push_to_dialer_campaign
+
+        not_found, created = MagicMock(), MagicMock()
+        not_found.status_code, not_found.text = 404, '{"message":"NOT_FOUND"}'
+        created.status_code, created.text = 204, ""
+
+        with patch("integrations.aircall._aircall_request", new_callable=AsyncMock,
+                   side_effect=[not_found, created]) as req:
+            result = await _push_to_dialer_campaign(AsyncMock(), self.LEAD)
+
+        assert result == {"status": "added", "phone": "+4915112345678"}
+        create_call = req.await_args_list[1]
+        assert create_call.args[2].endswith("/users/1492144/dialer_campaign")
+        assert create_call.kwargs["json"] == {"phone_numbers": ["+4915112345678"]}
+
+    @pytest.mark.asyncio
+    @patch("integrations.aircall.AIRCALL_CLOSER_USER_ID", "1492144")
+    async def test_failed_campaign_create_raises(self):
+        from integrations.aircall import _push_to_dialer_campaign
+
+        not_found, failed = MagicMock(), MagicMock()
+        not_found.status_code, not_found.text = 404, ""
+        failed.status_code, failed.text = 422, '{"message":"invalid"}'
+        failed.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "Unprocessable", request=MagicMock(), response=failed
+        )
+        with patch("integrations.aircall._aircall_request", new_callable=AsyncMock,
+                   side_effect=[not_found, failed]):
+            with pytest.raises(httpx.HTTPStatusError):
+                await _push_to_dialer_campaign(AsyncMock(), self.LEAD)
+
 
 class TestEndToEndFlow:
     """Full flow test: add_to_power_dialer with high-level mocks."""

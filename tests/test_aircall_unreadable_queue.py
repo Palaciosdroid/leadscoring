@@ -65,6 +65,12 @@ class TestQueueReadDistinguishesUnreadableFromEmpty:
         assert await _get_dialer_queue(MagicMock()) == []
 
     @patch("integrations.aircall._aircall_request", new_callable=AsyncMock)
+    async def test_404_no_active_campaign_is_empty(self, mock_req):
+        """Aircall docs: 404 = 'User has no active campaign' — a real answer."""
+        mock_req.return_value = _resp(404)
+        assert await _get_dialer_queue(MagicMock()) == []
+
+    @patch("integrations.aircall._aircall_request", new_callable=AsyncMock)
     async def test_populated_queue_returns_numbers(self, mock_req):
         mock_req.return_value = _resp(200, {"numbers": QUEUE})
         assert await _get_dialer_queue(MagicMock()) == QUEUE
