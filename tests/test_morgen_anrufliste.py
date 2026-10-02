@@ -82,6 +82,21 @@ def test_unknown_disposition_is_a_retry():
     assert evaluate({}, JOINED, [call(2026, 10, 2, 10, 0, "")], TODAY).status == "wiedervorlage"
 
 
+def test_live_label_termin_vereinbart_is_out(monkeypatch):
+    # GUID not in DISPOSITIONS, resolved by label from the live HubSpot map
+    from batch import morgen_anrufliste as m
+    monkeypatch.setitem(m._live_labels, "guid-termin", "Termin vereinbart")
+    r = evaluate({}, JOINED, [call(2026, 10, 2, 10, 0, "guid-termin")], TODAY)
+    assert (r.status, r.reason) == (None, "abgeschlossen")
+    assert m.disposition_label("guid-termin") == "Termin vereinbart"
+
+
+def test_live_label_no_answer_stays_a_retry(monkeypatch):
+    from batch import morgen_anrufliste as m
+    monkeypatch.setitem(m._live_labels, "guid-voicemail", "Voicemail hinterlassen")
+    assert evaluate({}, JOINED, [call(2026, 10, 2, 10, 0, "guid-voicemail")], TODAY).status == "wiedervorlage"
+
+
 def test_epoch_millis_timestamps():
     ms = str(int(datetime(2026, 10, 5, 9, 0, tzinfo=Z).timestamp() * 1000))
     calls = [{"hs_timestamp": ms, "hs_call_direction": "OUTBOUND", "hs_call_disposition": BUSY}]
