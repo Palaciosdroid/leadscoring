@@ -29,7 +29,8 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from batch.dialer_gate import dialer_suppressed
-from integrations.hubspot import HUBSPOT_BASE, _headers
+from batch.lifecycle import classify_outcome
+from integrations.hubspot import HUBSPOT_BASE, _headers, get_disposition_map
 
 logger = logging.getLogger(__name__)
 
@@ -53,9 +54,23 @@ DISPOSITIONS: dict[str, tuple[str, bool]] = {
     "3486e24c-aaec-42ce-862e-a5acdb2b5fb3": ("Nicht interessiert", True),
 }
 
+# GUIDs not listed above (e.g. "Termin vereinbart", created in the HubSpot UI) are
+# resolved by LABEL from the live disposition map, filled in build_message(), and
+# classified like the dialer lifecycle does.
+FINAL_CLASSES = frozenset({"reached", "wrong_number", "not_interested"})
+_live_labels: dict[str, str] = {}
+
 
 def disposition_label(guid: str | None) -> str:
-    return DISPOSITIONS.get(guid or "", ("unbekannt", False))[0]
+    if (guid or "") in DISPOSITIONS:
+        return DISPOSITIONS[guid][0]
+    return _live_labels.get(guid or "", "unbekannt")
+
+
+def is_final(guid: str | None) -> bool:
+    if (guid or "") in DISPOSITIONS:
+        return DISPOSITIONS[guid][1]
+    return classify_outcome(_live_labels.get(guid or "", "")) in FINAL_CLASSES
 
 
 def to_dt(value: Any) -> datetime | None:
@@ -104,7 +119,7 @@ def evaluate(contact: dict, joined_at: datetime, calls: list[dict], today: datet
 
     last_ts, last = relevant[-1]
     last = {**last, "_ts": last_ts}
-    if DISPOSITIONS.get(last.get("hs_call_disposition") or "", ("", False))[1]:
+    if is_final(last.get("hs_call_disposition")):
         return Result(None, "abgeschlossen", attempts, last)
     if attempts >= max_attempts:
         return Result(None, "obergrenze", attempts, last)
@@ -263,6 +278,7 @@ async def fetch_data(list_ids: list[str]) -> tuple[list[dict], dict[str, dict], 
 # ---------------------------------------------------------------------------
 async def build_message(now: datetime | None = None) -> tuple[str, dict]:
     now = now or datetime.now(ZONE)
+    _live_labels.update(await get_disposition_map())
     lists, contacts, calls_by_contact = await fetch_data(LIST_IDS)
 
     # Gate only the candidates: a handful of HubSpot calls instead of one per member.
