@@ -22,6 +22,8 @@ deal amount + Bexio (owned by the Tracking-Crew), out of scope here.
 Both fetches are READ-ONLY.
 """
 
+import datetime
+import enum
 import os
 import logging
 
@@ -66,6 +68,72 @@ def is_converted(
         if email.strip().lower() in completed_set:
             return True
     return False
+
+
+class ConversionTiming(enum.Enum):
+    """Did the purchase happen after the signal, before it, or not at all?
+
+    `is_converted` answers "did they ever buy", which is right for baseline and
+    point calibration. It is wrong for signal calibration: a customer who bought
+    two years ago and revisits the offer page today shows up as a hit for whatever
+    signal that visit produced. Measured 19.08.2026 on the PostHog signal
+    population — 22 of 26 resolvable conversions had bought BEFORE the signal, a
+    median of 456 days before. That alone flattened every bucket to within four
+    points of the others and inverted the ranking.
+
+    PRIOR_BUYER is deliberately its own outcome and NOT a negative example. Those
+    contacts already bought and are no longer in the market; scoring them as
+    "did not convert" would understate every signal. Callers drop them from the
+    population instead.
+    """
+    CONVERTED_AFTER = "converted_after"
+    PRIOR_BUYER = "prior_buyer"
+    NOT_CONVERTED = "not_converted"
+    UNDECIDABLE = "undecidable"
+
+
+def _as_utc(dt: datetime.datetime | None) -> datetime.datetime | None:
+    """HubSpot and Supabase disagree about tzinfo; normalise instead of crashing."""
+    if dt is None:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)
+
+
+def converted_after(
+    contact_id: str | int | None,
+    email: str | None,
+    won_dates: dict[str, datetime.datetime],
+    purchase_dates: dict[str, datetime.datetime],
+    anchor: datetime.datetime | None,
+) -> ConversionTiming:
+    """Time-ordered counterpart to `is_converted`.
+
+    `anchor` is the signal timestamp. A purchase strictly AFTER it is the only
+    thing that can be called a conversion of that signal. A purchase at exactly
+    the anchor counts as prior: identical timestamps cannot show which caused
+    which, and claiming a hit there would be the same wishful reading this
+    function exists to prevent.
+
+    Without an anchor there is no ordering, so the answer is UNDECIDABLE — the
+    caller drops the row rather than guessing.
+    """
+    if anchor is None:
+        return ConversionTiming.UNDECIDABLE
+    anchor = _as_utc(anchor)
+
+    dates: list[datetime.datetime] = []
+    if contact_id is not None and str(contact_id) in won_dates:
+        dates.append(won_dates[str(contact_id)])
+    if email:
+        d = purchase_dates.get(email.strip().lower())
+        if d is not None:
+            dates.append(d)
+
+    if not dates:
+        return ConversionTiming.NOT_CONVERTED
+    if any(_as_utc(d) > anchor for d in dates):
+        return ConversionTiming.CONVERTED_AFTER
+    return ConversionTiming.PRIOR_BUYER
 
 
 async def fetch_won_contacts(*, timeout: float = 30.0) -> set[str]:
@@ -137,6 +205,163 @@ async def fetch_won_contacts(*, timeout: float = 30.0) -> set[str]:
 
     logger.info("fetch_won_contacts: %d distinct won contacts", len(contact_ids))
     return contact_ids
+
+
+def _parse_ts(value) -> datetime.datetime | None:
+    """HubSpot sends epoch millis or ISO; Supabase sends ISO. Never raise."""
+    if not value:
+        return None
+    try:
+        s = str(value)
+        if s.isdigit():
+            return datetime.datetime.fromtimestamp(int(s) / 1000, datetime.timezone.utc)
+        return _as_utc(datetime.datetime.fromisoformat(s.replace("Z", "+00:00")))
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+async def fetch_won_contact_dates(*, timeout: float = 30.0) -> dict[str, datetime.datetime]:
+    """Contact ID → date of their most recent Won deal. READ-ONLY.
+
+    Deliberately NOT sharing an implementation with `fetch_won_contacts`, even
+    though both walk the same two endpoints. That function feeds baseline.py and
+    calibrate_points.py and has no test coverage of its own; refactoring it into
+    a wrapper would risk a silent change to the population those reports use
+    (a deal without a closedate would have to be represented somehow). Twenty
+    duplicated lines are the cheaper mistake here. If either gains tests, merge them.
+
+    Contacts whose won deals all lack a closedate are omitted — an undated
+    purchase cannot be ordered against a signal, and a guess would defeat the point.
+    """
+    if not ACCESS_TOKEN:
+        logger.warning("fetch_won_contact_dates: HUBSPOT_ACCESS_TOKEN not set — returning empty")
+        return {}
+
+    deal_dates: dict[str, datetime.datetime] = {}
+    contact_dates: dict[str, datetime.datetime] = {}
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        after: str | None = None
+        while True:
+            body: dict = {
+                "filterGroups": [{
+                    "filters": [
+                        {"propertyName": "pipeline",  "operator": "EQ", "value": WON_DEAL_PIPELINE_ID},
+                        {"propertyName": "dealstage", "operator": "EQ", "value": WON_DEAL_STAGE_ID},
+                    ]
+                }],
+                "properties": ["closedate"],
+                "limit": 100,
+            }
+            if after:
+                body["after"] = after
+            resp = await client.post(
+                f"{HUBSPOT_BASE}/crm/v3/objects/deals/search", headers=_headers(), json=body,
+            )
+            if resp.status_code != 200:
+                logger.error(
+                    "fetch_won_contact_dates: deal search failed %s %s",
+                    resp.status_code, resp.text[:300],
+                )
+                break
+            data = resp.json()
+            for d in data.get("results", []):
+                ts = _parse_ts(d.get("properties", {}).get("closedate"))
+                if ts:
+                    deal_dates[d["id"]] = ts
+            after = data.get("paging", {}).get("next", {}).get("after")
+            if not after:
+                break
+
+        undated = 0
+        for deal_id, ts in deal_dates.items():
+            assoc = await client.get(
+                f"{HUBSPOT_BASE}/crm/v3/objects/deals/{deal_id}/associations/contacts",
+                headers=_headers(),
+            )
+            if assoc.status_code != 200:
+                undated += 1
+                continue
+            for row in assoc.json().get("results", []):
+                cid = row.get("id")
+                if not cid:
+                    continue
+                cid = str(cid)
+                # Most recent win wins: a repeat customer's latest purchase is the
+                # one a later signal has to be ordered against.
+                if cid not in contact_dates or ts > contact_dates[cid]:
+                    contact_dates[cid] = ts
+
+    logger.info(
+        "fetch_won_contact_dates: %d dated won deals → %d contacts (%d assoc lookups failed)",
+        len(deal_dates), len(contact_dates), undated,
+    )
+    return contact_dates
+
+
+async def fetch_completed_purchase_dates() -> dict[str, datetime.datetime]:
+    """Lowercased email → date of their most recent completed Whyros purchase.
+
+    READ-ONLY on Andre's Supabase — we never write there.
+
+    Refunded purchases are excluded (`refunded_at` set). A refund is not a
+    conversion, and `fetch_completed_purchase_emails` counts them today because
+    payment_status stays 'completed' after a refund.
+
+    ⚠️ `purchased_at` is the invoice date, not the checkout moment. For instalment
+    and invoice purchases the browsing session can sit days to weeks earlier. That
+    is tolerable here — the distortion this function exists to remove is measured
+    in months — but it makes any single near-anchor case unreliable.
+    """
+    client = get_supabase_client()
+
+    purchases = await client._get("purchases", {
+        "select": "contact_id,purchased_at,refunded_at",
+        "payment_status": "eq.completed",
+    })
+
+    by_contact: dict[str, datetime.datetime] = {}
+    refunded = 0
+    undated = 0
+    for p in purchases:
+        cid = p.get("contact_id")
+        if not cid:
+            continue
+        if p.get("refunded_at"):
+            refunded += 1
+            continue
+        ts = _parse_ts(p.get("purchased_at"))
+        if ts is None:
+            undated += 1
+            continue
+        cid = str(cid)
+        if cid not in by_contact or ts > by_contact[cid]:
+            by_contact[cid] = ts
+
+    if not by_contact:
+        logger.info("fetch_completed_purchase_dates: 0 usable completed purchases")
+        return {}
+
+    emails: dict[str, datetime.datetime] = {}
+    contact_ids = list(by_contact)
+    _CHUNK = 100
+    for i in range(0, len(contact_ids), _CHUNK):
+        chunk = contact_ids[i:i + _CHUNK]
+        contacts = await client._get("contacts", {
+            "select": "id,email",
+            "id": f"in.({','.join(chunk)})",
+        })
+        for c in contacts:
+            e = (c.get("email") or "").strip().lower()
+            ts = by_contact.get(str(c.get("id")))
+            if e and ts and (e not in emails or ts > emails[e]):
+                emails[e] = ts
+
+    logger.info(
+        "fetch_completed_purchase_dates: %d emails dated (%d refunded skipped, %d undated skipped)",
+        len(emails), refunded, undated,
+    )
+    return emails
 
 
 async def fetch_completed_purchase_emails() -> set[str]:
