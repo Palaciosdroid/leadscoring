@@ -46,6 +46,9 @@ _RETRY_BASE_DELAY = 2.0  # seconds, doubles each retry
 AIRCALL_API_ID       = os.environ.get("AIRCALL_API_ID", "")
 AIRCALL_API_TOKEN    = os.environ.get("AIRCALL_API_TOKEN", "")
 AIRCALL_BASE         = "https://api.aircall.io/v1"
+# User V1 endpoints (list/retrieve/create/update a user) are removed on 30.09.2026.
+# Dialer campaign, contacts and notes stay on v1 — Aircall publishes no v2 for them.
+AIRCALL_BASE_V2      = "https://api.aircall.io/v2"
 AIRCALL_CLOSER_USER_ID = os.environ.get("AIRCALL_CLOSER_USER_ID", "")
 
 # Fresh window unified with the scorer (scoring FRESH_WINDOW = 7 days). Aircall's
