@@ -57,6 +57,7 @@ from integrations.zoom import (
 from batch.call_summarizer import process_zoom_vtt
 from integrations.aircall import add_to_power_dialer, remove_from_power_dialer
 from batch.dialer_gate import dialer_suppressed
+from batch.morgen_anrufliste import run_morgen_anrufliste
 from integrations.supabase import (
     fetch_touchpoints_for_emails,
     fetch_all_lead_data,
@@ -250,6 +251,19 @@ async def lifespan(app: FastAPI):
         id="weekly_buyer_journey",
         replace_existing=True,
     )
+    # Morning call list for Kevin — Mon-Fri 07:00 Zurich, posted to Palacios Base.
+    # Off unless ANRUFLISTE_ENABLED=1 (needs BASE_URL, BASE_API_KEY, ANRUFLISTE_CHANNEL_ID).
+    if os.environ.get("ANRUFLISTE_ENABLED") == "1":
+        scheduler.add_job(
+            run_morgen_anrufliste,
+            "cron",
+            day_of_week="mon-fri",
+            hour=7,
+            minute=0,
+            timezone=ZoneInfo("Europe/Zurich"),
+            id="morgen_anrufliste",
+            replace_existing=True,
+        )
     scheduler.start()
     logger.info(
         "Schedulers started — batch scoring cron 08/12/16 CET, call polling every %dm (window=%dm), "
@@ -1276,6 +1290,15 @@ async def debug_poll(window_minutes: int = 10, x_api_key: str | None = Header(de
     logger.info("/debug/poll triggered manually (window=%dm)", window_minutes)
     await run_call_polling(since_minutes=window_minutes)
     return {"status": "ok", "message": f"Call polling completed (window={window_minutes}m)"}
+
+
+@app.post("/debug/anrufliste")
+async def debug_anrufliste(dry_run: bool = True, x_api_key: str | None = Header(default=None)):
+    """Build the morning call list now. dry_run=true (default) returns the text without posting.
+    Requires DEBUG_API_KEY."""
+    if not DEBUG_API_KEY or x_api_key != DEBUG_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key header")
+    return await run_morgen_anrufliste(dry_run=dry_run)
 
 
 # ---------------------------------------------------------------------------
