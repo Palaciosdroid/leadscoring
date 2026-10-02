@@ -641,6 +641,70 @@ def _aircall_priority_key(item: dict) -> tuple:
     return (priority, fresh_hours, -score)
 
 
+async def _push_aircall_queue(aircall_queue: list[dict], now_utc: datetime, _stats: BatchRunStats) -> int:
+    """Push the sorted queue into Kevin's dialer. Returns the number pushed.
+
+    Stops on the first AircallAuthError: a rejected key fails every request, so
+    walking the rest of the queue only repeats the same 403 (23.09.2026: 958 leads,
+    three calls each). The skipped count goes into the batch report.
+    """
+    from integrations.aircall import add_to_power_dialer, AircallAuthError
+
+    pushed = 0
+    for idx, item in enumerate(aircall_queue):
+        try:
+            if item["phone"]:
+                if not is_within_call_window(region_for(item["phone"]), now_utc):
+                    _stats.aircall_window_skipped += 1
+                    logger.debug(
+                        "Batch: outside call window for %s — skip push this run",
+                        item["email"],
+                    )
+                    continue
+                lead_dict = {
+                    "phone": item["phone"],
+                    "firstname": item["firstname"],
+                    "lastname": item["lastname"],
+                    "email": item["email"],
+                    "notes": item["aircall_card"],
+                }
+                result = await add_to_power_dialer(
+                    lead_dict,
+                    score=item["score"],
+                    is_fresh=item.get("is_fresh", False),
+                    interest_category=item["funnel"],
+                    lead_tier=item["lead_tier"],
+                    list_key=item["list_key"],
+                )
+                if result is not None:
+                    pushed += 1
+                    logger.info(
+                        "Batch: pushed %s to Aircall [%s] score=%.0f tier=%s",
+                        item["email"], item["list_key"], item["score"], item["tier_label"],
+                    )
+                else:
+                    _stats.aircall_rejected += 1
+                    logger.warning(
+                        "Batch: Aircall rejected %s — score=%.0f tier=%s is_fresh=%s "
+                        "(check _should_dial logic)",
+                        item["email"], item["score"], item["tier_label"], item.get("is_fresh"),
+                    )
+        except AircallAuthError as e:
+            _stats.aircall_auth_skipped = len(aircall_queue) - idx - 1
+            if _stats.aircall_push_error_sample is None:
+                _stats.aircall_push_error_sample = str(e)[:200]
+            logger.error(
+                "Batch: Aircall rejected the API key (%s) — stopping push, %d lead(s) not tried",
+                e, _stats.aircall_auth_skipped,
+            )
+            break
+        except Exception as e:
+            logger.error("Batch: Aircall push failed for %s: %s", item["email"], e)
+            if _stats.aircall_push_error_sample is None:
+                _stats.aircall_push_error_sample = str(e)[:200]
+    return pushed
+
+
 def _determine_tier_label(score: float, is_fresh: bool, is_booked: bool = False) -> str:
     """Human-readable tier label for Aircall card."""
     if is_booked:
@@ -1734,50 +1798,7 @@ async def run_batch_scoring() -> None:
         len(aircall_queue),
     )
     _stats.aircall_queued = len(aircall_queue)
-    pushed = 0
-    for item in aircall_queue:
-        try:
-            from integrations.aircall import add_to_power_dialer
-            if item["phone"]:
-                if not is_within_call_window(region_for(item["phone"]), now_utc):
-                    _stats.aircall_window_skipped += 1
-                    logger.debug(
-                        "Batch: outside call window for %s — skip push this run",
-                        item["email"],
-                    )
-                    continue
-                lead_dict = {
-                    "phone": item["phone"],
-                    "firstname": item["firstname"],
-                    "lastname": item["lastname"],
-                    "email": item["email"],
-                    "notes": item["aircall_card"],
-                }
-                result = await add_to_power_dialer(
-                    lead_dict,
-                    score=item["score"],
-                    is_fresh=item.get("is_fresh", False),
-                    interest_category=item["funnel"],
-                    lead_tier=item["lead_tier"],
-                    list_key=item["list_key"],
-                )
-                if result is not None:
-                    pushed += 1
-                    logger.info(
-                        "Batch: pushed %s to Aircall [%s] score=%.0f tier=%s",
-                        item["email"], item["list_key"], item["score"], item["tier_label"],
-                    )
-                else:
-                    _stats.aircall_rejected += 1
-                    logger.warning(
-                        "Batch: Aircall rejected %s — score=%.0f tier=%s is_fresh=%s "
-                        "(check _should_dial logic)",
-                        item["email"], item["score"], item["tier_label"], item.get("is_fresh"),
-                    )
-        except Exception as e:
-            logger.error("Batch: Aircall push failed for %s: %s", item["email"], e)
-            if _stats.aircall_push_error_sample is None:
-                _stats.aircall_push_error_sample = str(e)[:200]
+    pushed = await _push_aircall_queue(aircall_queue, now_utc, _stats)
 
     # Step 6: Count decays — no individual Slack alerts, summary goes into batch report
     _stats.decay_count = len(decay_alerts)

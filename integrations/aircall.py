@@ -31,6 +31,14 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+
+class AircallAuthError(Exception):
+    """Aircall rejected the credentials (401/403 = invalid API key per its docs).
+
+    Distinct from other HTTP errors because it holds for every request, not one
+    lead: the batch stops pushing on the first one instead of walking the queue.
+    """
+
 # Retry config for Aircall 429 rate limits (60 req/min)
 _MAX_RETRIES = 3
 _RETRY_BASE_DELAY = 2.0  # seconds, doubles each retry
@@ -262,17 +270,22 @@ async def add_to_power_dialer(
     # NOTE: Aircall API does NOT support tags on contacts — only on calls.
     # All routing info (score, tier, funnel) lives in the 'information' field.
     async with httpx.AsyncClient(timeout=timeout) as client:
-        # Step 1: Create/update contact with call info in information field
-        contact_id = await _upsert_contact(client, lead_with_info)
+        try:
+            # Step 1: Create/update contact with call info in information field
+            contact_id = await _upsert_contact(client, lead_with_info)
 
-        # Step 2: Write scorer card as a NOTE on the contact
-        # Notes appear directly in the Aircall UI panel (visible during calls)
-        # The information field is hidden in Power Dialer view
-        if contact_id and call_info:
-            await _write_contact_note(client, contact_id, call_info, lead.get("email", ""))
+            # Step 2: Write scorer card as a NOTE on the contact
+            # Notes appear directly in the Aircall UI panel (visible during calls)
+            # The information field is hidden in Power Dialer view
+            if contact_id and call_info:
+                await _write_contact_note(client, contact_id, call_info, lead.get("email", ""))
 
-        # Step 3: Push phone number into Closer's dialer campaign
-        return await _push_to_dialer_campaign(client, lead)
+            # Step 3: Push phone number into Closer's dialer campaign
+            return await _push_to_dialer_campaign(client, lead)
+        except httpx.HTTPStatusError as e:
+            if e.response is not None and e.response.status_code in (401, 403):
+                raise AircallAuthError(str(e)) from e
+            raise
 
 
 async def _upsert_contact(
