@@ -252,7 +252,7 @@ async def lifespan(app: FastAPI):
         replace_existing=True,
     )
     # Morning call list for Kevin — Mon-Fri 07:00 Zurich, posted to Palacios Base.
-    # Off unless ANRUFLISTE_ENABLED=1 (needs BASE_URL, BASE_API_KEY, ANRUFLISTE_CHANNEL).
+    # Off unless ANRUFLISTE_ENABLED=1 (needs BASE_URL, BASE_API_KEY, ANRUFLISTE_CHANNEL_ID).
     if os.environ.get("ANRUFLISTE_ENABLED") == "1":
         scheduler.add_job(
             run_morgen_anrufliste,

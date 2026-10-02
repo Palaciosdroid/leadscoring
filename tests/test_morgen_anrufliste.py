@@ -118,5 +118,14 @@ def test_render_message():
     assert "https://app.hubspot.com/contacts/27034546/record/0-1/a" in text
 
 
+def test_base_target_prefers_channel_id(monkeypatch):
+    from batch.morgen_anrufliste import base_target
+    monkeypatch.setenv("ANRUFLISTE_CHANNEL", "sales")
+    monkeypatch.delenv("ANRUFLISTE_CHANNEL_ID", raising=False)
+    assert base_target() == {"channel": "sales"}
+    monkeypatch.setenv("ANRUFLISTE_CHANNEL_ID", "11111111-2222-3333-4444-555555555555")
+    assert base_target() == {"channel_id": "11111111-2222-3333-4444-555555555555"}
+
+
 def test_render_empty():
     assert "Heute keine offenen Anrufe." in render_message([], TODAY)

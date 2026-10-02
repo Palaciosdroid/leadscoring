@@ -286,12 +286,21 @@ async def build_message(now: datetime | None = None) -> tuple[str, dict]:
     return render_message(sections, now, os.environ.get("ANRUFLISTE_MENTION", "")), stats
 
 
+def base_target() -> dict:
+    """Channel UUID wins: Base resolves names with .single(), so a duplicated
+    name (there are two channels called "sales") would make every post fail."""
+    channel_id = os.environ.get("ANRUFLISTE_CHANNEL_ID", "").strip()
+    if channel_id:
+        return {"channel_id": channel_id}
+    return {"channel": os.environ["ANRUFLISTE_CHANNEL"]}
+
+
 async def post_to_base(message: str) -> dict:
     base_url = os.environ["BASE_URL"].rstrip("/")
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(f"{base_url}/api/webhooks/channel",
                                  headers={"X-API-Key": os.environ["BASE_API_KEY"]},
-                                 json={"channel": os.environ["ANRUFLISTE_CHANNEL"], "message": message})
+                                 json={**base_target(), "message": message})
         resp.raise_for_status()
         return resp.json()
 
