@@ -445,6 +445,7 @@ async def health():
 async def customerio_webhook(
     request: Request,
     x_cio_signature: str | None = Header(default=None),
+    x_cio_timestamp: str | None = Header(default=None),
 ):
     """
     Receive a Customer.io webhook — supports TWO formats:
@@ -461,7 +462,7 @@ async def customerio_webhook(
     if WEBHOOK_SECRET:
         if not x_cio_signature:
             raise HTTPException(status_code=401, detail="Missing webhook signature")
-        _verify_signature(raw_body, x_cio_signature)
+        _verify_signature(raw_body, x_cio_signature, x_cio_timestamp)
 
     import json
     body = json.loads(raw_body)
@@ -1670,16 +1671,25 @@ def _build_ai_features(
     }
 
 
-def _verify_signature(raw_body: bytes, signature: str) -> None:
+def _verify_signature(raw_body: bytes, signature: str, timestamp: str | None = None) -> None:
     """HMAC-SHA256 verification for Customer.io webhook secret.
+
+    Customer.io reporting webhooks send X-CIO-Timestamp and sign
+    "v0:<timestamp>:<raw body>". Requests without a timestamp (manual/direct
+    triggers) are checked against the raw body alone. When a timestamp is sent,
+    only the v0 form is accepted.
 
     CIO may send either "sha256=<hex>" or raw "<hex>" — strip prefix before comparing.
     """
     import hashlib
     import hmac
 
+    if timestamp:
+        message = b"v0:" + timestamp.encode() + b":" + raw_body
+    else:
+        message = raw_body
     expected = hmac.new(
-        WEBHOOK_SECRET.encode(), raw_body, hashlib.sha256
+        WEBHOOK_SECRET.encode(), message, hashlib.sha256
     ).hexdigest()
     # Strip "sha256=" prefix if present (CIO format varies by account/version)
     canonical = signature.removeprefix("sha256=")
